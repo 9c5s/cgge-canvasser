@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.14"
 # dependencies = [
 #     "playwright>=1.40.0",
 #     "pycryptodome>=3.19",
