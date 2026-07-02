@@ -511,8 +511,8 @@ def collect_checkins(
             msg = f"state.json が破損しています: {e}. 手動で確認してから再実行してください."
             if execute:
                 raise FailClosedError(msg) from e
+            # dry-run は初期値 (空 state) のまま継続する. スポット取得後の検証を回すため.
             print(msg, file=sys.stderr)
-            return 0
 
     # 完了済みスポットを事前に filter する. これでサーバー側で「既達成」となっている
     # ものを無駄に POST しない.
@@ -1336,11 +1336,13 @@ def _profiles_dir_is_gitignored(profiles_dir: Path) -> bool:
     parent = profiles_dir.parent
     cwd = parent if parent.is_dir() else Path.cwd()
     try:
+        # `--` を挟んで, `-` で始まるユーザー指定パスを option 扱いされないようにする.
         result = subprocess.run(
-            ["git", "check-ignore", "--quiet", path_arg],
+            ["git", "check-ignore", "--quiet", "--", path_arg],
             cwd=cwd,
             capture_output=True,
             timeout=10,
+            check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False
@@ -1623,6 +1625,20 @@ def _main_impl() -> int:
     if args.no_mission and not args.checkin:
         print(
             "--no-mission は --checkin と組み合わせて使ってください.",
+            file=sys.stderr,
+        )
+        return 1
+    # 実行ゲート単独指定を拒否. 対応する対象フラグが無いと黙って dry-run で終わり
+    # 「実POST を送ったつもりが送られていない」誤運用に繋がるため.
+    if args.execute_mission and not run_mission:
+        print(
+            "--execute-mission は --no-mission と併用できません.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.execute_checkin and not run_checkin:
+        print(
+            "--execute-checkin は --checkin と組み合わせて使ってください.",
             file=sys.stderr,
         )
         return 1
