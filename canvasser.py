@@ -37,6 +37,7 @@ import math
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1331,14 +1332,19 @@ def _profiles_dir_is_gitignored(profiles_dir: Path) -> bool:
     git 自体が使えない環境も False. `git check-ignore --quiet` は
     exit 0=ignored, 1=not ignored, 128=error (repo外) を返す.
     """
+    # git 実体を PATH から解決. S607 対策で partial path を渡さない.
+    git_bin = shutil.which("git")
+    if git_bin is None:
+        return False
     # Windows の path 区切りは git に渡す前に正規化. 末尾 / でディレクトリと明示する.
     path_arg = str(profiles_dir).replace("\\", "/").rstrip("/") + "/"
     parent = profiles_dir.parent
     cwd = parent if parent.is_dir() else Path.cwd()
     try:
         # `--` を挟んで, `-` で始まるユーザー指定パスを option 扱いされないようにする.
-        result = subprocess.run(
-            ["git", "check-ignore", "--quiet", "--", path_arg],
+        # 引数リストは shell=False で渡すので shell injection は起こらない.
+        result = subprocess.run(  # noqa: S603
+            [git_bin, "check-ignore", "--quiet", "--", path_arg],
             cwd=cwd,
             capture_output=True,
             timeout=10,
@@ -1556,7 +1562,8 @@ def _main_impl() -> int:
         "--allow-unignored-profiles-dir",
         action="store_true",
         help="--profiles-dir が git ignore 対象でない場合の警告を無視する. "
-             "デフォルトは実POST 拒否 (Cookieの誤コミット防止).",
+             "デフォルトはモードに関係なく未 ignore の profiles-dir を拒否 "
+             "(Cookie の誤コミット防止).",
     )
     args = parser.parse_args()
 
