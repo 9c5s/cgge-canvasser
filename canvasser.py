@@ -751,6 +751,10 @@ def collect_checkins(
                 "body の ecode を確認して意味を確定してから再実行してください.",
                 partial_gained=gained,
             )
+        # 未観測 ecode を許容範囲内で流す場合でも, 移動時間は消費済みなので次スポットの
+        # travel 計算を現地点起点に更新する. さもないと clock は失敗スポット到着時刻,
+        # origin は前スポットという物理的にありえない状態になる.
+        prev_lat, prev_lng = s_lat, s_lng
 
     label = "獲得見込み" if not execute else "獲得"
     footer = f"{successful}スポット成功"
@@ -1007,11 +1011,19 @@ def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
 # スキーマ:
 #   {
 #     "last_checkin": {
+#       schema_version: 2,                          # 実POST 成功でのみ書かれるマーカー
 #       spot_slug, spot_name, location_latitude, location_longitude,
 #       virtual_completed_at (ISO8601 JST-aware), real_completed_at (ISO8601 UTC)
 #     },
 #     "completed_spots": ["cg_vote2026_XX", ...]   # 過去にチェックイン成功したスポット slug の集合
 #   }
+#
+# LAST_CHECKIN_SCHEMA_VERSION: last_checkin レコードのバージョン. 過去に dry-run 経路が
+# state を書いていた版があり, last_checkin の中身だけでは実POST 由来かどうか判別できない.
+# 現行版 (このコード) は実POST 成功のみでこのフィールドを書くので, 値が最新版と一致する
+# レコードだけ resume に使う. 値が違う / 存在しない場合は「信頼できない旧 state」として
+# lat/lng/resume_at を無視する.
+LAST_CHECKIN_SCHEMA_VERSION = 2
 _STATE_FILENAME = "canvasser_state.json"
 
 
@@ -1070,6 +1082,7 @@ def _validate_state_schema(state: dict[str, Any], source: Path) -> None:
         if not isinstance(last, dict):
             raise StateFileCorruptedError(f"{source}: last_checkin が dict でない")
         for k, typ in (
+            ("schema_version", int),
             ("spot_slug", str),
             ("spot_name", str),
             ("location_latitude", (int, float)),
@@ -1167,6 +1180,7 @@ def update_checkin_state(
     """
     state = load_account_state(profile_dir)
     state["last_checkin"] = {
+        "schema_version": LAST_CHECKIN_SCHEMA_VERSION,
         "spot_slug": spot["slug"],
         "spot_name": spot["name"],
         "location_latitude": float(spot["location_latitude"]),
@@ -1198,9 +1212,13 @@ def resume_context(
     """
     state = load_account_state(profile_dir, strict=strict)
     last = state.get("last_checkin") or {}
-    lat = last.get("location_latitude")
-    lng = last.get("location_longitude")
-    raw = last.get("virtual_completed_at")
+    # schema_version が一致しない last_checkin は「実POST 成功由来か」を保証できないため
+    # resume に使わない. 旧 dry-run が simulated route を書いた state を execute run で
+    # 起点にしてしまうと, 偽の位置/時刻から始まり有効スポットを skip する事故になる.
+    schema_ok = last.get("schema_version") == LAST_CHECKIN_SCHEMA_VERSION
+    lat = last.get("location_latitude") if schema_ok else None
+    lng = last.get("location_longitude") if schema_ok else None
+    raw = last.get("virtual_completed_at") if schema_ok else None
     resume_at: datetime | None = None
     if raw:
         try:
