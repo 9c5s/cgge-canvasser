@@ -1177,8 +1177,10 @@ def resume_context(
       - resume_at: 前回終了時刻 (仮想, JST aware).
                    スキーマ上は「滞在時間を含めない出発直前の仮想時刻」を保存する.
       - completed_spots: 実POST 成功済みスポット slug の集合. 起動時の事前 filter に使う.
-        旧schema (last_checkin.spot_slug は存在するが completed_spots がない) から自動移行
-        するため, last_checkin.spot_slug がある場合はここで補完する.
+        旧版の dry-run 経路も update_checkin_state を叩いていたので, last_checkin
+        フィールドから「実POST 成功済み」を後方から推定する手段がない. 誤って dry-run 由来の
+        slug を完了扱いすると次回 --execute-checkin でそのスポットの reward を落とすため,
+        自動移行はしない. 旧 state の補完が必要な場合は --mark-completed を明示的に使う.
     """
     state = load_account_state(profile_dir, strict=strict)
     last = state.get("last_checkin") or {}
@@ -1195,21 +1197,6 @@ def resume_context(
         except ValueError:
             resume_at = None
     completed = set(state.get("completed_spots") or [])
-    # 旧schema 自動移行: last_checkin.spot_slug は「実POST 成功済み」の記録なので
-    # completed_spots に補完する. これで syota のように completed_spots が空でも
-    # 過去成功スポットに実POST を再送しない.
-    # ただし過去に dry-run が state を書いていた版がある場合, その spot_slug は
-    # 「実POST 成功済み」ではない. 現行版が実POST 時のみ記録する real_completed_at の
-    # 有無を「実POST の痕跡」として使い, これが無いレコードは移行しない.
-    legacy_slug = last.get("spot_slug")
-    real_completed_at = last.get("real_completed_at")
-    if (
-        isinstance(legacy_slug, str)
-        and _SPOT_SLUG_RE.fullmatch(legacy_slug)
-        and isinstance(real_completed_at, str)
-        and real_completed_at
-    ):
-        completed.add(legacy_slug)
     return (
         float(lat) if lat is not None else None,
         float(lng) if lng is not None else None,
