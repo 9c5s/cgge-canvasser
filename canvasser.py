@@ -10,12 +10,9 @@
 # ///
 """シンデレラガール総選挙2026 デイリー自動化スクリプト。
 
-Playwright の persistent context でブラウザセッションを保持し、フロントが叩いている
+Playwright の persistent context でブラウザセッションを保持し、フロントが叩く
 内部 API をそのまま呼び出してミッション回収と (--checkin ならば) チェックインを自動化する。
-複数アカウントを ./profiles/{account}/ に分けて運用する構成が前提となる。
-
-初回のみ `--login --account NAME` で手動ログインし、以降は `uv run canvasser.py` で
-全アカウントを headless に順次処理する。
+複数アカウントは ./profiles/{account}/ 配下に分けて運用する。
 
   uv run canvasser.py --login --account main               # 初回ログイン
   uv run canvasser.py                                      # 全アカウント、完全ドライラン
@@ -23,7 +20,7 @@ Playwright の persistent context でブラウザセッションを保持し、�
   uv run canvasser.py --checkin --execute-checkin          # チェックインだけ本番
   uv run canvasser.py --checkin --execute-mission --execute-checkin  # 両方本番
 
-`--execute-mission` と `--execute-checkin` は独立したゲート。どちらも未指定であれば
+`--execute-mission` と `--execute-checkin` は独立したゲート。どちらも未指定なら
 GET のみのドライランとなり、POST/PUT は一切送らない。
 """
 
@@ -54,13 +51,13 @@ from dotenv import load_dotenv
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, sync_playwright
 
-# .env をスクリプト自身の隣から明示的にロードする。cwd が違ってもタスクスケジューラから読める。
+# cwd が違ってもタスクスケジューラから読めるよう、スクリプト隣の .env を明示ロードする。
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
-# キャンペーンの時刻はすべて日本時間で扱う (サーバ側も JST で返してくる)。
+# サーバも JST で返してくるため、内部時刻は JST に統一する。
 JST = ZoneInfo("Asia/Tokyo")
 
-# Next.js のチャンクから抽出した API 定数。総選挙2026 用の名前空間となる。
+# Next.js のチャンク解析で抽出した総選挙2026 用の名前空間。
 API_HOST = "https://api.idolmaster-official.jp"
 API_V1 = f"{API_HOST}/api/v1_1_0"
 API_BASE = "/api/v1_1_0/mileage_vote/cinderellagirls_vote_2026"
@@ -72,25 +69,24 @@ MISSION_PAGE_URL = (
 CHECKIN_PAGE_URL = f"https://idolmaster-official.jp/mydesk/spot/{CHECKIN_EVENT_SLUG}"
 LOGIN_CHECK_URL = f"{API_HOST}/api/v1_1_0/auths/login/check"
 
-# 地球の 1 度緯度に対応する距離 (メートル)。WGS84 近似。
+# 地球の 1 度緯度に対応する距離 [m]。WGS84 近似。
 METERS_PER_DEG_LAT = 111_320.0
-# チェックイン許容半径を少し内側へ絞って境界事故を避けるための係数。
+# 許容半径ぎりぎりの座標を避けて境界事故を防ぐ内寄せ係数。
 CHECKIN_RADIUS_MARGIN = 0.85
 
 
 def _default_now() -> datetime:
-    """collect_checkins の now_fn の既定値。現在 JST 時刻を返す。"""
+    """collect_checkins の now_fn 既定値。テスト時は差し替える。"""
     return datetime.now(JST)
 
 
 def call_api(page: Page, method: str, path: str) -> dict[str, Any]:
     """ページ内で fetch を実行し、Cookie 付きで API を叩く。
 
-    - 送信元は idolmaster-official.jp、API は api.idolmaster-official.jp と別ホストだが、
-      サーバ側で CORS allow-credentials が有効なので credentials=include で通る。
-    - x-api-key はフロント公開の固定値を使う。
+    - 送信元と API は別ホストだが、サーバ側で CORS allow-credentials が有効なので
+      credentials=include で通る。x-api-key はフロント公開の固定値。
     - fetch reject (ネットワーク・CORS・DNS 失敗) や非 JSON 応答も {status, body, error} で
-      構造化して返す。呼び出し側で status==0 やエラーコードで分岐できる。
+      構造化して返し、呼び出し側で status==0 やエラーコードで分岐できるようにする。
     """
     url = f"{API_HOST}{API_BASE}{path}"
     return page.evaluate(
@@ -120,9 +116,8 @@ def call_api(page: Page, method: str, path: str) -> dict[str, Any]:
 def check_login(page: Page) -> bool:
     """auths/login/check を叩いて認証状態を確認する。
 
-    fetch 例外や非 JSON 応答は「未ログイン」と同義扱いにする。これで Cookie
-    期限切れ・ネットワーク不通も呼び出し側の「未ログインならば --login を促す」ルート
-    へ合流させられる。
+    fetch 例外や非 JSON 応答は未ログインと同義に丸める。Cookie 期限切れやネットワーク不通も
+    「未ログインなら --login を促す」ルートに合流させるため。
     """
     result = page.evaluate(
         """
@@ -148,13 +143,11 @@ def check_login(page: Page) -> bool:
 def collect_missions(page: Page, execute: bool = False) -> int:
     """API 経由で完了可能なミッションをまとめて消化する。
 
-    - `mission_complete_api_call_flag=True` のみを対象にする。
-      あいことばやチェックインは外部トリガー起因なのでスキップする。
-    - 未達成で残挑戦回数がある場合は達成 POST の後に受取 PUT を送る。
-    - 達成済みで未受取の場合は受取 PUT のみ送る。
+    - `mission_complete_api_call_flag=True` のみを対象にする。あいことばやチェックインは
+      外部トリガー起因のため、この関数からは触らない。
     - `execute=False` (デフォルト) は完全ドライラン。GET のみ実行し、POST/PUT は送らない。
 
-    戻り値は今回獲得した投票券数の合計 (dry-run 時は「実行した場合に得るはずの見込み」)。
+    戻り値は今回獲得した投票券数の合計 (dry-run 時は実行した場合の見込み)。
     """
     listing = call_api(page, "GET", "/missions?mission_type=0&limit=300")
     body = listing.get("body")
@@ -185,9 +178,8 @@ def collect_missions(page: Page, execute: bool = False) -> int:
 
         if not completed and remaining > 0:
             outcome = _complete(page, mid, name, execute=execute)
-            # 累計達成数系ミッション (#100-104) は他ミッション達成の副作用で
-            # サーバ側では達成扱いになる。一方で一覧の completed フラグ更新は遅延する。
-            # 達成 POST が「既に達成済み」を返した場合でも受取 PUT は通るので試す。
+            # 累計達成数系ミッション (#100-104) はサーバ側で自動達成されるが、一覧の completed
+            # フラグ更新が遅延する。達成 POST が「既に達成済み」を返した場合も受取 PUT は通る。
             if outcome in ("ok", "already_done"):
                 gained += _receive(page, mid, name, pts, execute=execute)
 
@@ -199,10 +191,8 @@ def collect_missions(page: Page, execute: bool = False) -> int:
 def _complete(page: Page, mid: int, name: str, execute: bool = False) -> str:
     """ミッション達成の POST を送る。
 
-    補足として、一覧取得は `/missions` (複数形) だが、個別操作は `/mission` (単数形) となる。
-    フロントの `b.eq` 定数が単数形であることをチャンク解析で確認済み。
-
-    execute=False の場合は POST を送らず "ok" 相当 (次の受取も dry-run で進める) を返す。
+    一覧取得は `/missions` (複数形) だが個別操作は `/mission` (単数形)。フロントの `b.eq`
+    定数が単数形であることをチャンク解析で確認済み。
 
     戻り値:
       - "ok"             : 達成成功
@@ -234,10 +224,7 @@ def _complete(page: Page, mid: int, name: str, execute: bool = False) -> str:
 
 
 def _receive(page: Page, mid: int, name: str, pts: int, execute: bool = False) -> int:
-    """投票券受取の PUT を送る。成功時は加算票数を返す。
-
-    execute=False の場合は PUT を送らず、「実行していれば得られたであろう pts」を返す。
-    """
+    """投票券受取の PUT を送る。成功時は加算票数、dry-run 時は「実行していれば得た pts」を返す。"""
     print(f"[受取] #{mid} {name} (+{pts})")
     if not execute:
         print("  -> DRY-RUN (PUT送信なし)")
@@ -265,10 +252,9 @@ def encrypt_coords(coords: dict[str, Any], password: str = API_KEY) -> str:
       - ciphertext = AES-CBC(key, iv, PKCS7(JSON.stringify(coords)))
       - payload = f"{salt.hex()},{iv.hex()},{ct_base64}"
 
-    パスワードはフロント公開値の X-API-KEY を流用しているため、この暗号化に機密性は
-    ない (プロトコル互換のためのラッパーにあたる)。サーバが受理する形式を再現している。
-    salt と iv は hex、ciphertext は Base64 で連結する (crypto-js の Hex と Base64
-    混在フォーマットを実 UI 経由の POST 観測で確定した)。
+    パスワードはフロント公開値の X-API-KEY を流用しているため、この暗号化に機密性はない
+    (サーバが受理する形式を再現するだけのラッパー)。salt と iv は hex、ciphertext は
+    Base64 で連結する形式は、実 UI 経由の POST 観測で確定した。
     """
     salt = os.urandom(16)
     iv = os.urandom(16)
@@ -282,10 +268,10 @@ def encrypt_coords(coords: dict[str, Any], password: str = API_KEY) -> str:
 def random_point_in_circle(
     center_lat: float, center_lng: float, radius_m: float
 ) -> tuple[float, float]:
-    """半径 radius_m [m] の円内から面積一様分布でランダム点を返す。
+    """半径 radius_m の円内から面積一様分布でランダム点を返す。
 
-    d = r*sqrt(u)、theta = 2*pi*v で面積一様となる (中心密集を避ける)。
-    経度スケールは緯度によって変わるため cos(lat) で補正する。
+    d = r*sqrt(u) で中心密集を避けた面積一様分布を作る。経度スケールは緯度で変わるため
+    cos(lat) で補正する。
     """
     u = random.random()
     theta = random.random() * 2 * math.pi
@@ -298,25 +284,24 @@ def random_point_in_circle(
 
 
 def _natural_accuracy() -> float:
-    """モバイル GPS 屋外の実測分布に近い精度値をランダムに返す [m]。
+    """モバイル GPS 屋外の実測分布に近い精度値 [m] を返す。
 
-    実機の accuracy は 8〜30m あたりに強く集中し、稀に 30〜80m の外れ値を出す。
-    一様乱数だと分布がフラットで統計的に不自然になるので、正規分布と外れ値の混合で再現する。
+    実機の accuracy は 8〜30m に強く集中し、稀に 30〜80m の外れ値が出る。一様乱数だと
+    分布がフラットで統計的に不自然なので、正規分布と外れ値の混合で再現する。
     """
     if random.random() < 0.15:
-        # 外れ値: 屋内寄り、あるいはマルチパスの影響
+        # 屋内寄り or マルチパスの影響を想定した外れ値
         val = random.uniform(30.0, 80.0)
     else:
-        # 中央値 18m、標準偏差 6m の正規分布。5m 未満は非現実的なのでクランプする
+        # 5m 未満は現実的でないためクランプする
         val = max(5.0, random.gauss(18.0, 6.0))
     return round(val, 3)
 
 
 def _natural_altitude() -> tuple[float | None, float | None]:
-    """altitude と altitudeAccuracy をリアルに乱択して返す。
+    """altitude と altitudeAccuracy を実機挙動に近い分布で返す。
 
-    - 大多数のケース (80%) は取得不可として None を返す。
-    - 20% は GPS 側で取れた想定にする。日本の都市部平地の 5〜80m 程度に散らばらせる。
+    多くの環境 (80%) は取得不可の None、20% は日本の都市部平地相当の 5〜80m を返す。
     """
     if random.random() < 0.20:
         alt = round(random.uniform(5.0, 80.0), 1)
@@ -326,10 +311,10 @@ def _natural_altitude() -> tuple[float | None, float | None]:
 
 
 def make_checkin_coords(spot: dict[str, Any]) -> dict[str, Any]:
-    """スポット情報から、円内ランダム点と自然化した coords を組んで返す。
+    """スポット情報から、円内ランダム点と自然化した coords を組む。
 
-    サーバ側 (あるいは将来の異常検知) で分布統計が取られた場合に BOT らしい特徴が出ない
-    ように、accuracy と altitude を実機挙動に近い分布で乱択する。
+    サーバ側や将来の異常検知で分布統計が取られた場合に BOT らしい特徴が出ないよう、
+    accuracy と altitude を実機挙動に近い分布で乱択する。
     """
     radius = float(spot.get("checkin_radius") or 500)
     lat, lng = random_point_in_circle(
@@ -344,7 +329,7 @@ def make_checkin_coords(spot: dict[str, Any]) -> dict[str, Any]:
         "longitude": lng,
         "altitude": alt,
         "altitudeAccuracy": alt_acc,
-        # チェックイン時は「静止して端末を見ている」想定なので heading と speed は null に置く
+        # 「静止して端末を見ている」想定なので heading と speed は null に置く
         "heading": None,
         "speed": None,
     }
@@ -358,9 +343,9 @@ def call_checkin_api(
 ) -> dict[str, Any]:
     """checkins 系エンドポイントを叩く。
 
-    body があれば application/x-www-form-urlencoded で送る。これは実 UI の POST を
-    キャプチャして確定した仕様となる (axios が data:string を送るときの既定 Content-Type)。
-    body は "salt_hex,iv_hex,ct_base64" の文字列をそのまま (URL エンコードせずに) 載せる。
+    body があれば application/x-www-form-urlencoded で送る (axios が data:string を
+    送るときの既定 Content-Type を実 UI キャプチャで確定した)。body は
+    "salt_hex,iv_hex,ct_base64" の文字列をそのまま (URL エンコードせずに) 載せる。
     """
     url = f"{API_V1}/checkins{path}"
     return page.evaluate(
@@ -389,12 +374,11 @@ def call_checkin_api(
     )
 
 
-# チェックイン API の既知エラーコード。UI 側から抽出したもの。
-# チャンクの表示コードから "E5005" (チェックイン範囲外) を把握している。それ以外 (既達成含む) は、
-# 実 POST 前の段階では「未観測 ecode = unknown = 即停止」として扱う。
-# 実観測で意味が確定した ecode だけを随時ここへ追加する。
+# チェックイン API の既知エラーコード。UI 側チャンクから "E5005" (範囲外) は把握済み。
+# それ以外 (既達成含む) は未観測 = unknown として即停止で扱い、実観測で意味が確定した
+# ecode だけを随時 ECODES_ALREADY_DONE に追加する。
 ECODE_OUT_OF_RANGE = "E5005"
-ECODES_ALREADY_DONE: tuple[str, ...] = ()  # 実観測が済むまで空。未観測は unknown で停止する。
+ECODES_ALREADY_DONE: tuple[str, ...] = ()
 
 
 def order_spots_by_proximity(
@@ -402,20 +386,18 @@ def order_spots_by_proximity(
     start_index: int | None = None,
     start_location: tuple[float, float] | None = None,
 ) -> list[dict[str, Any]]:
-    """最近傍法でスポット順序を決める。現実の人間の移動に近いルートを生成する。
+    """最近傍法でスポット順序を決める。
 
-    - `start_location` を指定した場合は、現在地に最も近いスポットを 1 件目に据える
-      (state.json から前回位置を渡す想定)。
-    - `start_location` と `start_index` の両方が未指定であれば、開始スポットを乱択する。
-    - 以降は現在地から Haversine 直線距離が最小のスポットを次に選ぶ。
-    - 単純な greedy TSP 近似。最適ではないが「近場をまとめて回る」自然な挙動になる。
+    - `start_location` を指定すれば、そこに最も近いスポットを 1 件目にする
+      (state.json の前回位置を渡す想定)。
+    - `start_location` と `start_index` が両方 None なら開始スポットを乱択する。
+    - 単純な greedy TSP 近似で、最適ではないが「近場をまとめて回る」自然な挙動になる。
     """
     if not spots:
         return []
     unvisited = list(spots)
 
     if start_location is not None:
-        # 前回位置に最も近いスポットを 1 件目に据える
         cur_lat, cur_lng = start_location
         nearest_idx = 0
         nearest_d = float("inf")
@@ -468,21 +450,21 @@ def collect_checkins(
     """全スポットに対してチェックインを試みる。戻り値は獲得票数の見込み。
 
     セーフティ:
-      - `execute=False` (デフォルト) は完全ドライランとなる (POST を送らず、sleep もなく、state も書き換えない)。
-      - `state.completed_spots` にある slug は事前に skip する (実 POST を無駄に打たない)。
-      - 未観測 ecode (SUCCESS と E5005 以外) は fail closed で即停止する。意味が判るまで
-        「BAN シグナル・認証切れ・予期せぬ状態」のいずれかとして扱う。
-      - `consecutive_failure_limit` の未知エラーが連続した場合、全体を中断する (デフォルト 1 = 即停止)。
-      - `daily_budget > 0` で件数上限を設ける。`daily_budget=0` は無制限として扱う。
-      - スポット間には交通機関稼働時間帯 (06:00-24:00) を考慮した移動時間の待機を挟む。
-      - 到着時刻がスポットの `checkin_end_datetime` を過ぎたスポットは skip する (イベント全体
-        期限ではないため、後続の valid スポットは処理を継続する)。
-      - deadline がパースできないスポットは `execute=True` の場合に fail closed で扱う (skip 相当)。
-      - 各スポットで 10〜30 分の滞在時間を挟む (最終スポットや budget 到達時は skip する)。
+      - `execute=False` (デフォルト) は完全ドライラン (POST を送らず、sleep もなく、
+        state も書き換えない)。
+      - `state.completed_spots` にある slug は事前に skip する。
+      - 未観測 ecode (SUCCESS と E5005 以外) は fail closed で即停止する。BAN シグナル・
+        認証切れ・予期せぬ状態のいずれかとして扱う。
+      - `consecutive_failure_limit` の未知エラーが連続したら全体中断する (デフォルト 1)。
+      - `daily_budget > 0` で件数上限を設ける (0 は無制限)。
+      - スポット間には交通機関稼働時間帯 (06:00-24:00) を考慮した移動待機を挟む。
+      - `checkin_end_datetime` を過ぎたスポットは skip する (イベント全体期限とは別)。
+      - deadline がパースできないスポットは `execute=True` の場合に fail closed で扱う。
+      - 各スポットで 10〜30 分の滞在時間を挟む (最終スポットや budget 到達時は skip)。
       - state.json は実 POST 成功時に限り atomic に更新する。
-      - state.json が壊れている場合、`execute=True` では FailClosedError を送出する (exit_code=1)。
-        dry-run では空 state で継続する。
-      - `out_of_range_limit` 件以上 E5005 (範囲外) が続いた場合は停止する (crypto・body・radius の
+      - state.json 破損時は `execute=True` で FailClosedError を送出し、dry-run では
+        空 state で継続する。
+      - `out_of_range_limit` 件以上 E5005 が続いたら停止する (crypto・body・radius の
         不一致が疑われるため、実 POST を 51 件全部撃たせない)。
     """
     if now_fn is None:
@@ -497,8 +479,6 @@ def collect_checkins(
         print("チェックイン対象スポットが空でした。")
         return 0
 
-    # state.json から前回の最終チェックイン地点・仮想時刻・完了済み集合を復元する。
-    # execute=True の場合は、state 破損時に FailClosedError を送出する。
     resume_lat: float | None = None
     resume_lng: float | None = None
     resume_at: datetime | None = None
@@ -512,11 +492,9 @@ def collect_checkins(
             msg = f"state.json が破損しています: {e}。手動で確認してから再実行してください。"
             if execute:
                 raise FailClosedError(msg) from e
-            # dry-run は初期値 (空 state) のまま継続する。スポット取得後の検証を回すため。
+            # dry-run は空 state のまま継続してスポット取得後の検証を回す
             print(msg, file=sys.stderr)
 
-    # 完了済みスポットを事前にフィルタする。これでサーバ側で「既達成」となっている
-    # ものへ無駄に POST を送らない。
     skipped_completed = [s for s in all_spots if s["slug"] in completed_spots]
     spots = [s for s in all_spots if s["slug"] not in completed_spots]
     if skipped_completed:
@@ -525,8 +503,6 @@ def collect_checkins(
         print("全スポット完了済みです。")
         return 0
 
-    # 開始地点は state に前回位置があれば「そこに最も近いスポット」を起点にする。
-    # なければランダム開始とし、以降は最近傍で辿る。
     start_loc = (
         (resume_lat, resume_lng) if resume_lat is not None and resume_lng is not None else None
     )
@@ -544,12 +520,12 @@ def collect_checkins(
 
     gained = 0
     successful = 0
-    attempted = 0  # 実 POST を送った回数。execute=True のときのみ加算する。
+    attempted = 0  # execute=True でのみ加算する実 POST 試行回数
     consecutive_failures = 0
-    out_of_range_count = 0  # E5005 (範囲外) の累積カウンタ。実装バグ検知に使う。
+    out_of_range_count = 0
 
-    # 現在時刻を追跡する。state に前回終了時刻があれば now と比較して大きい方を採用する。
-    # これで「前回 23:50 に終わって翌日 12:00 に再開」も自然に連続扱いになる。
+    # 「前回 23:50 に終わって翌日 12:00 に再開」を自然な連続扱いにするため、
+    # resume_at が現在時刻より進んでいれば resume_at を採用する。
     virtual_now: datetime = now_fn()
     if virtual_now.tzinfo is None:
         virtual_now = virtual_now.replace(tzinfo=JST)
@@ -559,16 +535,13 @@ def collect_checkins(
     print(f"開始時刻(仮想): {virtual_now:%Y-%m-%d %H:%M %Z}"
           + (f" (前回位置から再開: {resume_lat:.4f},{resume_lng:.4f})" if resumed else ""))
 
-    # 「1 件目に前回位置がある」場合、直前スポットは前回位置扱いになるため、
-    # 1 件目の前にも移動時間を計算する必要がある。resumed で分岐を制御する。
     prev_lat: float | None = resume_lat if resumed else None
     prev_lng: float | None = resume_lng if resumed else None
 
     for i, spot in enumerate(spots, 1):
-        # 上限判定は「実行モードで意味のあるカウンタ」で行う。
-        # - execute=True: 実 POST 試行回数 (成功・既達成・範囲外・失敗のいずれでも 1 リクエスト = 1 消費)
-        # - execute=False: 仮想成功数 (ドライラン獲得見込みの目安)
-        # これで `--execute --daily-budget 1` は「実 POST を 1 回だけ送る」を厳密に保証する。
+        # 上限判定のカウンタを execute の状態で切替える。execute=True の attempted は
+        # 「実 POST を厳密に daily_budget 回だけ送る」ためのゲートで、既達成・範囲外・
+        # 失敗のいずれも 1 リクエスト = 1 消費として扱う。
         limit_counter = attempted if execute else successful
         if daily_budget > 0 and limit_counter >= daily_budget:
             print(f"  日次上限 {daily_budget}件に到達。残り {len(spots) - i + 1}件は次回以降。")
@@ -579,18 +552,16 @@ def collect_checkins(
         s_lat = float(spot["location_latitude"])
         s_lng = float(spot["location_longitude"])
 
-        # 前回位置 (直前スポット、あるいは state 復元位置) からの移動時間を計算する。
         if prev_lat is not None:
             secs, mode = estimate_travel_seconds(
                 prev_lat, prev_lng, s_lat, s_lng,
                 departure_time=virtual_now,
             )
             if mode == "gmaps-transit":
-                # transit の duration は Google が始発待ち等を含めて計算済み。
-                # 追加で翌朝発に押し戻すと二重加算になるので、そのまま加算する。
+                # transit の duration には始発待ち等が織り込まれているため、翌朝発への
+                # 押し戻しをかけると二重加算になる。
                 arrival = virtual_now + timedelta(seconds=secs)
             else:
-                # driving や haversine は 24 時間稼働前提の計算のため、深夜跨ぎを翌朝に押し戻す。
                 arrival = next_arrival_time(virtual_now, secs)
             wait_seconds = (arrival - virtual_now).total_seconds()
             straight_km = _distance_m(prev_lat, prev_lng, s_lat, s_lng) / 1000
@@ -608,10 +579,9 @@ def collect_checkins(
                 time.sleep(wait_seconds)
             virtual_now = arrival
 
-        # スポットのチェックイン期間を過ぎていないか確認する。個別スポットだけを skip し、
-        # 他の有効スポットは続けて処理する (イベント全体の期限とは別)。
-        # 期限をパースできない場合、execute では fail closed で全体を中断する (サーバ形式変更の
-        # 疑い)。個別スポットの skip では気付きにくいため、ここで例外を上げる。
+        # 個別スポットの期限。イベント全体期限とは別で、超過したものだけ skip して
+        # 後続の有効スポットは処理を続ける。パース不能は execute では fail closed に
+        # 落として、サーバ形式変更を早期検知する (個別 skip では気付きにくい)。
         deadline = parse_checkin_deadline(spot)
         if deadline is None:
             msg = (
@@ -621,12 +591,11 @@ def collect_checkins(
             if execute:
                 raise FailClosedError(msg, partial_gained=gained)
             print(f"  {msg} (dry-run: skip)", file=sys.stderr)
-            # 移動時間は消費済み。次スポットの travel は現地点から計算する。
+            # skip でも到着はしたので、次スポットの travel 起点を現地点に更新する
             prev_lat, prev_lng = s_lat, s_lng
             continue
         if virtual_now > deadline:
             print(f"  [{slug}] スポット期限 ({deadline:%m/%d %H:%M %Z}) 経過、skip。")
-            # 到着はしているので、次スポットの移動計算は現地点起点にする。
             prev_lat, prev_lng = s_lat, s_lng
             continue
 
@@ -642,11 +611,10 @@ def collect_checkins(
         stay_secs = natural_stay_seconds()
 
         def will_continue_after(next_attempted: int, next_successful: int) -> bool:
-            """このスポット処理後に次のループへ進むかを判定する。
+            """このスポットの後にループを継続するかを判定する。
 
-            - 最終スポットなら False (もう次はない)。
-            - daily_budget を使い切ったら False (次のループ冒頭で break される)。
-            - execute の True と False では使うカウンタが異なる (attempted と successful)。
+            execute の True と False で使うカウンタが違う点だけ注意する
+            (attempted と successful)。
             """
             if i >= len(spots):
                 return False
@@ -656,8 +624,8 @@ def collect_checkins(
             return counter < daily_budget
 
         if not execute:
-            # ドライランは POST を送らず、state.json も汚染しない。
-            # 実 POST 実行時の resume を狂わせないためにも、ここで state を書き換えないのは要点になる。
+            # dry-run では state.json を書かない。実 POST 実行時の resume 起点を
+            # ドライラン由来の値で汚染しないため。
             print(f"       body={body[:60]}...(len={len(body)})  [DRY-RUN]")
             gained += 10
             successful += 1
@@ -667,9 +635,8 @@ def collect_checkins(
                 print(f"       滞在 {humanize_duration(stay_secs)} -> 出発 {virtual_now:%m/%d %H:%M}")
             continue
 
-        # --- 実 POST 分岐 ---
-        # POST 送信の直前に attempted を加算する。これで daily_budget が「実 POST 試行回数」で
-        # 厳密に働き、既達成・範囲外・失敗のいずれも 1 リクエスト = 1 消費として扱える。
+        # POST 直前に attempted を加算する。これで既達成・範囲外・失敗のいずれも
+        # 1 リクエスト = 1 消費になり、daily_budget が実 POST 試行回数として厳密に働く。
         attempted += 1
         res = call_checkin_api(
             page,
@@ -689,17 +656,15 @@ def collect_checkins(
             virtual_now = now_fn()
             if virtual_now.tzinfo is None:
                 virtual_now = virtual_now.replace(tzinfo=JST)
-            # 成功直後に一次 state を保存する。sleep 中に中断されても completed_spots に slug が残り、
-            # 次回起動時の事前フィルタで無駄な POST を防げる。
+            # sleep 中に中断されても completed_spots に slug が残るよう、成功直後に
+            # 一次 state を保存する。
             if profile_dir is not None:
                 update_checkin_state(profile_dir, spot, virtual_now)
-            # 次のスポットに進む場合に限り滞在時間を消化する。
-            # 最終スポットや budget 到達時は無駄な sleep を避ける。
             if will_continue_after(attempted, successful):
                 time.sleep(stay_secs)
                 virtual_now = virtual_now + timedelta(seconds=stay_secs)
                 print(f"       滞在 {humanize_duration(stay_secs)} -> 出発 {virtual_now:%m/%d %H:%M %Z}")
-                # 滞在で仮想時刻を進めた分を state に反映する。spot 情報は同じなので上書き相当となる。
+                # 滞在後の virtual_now を state に反映する (同じ spot への上書き相当)
                 if profile_dir is not None:
                     update_checkin_state(profile_dir, spot, virtual_now)
             continue
@@ -712,31 +677,28 @@ def collect_checkins(
             )
             consecutive_failures = 0
             if out_of_range_count >= out_of_range_limit:
-                # E5005 が想定より多発する場合は crypto・body・radius の実装不一致が疑われる。
-                # 未指定なら 51 件全部を撃ってしまうため、FailClosedError で全体を中断する
-                # (process_account が exit_code=1 に反映する)。
+                # E5005 の多発は crypto・body・radius の実装不一致を強く示唆する。
+                # 未指定なら 51 件全部を撃ってしまうため、ここで全体を止める。
                 raise FailClosedError(
                     f"範囲外 (E5005) が {out_of_range_count} 件。crypto・body・radius の "
                     "実装不一致の疑いがあるため停止する。座標計算とペイロードの整合性を確認して "
                     "から --max-out-of-range を上げて再実行する。",
                     partial_gained=gained,
                 )
-            # 移動時間は消費済みなので、次スポットの travel 計算は現地点を起点にする。
             prev_lat, prev_lng = s_lat, s_lng
             continue
 
         if ecode in ECODES_ALREADY_DONE:
-            # 実観測で意味が確定した「既達成」ecode のみここに入る (初期は空 tuple)。
             print(f"       -> 既達成 ({ecode})、スキップ")
             consecutive_failures = 0
             prev_lat, prev_lng = s_lat, s_lng
-            # 「サーバ側で成功済み」の意味なので、state に反映しておけば次回以降 skip される。
+            # サーバ側で成功済みなので state に反映しておくと次回以降 skip される
             if profile_dir is not None:
                 update_checkin_state(profile_dir, spot, virtual_now, mark_completed=True)
             continue
 
-        # 未観測 ecode = unknown となる。BAN シグナル・認証切れ・予期せぬ状態のいずれかなので
-        # fail closed で即中断する。意味が確定したら ECODE_* に追加してから再実行する。
+        # 未観測 ecode = unknown。BAN シグナル・認証切れ・予期せぬ状態のいずれかとして
+        # 扱い、fail closed で即中断する。意味が確定したら ECODE_* に追加してから再実行。
         consecutive_failures += 1
         err_note = f" err={res.get('error')}" if res.get("error") else ""
         print(
@@ -745,15 +707,13 @@ def collect_checkins(
             file=sys.stderr,
         )
         if consecutive_failures >= consecutive_failure_limit:
-            # unknown ecode が limit を超えた場合は想定外の状況にあたる。exit_code=1 で明示する。
             raise FailClosedError(
                 f"連続失敗が {consecutive_failure_limit}件に達したため中断する。"
                 "body の ecode を確認して意味を確定してから再実行する。",
                 partial_gained=gained,
             )
-        # 未観測 ecode を許容範囲内で流す場合でも、移動時間は消費済みなので、次スポットの
-        # travel 計算を現地点起点に更新する。そうしないと clock は失敗スポット到着時刻、
-        # origin は前スポットという物理的にありえない状態になる。
+        # skip 時も移動時間は消費済み。prev を更新しないと clock は失敗スポット到着時刻・
+        # origin は前スポットという物理的にあり得ない状態になる。
         prev_lat, prev_lng = s_lat, s_lng
 
     label = "獲得見込み" if not execute else "獲得"
@@ -776,12 +736,10 @@ def _distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-# 実移動時間の推定用パラメータ。直線距離を実道路距離に補正するための係数となる。
+# 直線距離を実道路距離へ補正する係数
 ROAD_DISTANCE_FACTOR = 1.35
 
-# Google Maps Directions API 統合。GMAPS_KEY 環境変数があれば有効化する。
-# キャッシュキーは (lat1, lng1, lat2, lng2, departure_bucket_iso) で構成する。
-# departure_time は 30 分単位で丸めてキャッシュヒット率を確保する。
+# gmaps キャッシュ。キーの departure_time は 30 分単位に丸めてヒット率を確保する。
 _GMAPS_CACHE: dict[tuple[float, float, float, float, str], tuple[float, str]] = {}
 _gmaps_client: Any = None
 _gmaps_probed: bool = False
@@ -789,7 +747,7 @@ _GMAPS_TIME_BUCKET_MINUTES = 30
 
 
 def _get_gmaps_client() -> Any:
-    """遅延初期化する。GMAPS_KEY が未設定なら None を返す。"""
+    """遅延初期化。GMAPS_KEY 未設定なら None を返す。"""
     global _gmaps_client, _gmaps_probed
     if _gmaps_probed:
         return _gmaps_client
@@ -815,14 +773,13 @@ def _estimate_travel_seconds_gmaps(
 ) -> tuple[float, str] | None:
     """Google Maps Directions API で公共交通機関の実移動時間を取得する。
 
-    `departure_time` を渡すことで、深夜出発時の「始発待ち込み」の実運行 duration が
-    Google 側から返る (例: 22 時に東京→札幌の transit 検索なら「翌朝始発 + 移動」の時間)。
-    キーが無い場合や API エラー時は None を返し、呼び出し側で Haversine にフォールバックする。
+    `departure_time` を渡すと、深夜出発時の始発待ち込み duration が Google 側から返る
+    (例: 22 時に東京→札幌の transit なら「翌朝始発 + 移動」)。キー未設定や API エラー時は
+    None を返し、呼び出し側で Haversine にフォールバックする。
     """
     client = _get_gmaps_client()
     if client is None:
         return None
-    # departure_time を 30 分単位で丸めてキャッシュ粒度を揃える。秒と微秒は落とす。
     bucket_minute = (departure_time.minute // _GMAPS_TIME_BUCKET_MINUTES) * _GMAPS_TIME_BUCKET_MINUTES
     bucketed = departure_time.replace(minute=bucket_minute, second=0, microsecond=0)
     cache_key = (
@@ -832,9 +789,8 @@ def _estimate_travel_seconds_gmaps(
     if cache_key in _GMAPS_CACHE:
         return _GMAPS_CACHE[cache_key]
     try:
-        # transit モードで日本の JR・私鉄・バス・地下鉄を含む経路検索を行う。
-        # `departure_time` を過去時刻にすると 400 になるため、過去なら "now" にフォールバックする。
-        # `departure_time` が aware なら real-now も aware に合わせる (naive と aware の比較エラー回避)。
+        # departure_time を過去時刻にすると 400 になるため、過去なら "now" にフォールバック
+        # する。naive と aware の比較エラー回避のため real-now も tz を合わせる。
         real_now = datetime.now(departure_time.tzinfo) if departure_time.tzinfo else datetime.now()
         depart_arg: Any = departure_time if departure_time > real_now else "now"
         result = client.directions(
@@ -849,7 +805,7 @@ def _estimate_travel_seconds_gmaps(
         return None
 
     if not result:
-        # transit で経路が見つからない場合 (深夜帯や公共交通が届かない場所) は driving で再試行する。
+        # transit で経路がない (深夜帯や公共交通が届かない場所) 場合は driving で再試行
         try:
             result = client.directions(
                 (lat1, lng1), (lat2, lng2),
@@ -879,8 +835,8 @@ def _estimate_travel_seconds_haversine(
 ) -> tuple[float, str]:
     """フォールバックの実装。Haversine と距離レンジ別平均速度で下限を推定する。
 
-    Haversine 直線距離に `ROAD_DISTANCE_FACTOR` を掛けて実道路距離を推定し、距離レンジで手段を
-    自動選択したうえで、手段固有の乗換・準備オーバーヘッドを加える。
+    Haversine 直線距離に `ROAD_DISTANCE_FACTOR` を掛けた値を実道路距離とみなし、距離レンジで
+    手段を自動選択して、手段固有の乗換・準備オーバーヘッドを加える。
     """
     straight_m = _distance_m(lat1, lng1, lat2, lng2)
     road_m = straight_m * ROAD_DISTANCE_FACTOR
@@ -904,9 +860,9 @@ def estimate_travel_seconds(
 ) -> tuple[float, str]:
     """2 点間の常識的な最短移動時間 [秒] と使用手段名を返す。
 
-    `GMAPS_KEY` があれば Google Maps Directions API で実移動時間を取得する。
-    `departure_time` を渡せば、始発待ちや終電の運行時刻も加味された duration が返る。
-    キーが無い場合や API 失敗時は Haversine と距離レンジ別平均速度にフォールバックする。
+    `GMAPS_KEY` があれば Google Maps Directions API で実移動時間を取得し、`departure_time`
+    を渡せば始発待ちや終電の運行時刻も加味された duration が返る。キー未設定や API 失敗時は
+    Haversine + 距離レンジ別平均速度にフォールバックする。
     """
     if departure_time is None:
         departure_time = datetime.now(JST)
@@ -930,13 +886,12 @@ def humanize_duration(seconds: float) -> str:
     return f"{s}s"
 
 
-# 交通機関の稼働時間帯。深夜帯 (24:00-06:00) は移動不可とする。
-# 早朝始発以前の長距離移動は JR も私鉄も動いておらず、車移動でも人間の睡眠時間帯にあたるため不自然になる。
+# 交通機関の稼働時間帯。深夜帯 (24:00-06:00) は JR も私鉄も動かず、車移動でも睡眠時間帯に
+# あたって不自然になるため移動不可扱いにする。
 TRAVEL_ACTIVE_START_HOUR = 6
-TRAVEL_ACTIVE_END_HOUR = 24  # 24 = 翌 0 時。24 時ちょうどを非稼働の開始として扱う。
+TRAVEL_ACTIVE_END_HOUR = 24  # 翌 0 時ちょうどを非稼働の開始として扱う
 
-# 1 スポットあたりの滞在時間の想定範囲 [秒]。店に入り、チェックインし、買い物や食事をしてから
-# 次のスポットへ移動する自然な滞在を模擬する。
+# 店に入り、チェックインし、買い物や食事をしてから次スポットへ、という自然な滞在を模擬する
 STAY_DURATION_MIN_SEC = 10 * 60
 STAY_DURATION_MAX_SEC = 30 * 60
 
@@ -949,51 +904,45 @@ def natural_stay_seconds() -> float:
 def next_arrival_time(now: datetime, travel_seconds: float) -> datetime:
     """`now` から `travel_seconds` 移動した場合の現実的な到着時刻を返す。
 
-    現実の交通機関は深夜帯 (24:00-06:00) に動かない。「移動の途中で駅に泊まって朝に再開」は
-    不可能なので、出発時点で「今日中に完了できない旅」は旅そのものを翌朝 06:00 発へ
-    押し戻す。翌日も収まらないケース (24 時間を超える移動) はさらに翌日へ押される。
+    深夜帯 (24:00-06:00) は交通機関が動かず「駅で寝てから朝に再開」もできないため、
+    今日中に到着できない旅は旅程ごと翌朝 06:00 発へ押し戻す。24 時間超の旅はさらに翌日へ。
     """
     if travel_seconds <= 0:
         return now
 
     cursor = now
-    # 早朝すぎる場合は始発想定の 06:00 まで待機する
     if cursor.hour < TRAVEL_ACTIVE_START_HOUR:
         cursor = cursor.replace(
             hour=TRAVEL_ACTIVE_START_HOUR, minute=0, second=0, microsecond=0
         )
 
     while True:
-        # 今日の稼働終了時刻 (24:00 = 翌日 00:00)
         day_end = (cursor + timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         arrival = cursor + timedelta(seconds=travel_seconds)
         if arrival <= day_end:
             return arrival
-        # 今日中に着かない場合は、旅程ごと翌朝 06:00 発へ押し戻す
         cursor = day_end.replace(hour=TRAVEL_ACTIVE_START_HOUR)
 
 
 def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
-    """`spot["checkin_end_datetime"]` を JST の aware datetime にパースする。失敗時は None を返す。
+    """`spot["checkin_end_datetime"]` を JST の aware datetime にパースする。失敗時は None。
 
-    サーバは `YYYY-MM-DD HH:MM:SS` 形式 (JST) で返してくるが、ISO8601 `Z` 付きの
-    レスポンスに切り替わった場合にも扱えるよう isoformat も試す。パース失敗時は
-    呼び出し側で「fail closed = 期限判定できないなら実 POST を止める」扱いにする。
+    現行は `YYYY-MM-DD HH:MM:SS` (JST) 形式だが、ISO8601 `Z` 付きへ切り替わっても扱える
+    ように isoformat も試す。パース失敗は呼び出し側で「fail closed = 期限判定できないなら
+    実 POST を止める」扱いにする前提。
     """
     raw = spot.get("checkin_end_datetime")
     if not raw:
         return None
     if not isinstance(raw, str):
         return None
-    # 1) 現行仕様の "YYYY-MM-DD HH:MM:SS" (JST 前提)
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
             return datetime.strptime(raw, fmt).replace(tzinfo=JST)
         except ValueError:
             pass
-    # 2) ISO 8601 (Z 付き、あるいは offset 付き)
     iso = raw.replace("Z", "+00:00")
     try:
         parsed = datetime.fromisoformat(iso)
@@ -1015,14 +964,12 @@ def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
 #       spot_slug, spot_name, location_latitude, location_longitude,
 #       virtual_completed_at (ISO8601 JST-aware), real_completed_at (ISO8601 UTC)
 #     },
-#     "completed_spots": ["cg_vote2026_XX", ...]   # 過去にチェックイン成功したスポット slug の集合
+#     "completed_spots": ["cg_vote2026_XX", ...]
 #   }
 #
-# LAST_CHECKIN_SCHEMA_VERSION は last_checkin レコードのバージョン。過去に dry-run 経路が
-# state を書いていた版があり、last_checkin の中身だけでは実 POST 由来かどうか判別できない。
-# 現行版 (このコード) は実 POST 成功時のみこのフィールドを書くので、値が最新版と一致する
-# レコードだけを resume に使う。値が異なる場合や存在しない場合は「信頼できない旧 state」として
-# lat/lng/resume_at を無視する。
+# 旧版の dry-run 経路も state を書いていたため、last_checkin の中身だけでは実 POST 由来
+# かどうか判別できない。LAST_CHECKIN_SCHEMA_VERSION は「実 POST 成功でだけ書かれた」ことを
+# 保証するためのマーカーで、値が一致しないレコードは lat/lng/resume_at を無視する。
 LAST_CHECKIN_SCHEMA_VERSION = 2
 _STATE_FILENAME = "canvasser_state.json"
 
@@ -1034,13 +981,11 @@ class StateFileCorruptedError(Exception):
 class FailClosedError(Exception):
     """実行モードで安全に継続できない状況で送出する。
 
-    `process_account` でキャッチして exit_code=1 に反映する。タスクスケジューラや
-    運用ログ上でも「正常終了」に見えないよう、確実に nonzero で抜けるための例外となる。
+    `process_account` でキャッチして exit_code=1 に反映することで、タスクスケジューラや
+    運用ログ上でも「正常終了」に見えないようにする。
 
-    partial_gained は、この例外を投げるまでに集計済みの獲得見込み (実 POST 成功済み分) を持つ。
-    `collect_checkins` が途中で fail-closed する場合でも、サーバ側で成功した POST の
-    reward を集計から落とさないために保持する。例外を投げない通常経路の gained と
-    合流させる責務は呼び出し側にある。
+    partial_gained は、fail-closed 前にサーバ側で成功済みだった POST の reward を集計から
+    落とさないために持たせる。通常経路の gained と合流させる責務は呼び出し側にある。
     """
 
     def __init__(self, msg: str, partial_gained: int = 0) -> None:
@@ -1056,15 +1001,13 @@ class UserInputError(Exception):
     """
 
 
-# state.json の期待スキーマ。strict モードではこれをチェックし、通らないものは
-# 破損扱いで fail closed とする。
 _SPOT_SLUG_RE = re.compile(r"^cg_vote2026_[0-9]{1,6}$")
 
 
 def _validate_state_schema(state: dict[str, Any], source: Path) -> None:
     """load 時にスキーマを検証する。壊れていれば StateFileCorruptedError を送出する。
 
-    strict モード専用のガードとなる。dry-run では緩めに扱うため、この関数は呼ばれない。
+    strict モード専用のガード。dry-run では緩めに扱うため呼ばれない。
     """
     completed = state.get("completed_spots")
     if completed is not None:
@@ -1091,18 +1034,16 @@ def _validate_state_schema(state: dict[str, Any], source: Path) -> None:
         ):
             v = last.get(k)
             if v is None:
-                continue  # 部分的な dict は許容する (旧 schema 互換のため)
+                continue  # 旧 schema 互換のため部分 dict は許容する
             if not isinstance(v, typ):
                 raise StateFileCorruptedError(
                     f"{source}: last_checkin.{k} の型が不正 (期待 {typ})"
                 )
-        # spot_slug がある場合は正規表現マッチも要求する
         slug = last.get("spot_slug")
         if isinstance(slug, str) and not _SPOT_SLUG_RE.fullmatch(slug):
             raise StateFileCorruptedError(
                 f"{source}: last_checkin.spot_slug {slug!r} が cg_vote2026_NNNN 形式でない"
             )
-        # virtual_completed_at がある場合は datetime としてパース可能か検証する
         vca = last.get("virtual_completed_at")
         if isinstance(vca, str):
             try:
@@ -1117,10 +1058,9 @@ def _validate_state_schema(state: dict[str, Any], source: Path) -> None:
 def load_account_state(profile_dir: Path, strict: bool = False) -> dict[str, Any]:
     """`profile_dir/canvasser_state.json` を読み込む。
 
-    - 存在しない場合は空 dict を返す。
-    - JSON パース失敗時は、`strict=False` なら空 dict を返す (dry-run 用に緩め扱い)。
-      `strict=True` の場合は `StateFileCorruptedError` を送出する (`--execute` の fail closed)。
-    - `strict=True` の場合は追加で schema 検証も行う。
+    strict=False は dry-run 用の緩め扱いで、パース失敗や型不一致でも空 dict を返す。
+    strict=True は `--execute` 用で、破損時に `StateFileCorruptedError` を送出し、
+    追加でスキーマ検証も行う。
     """
     state_file = profile_dir / _STATE_FILENAME
     if not state_file.exists():
@@ -1143,8 +1083,8 @@ def load_account_state(profile_dir: Path, strict: bool = False) -> dict[str, Any
 def save_account_state(profile_dir: Path, state: dict[str, Any]) -> None:
     """`profile_dir/canvasser_state.json` に atomic に書き出す。
 
-    同じディレクトリに一時ファイルを作り、fsync の後に `os.replace` で置換する。
-    書き込み中にプロセスがクラッシュしても既存ファイルは壊れない。
+    一時ファイルへ書いて fsync してから `os.replace` で置換する。書き込み中に
+    クラッシュしても既存ファイルは壊れない。
     """
     profile_dir.mkdir(parents=True, exist_ok=True)
     state_file = profile_dir / _STATE_FILENAME
@@ -1158,7 +1098,7 @@ def save_account_state(profile_dir: Path, state: dict[str, Any]) -> None:
             os.fsync(f.fileno())
         os.replace(tmp_path, state_file)
     except Exception:
-        # 失敗時は一時ファイルを掃除して例外を伝播する (state_file は変更しない)
+        # 失敗時は一時ファイルだけ掃除して例外を伝播する (state_file はそのまま残す)
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -1172,11 +1112,10 @@ def update_checkin_state(
     virtual_now: datetime,
     mark_completed: bool = True,
 ) -> None:
-    """1 件チェックインに成功したら state を更新する。
+    """1 件チェックイン成功時に state を更新する。
 
-    - `last_checkin`：最終チェックイン地点と仮想時刻・実時刻。
-    - `completed_spots`：`mark_completed=True` の場合、`spot.slug` を集合に追加する。
-      これで次回起動時に同スポットへの実 POST を事前に skip できる。
+    `mark_completed=True` の場合、`spot.slug` を `completed_spots` へ追加して次回起動時の
+    事前 skip 対象にする。
     """
     state = load_account_state(profile_dir)
     state["last_checkin"] = {
@@ -1200,21 +1139,16 @@ def resume_context(
 ) -> tuple[float | None, float | None, datetime | None, set[str]]:
     """state.json から前回位置・仮想終了時刻・完了済みスポット集合を復元する。
 
-    戻り値は `(last_lat, last_lng, resume_at, completed_spots)`。
-      - `last_lat` と `last_lng`：前回最終チェックイン地点。state が空なら None。
-      - `resume_at`：前回終了時刻 (仮想の JST aware)。
-                     スキーマ上は「滞在時間を含めない出発直前の仮想時刻」を保存する。
-      - `completed_spots`：実 POST 成功済みスポット slug の集合。起動時の事前フィルタに使う。
-        旧版の dry-run 経路も `update_checkin_state` を叩いていたため、`last_checkin`
-        フィールドから「実 POST 成功済み」を後方から推定する手段がない。誤って dry-run 由来の
-        slug を完了扱いすると次回 `--execute-checkin` でそのスポットの reward を落とすため、
-        自動移行はしない。旧 state の補完が必要な場合は `--mark-completed` を明示的に使う。
+    旧版の dry-run 経路も `update_checkin_state` を叩いていたため、`last_checkin` から
+    「実 POST 成功済み」を後方推定する手段がない。誤って dry-run 由来の slug を完了扱い
+    すると次回 `--execute-checkin` で reward を落とすので、自動移行はしない。旧 state の
+    補完が必要なら `--mark-completed` を明示的に使う。
     """
     state = load_account_state(profile_dir, strict=strict)
     last = state.get("last_checkin") or {}
     # schema_version が一致しない last_checkin は「実 POST 成功由来か」を保証できないため
-    # resume には使わない。旧 dry-run が simulated route を書いた state を execute run で
-    # 起点にしてしまうと、偽の位置や時刻から始まり有効スポットを skip する事故になる。
+    # resume には使わない。旧 dry-run の simulated route を execute run の起点にすると、
+    # 偽の位置と時刻から始まって有効スポットを skip する事故になる。
     schema_ok = last.get("schema_version") == LAST_CHECKIN_SCHEMA_VERSION
     lat = last.get("location_latitude") if schema_ok else None
     lng = last.get("location_longitude") if schema_ok else None
@@ -1238,12 +1172,11 @@ def resume_context(
 
 
 def mark_spots_completed(profile_dir: Path, slugs: list[str]) -> None:
-    """外部から手動で成功済みスポットを state に登録するための CLI 用ヘルパー。
+    """外部から手動で成功済みスポットを state に登録する CLI 用ヘルパー。
 
-    実観測せずに「サーバ側では既に成功済み」と分かっているケース (別デバイスや
-    UI キャプチャ経由で checkin した分) を state に流し込むために使う。
-    `strict=True` で読み込むため、既存の state.json が破損している場合は
-    `StateFileCorruptedError` で失敗する (破損 state を空 dict で上書きするのを防ぐ)。
+    別デバイスや UI キャプチャで既に checkin 済みの分を流し込むために使う。既存 state.json
+    が破損している場合は `StateFileCorruptedError` を上げて、破損 state を空 dict で
+    上書きしてしまうのを防ぐ。
     """
     invalid = [s for s in slugs if not _SPOT_SLUG_RE.fullmatch(s)]
     if invalid:
@@ -1257,9 +1190,9 @@ def mark_spots_completed(profile_dir: Path, slugs: list[str]) -> None:
 
 
 def ensure_chromium_installed() -> None:
-    """Playwright の Chromium バイナリが未取得なら `playwright install chromium` を走らせる。
+    """Chromium バイナリが未取得なら `playwright install chromium` を走らせる。
 
-    `uv run` の初回起動でも自動で解決したいので、冪等に呼べるようにしておく。
+    `uv run` の初回起動から冪等に呼べるようにしておく。
     """
     with sync_playwright() as p:
         exe = p.chromium.executable_path
@@ -1275,8 +1208,8 @@ def ensure_chromium_installed() -> None:
 def run_login_flow(page: Page, timeout_sec: int = 600, interval_sec: float = 3.0) -> int:
     """headed で起動し、ログイン成功を is_login フラグでポーリング検知する。
 
-    対話入力に頼らないので、bash-input のような非対話環境でも動作する。
-    ブラウザを閉じるか Ctrl+C で中断できる。
+    対話入力に頼らないので、bash-input のような非対話環境でも動作する。中断はブラウザを
+    閉じるか Ctrl+C で行える。
     """
     print("ブラウザが立ち上がりました。", file=sys.stderr)
     print(
@@ -1298,8 +1231,7 @@ def run_login_flow(page: Page, timeout_sec: int = 600, interval_sec: float = 3.0
                 )
                 return 0
         except PlaywrightError:
-            # ページ遷移中や、ログイン画面へのリダイレクト中は fetch が失敗する。
-            # 次のポーリングを待つ。
+            # ログイン画面へのリダイレクト中などに fetch は失敗する。次のポーリングを待つ。
             pass
         time.sleep(interval_sec)
 
@@ -1310,8 +1242,7 @@ def run_login_flow(page: Page, timeout_sec: int = 600, interval_sec: float = 3.0
     return 1
 
 
-# アカウント名の許容文字集合。パストラバーサル (../) や絶対パス指定を排除するため、
-# basename として安全な文字だけを許可する。
+# パストラバーサル (../) や絶対パス指定を排除するため、basename として安全な文字集合に限定
 _ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
@@ -1321,7 +1252,7 @@ def _validate_account_name(account: str) -> None:
             f"--account の値 {account!r} は許可されていません。"
             "使える文字は英数字・'_'・'-'・'.' のみで、長さは 1〜64 文字です。"
         )
-    # 追加の防御として、'.' や '..' 単体、パス区切り文字を含むケースを弾く
+    # 正規表現は '.' や '..' 単体を通してしまうので、パス区切り含めここで追加防御する
     if account in (".", "..") or any(sep in account for sep in ("/", "\\")):
         raise UserInputError(
             f"--account の値 {account!r} はパスとして危険なため許可されません。"
@@ -1329,7 +1260,7 @@ def _validate_account_name(account: str) -> None:
 
 
 def _ensure_within(base: Path, candidate: Path) -> None:
-    """`candidate` が `base` の子孫ディレクトリであることを検証する。そうでなければ UserInputError を送出する。"""
+    """`candidate` が `base` の子孫であることを保証する。逸脱時は UserInputError を送出する。"""
     try:
         candidate.resolve().relative_to(base.resolve())
     except ValueError as e:
@@ -1339,27 +1270,27 @@ def _ensure_within(base: Path, candidate: Path) -> None:
 
 
 def _profiles_dir_is_gitignored(profiles_dir: Path) -> bool:
-    """`profiles_dir` が git ignore 対象であれば True を返す。
+    """`profiles_dir` が git ignore 対象なら True。
 
-    `profiles_dir` がまだ存在しない (初回 `--login` 前) ケースでも判定したいので、path 末尾
-    に `/` を付けてディレクトリ扱いを git に明示する。`.gitignore` の `profiles/` のような
-    ディレクトリ限定パターンは、path 側が「ディレクトリと分かる」形でないと match しないため。
+    profiles_dir がまだ存在しない (初回 `--login` 前) ケースでも判定できるよう、path 末尾
+    に `/` を付けてディレクトリと明示する。`.gitignore` の `profiles/` のようなディレクトリ
+    限定パターンは、path 側もディレクトリと分かる形でないと match しない。
 
-    git repo 外の場合は False を返す (誤コミット経路がないので判定不能扱いとし、拒否側にする)。
-    git 自体が使えない環境も False とする。`git check-ignore --quiet` の exit code は
-    0=ignored、1=not ignored、128=error (repo 外) を返す。
+    git repo 外や git 自体が使えない環境では False を返す (誤コミット経路を判定できないため
+    拒否側に倒す)。`git check-ignore --quiet` の exit は 0=ignored、1=not ignored、
+    128=error (repo 外)。
     """
-    # git の実体を PATH から解決する。S607 対策で partial path を渡さない。
+    # PATH から git 実体を解決する。S607 対策で partial path を渡さない。
     git_bin = shutil.which("git")
     if git_bin is None:
         return False
-    # Windows の path 区切りは git に渡す前に正規化する。末尾 / でディレクトリと明示する。
+    # git に渡す前に Windows の path 区切りを正規化し、末尾 / でディレクトリを明示する
     path_arg = str(profiles_dir).replace("\\", "/").rstrip("/") + "/"
     parent = profiles_dir.parent
     cwd = parent if parent.is_dir() else Path.cwd()
     try:
-        # `--` を挟むことで、`-` で始まるユーザー指定パスが option 扱いされないようにする。
-        # 引数リストは shell=False で渡すため、shell injection は起こらない。
+        # `--` で option 終端を明示することで、`-` から始まるユーザー指定パスを option 扱い
+        # されないようにする。shell=False なので shell injection は起こらない。
         result = subprocess.run(  # noqa: S603
             [git_bin, "check-ignore", "--quiet", "--", path_arg],
             cwd=cwd,
@@ -1376,10 +1307,10 @@ def resolve_profiles(
     profiles_dir: Path,
     account: str | None,
 ) -> list[tuple[str, Path]]:
-    """CLI 引数から処理対象のプロファイル一覧 `[(表示名, ディレクトリ), ...]` を決定する。
+    """処理対象のプロファイル一覧 `[(表示名, ディレクトリ), ...]` を決定する。
 
-    - `--account NAME` を指定すれば 1 アカウント固定となる (basename 文字種を検証する)。
-    - 未指定なら `--profiles-dir` 配下のサブディレクトリを全列挙する (複数アカウント運用)。
+    `account` を指定すれば 1 アカウント固定、未指定なら `profiles_dir` 配下のサブディレクトリを
+    全列挙する。
     """
     if account:
         _validate_account_name(account)
@@ -1392,7 +1323,7 @@ def resolve_profiles(
     for entry in sorted(profiles_dir.iterdir()):
         if not entry.is_dir():
             continue
-        # 既存ディレクトリ名も同じ規則で検証する (手動作成された悪性ディレクトリ対策)。
+        # 手動作成された悪性ディレクトリを排除するため、既存名も同じ規則で検証する
         if not _ACCOUNT_NAME_RE.fullmatch(entry.name):
             print(
                 f"[warn] プロファイル名 {entry.name!r} が命名規則に合致しないため skip します。",
@@ -1406,7 +1337,7 @@ def resolve_profiles(
 
 
 def open_persistent_context(p, profile_dir: Path, headless: bool):
-    """`persistent_context` を開く。Chromium が未取得の場合は install してからリトライする。"""
+    """persistent_context を開く。Chromium 未取得のエラーが出たら install してリトライする。"""
     kwargs: dict[str, Any] = {
         "headless": headless,
         "viewport": {"width": 1280, "height": 900},
@@ -1437,11 +1368,9 @@ def process_account(
 ) -> tuple[int, int]:
     """1 アカウント分の処理を行う。戻り値は `(獲得票数, exit_code)`。
 
-    - `login_mode=True` のときは獲得票数を集計しない (戻り値は獲得 0)。
-    - 未ログイン検知時は `exit_code=1` を返し、呼び出し側で他アカウントに進む。
-    - `run_mission=True` でミッション回収、`run_checkin=True` でチェックインを実施する。
-    - `execute_mission` と `execute_checkin` はそれぞれ独立した実 POST ゲート。
-      両方 False なら完全ドライランとなる (GET のみで、POST/PUT は送らない)。
+    `execute_mission` と `execute_checkin` はそれぞれ独立した実 POST ゲートで、両方 False
+    なら完全ドライラン (GET のみで POST/PUT は送らない)。未ログイン検知時は exit_code=1 を
+    返し、呼び出し側で他アカウントへ進む。
     """
     profile_dir.mkdir(parents=True, exist_ok=True)
     ctx = open_persistent_context(p, profile_dir, headless=not login_mode)
@@ -1463,12 +1392,12 @@ def process_account(
         gained = 0
         exit_code = 0
         if run_mission:
-            # 実 POST を送らないドライランの見込み枚数は集計に混ぜない (アカウント総計を汚さない)。
+            # dry-run の見込み枚数は集計に混ぜず、アカウント総計を汚さない
             mission_gain = collect_missions(page, execute=execute_mission)
             if execute_mission:
                 gained += mission_gain
         if run_checkin:
-            # チェックインページにも navigate しておく (Referer を合わせる意図)
+            # Referer を合わせるためチェックインページに一度 navigate しておく
             page.goto(CHECKIN_PAGE_URL, wait_until="domcontentloaded")
             try:
                 checkin_gain = collect_checkins(
@@ -1482,10 +1411,8 @@ def process_account(
                 if execute_checkin:
                     gained += checkin_gain
             except FailClosedError as e:
-                # state 破損や deadline パース不能など、「安全に継続できない」ケース。
-                # ログを stderr に流し、exit_code を nonzero に切り替える。
-                # fail-closed 前にサーバ側で成功済みの POST 分は `e.partial_gained` に
-                # 入っているので、集計から落とさない。
+                # fail-closed 前に成功していた POST の reward は e.partial_gained に入って
+                # いるので、集計から落とさないよう合流させる。
                 print(f"[{name}] fail closed: {e}", file=sys.stderr)
                 if execute_checkin:
                     gained += e.partial_gained
@@ -1584,9 +1511,8 @@ def _main_impl() -> int:
     )
     args = parser.parse_args()
 
-    # 上限系 CLI 引数の範囲検証。--daily-budget は 0=無制限扱いだが、負数を許すと
-    # limit_counter 判定が常時 truthy になり、実 POST 上限が壊れる。その他の閾値も
-    # 1 未満だと本来の役割 (連続失敗打ち切り、範囲外累積打ち切り) を果たせない。
+    # --daily-budget=0 は無制限として扱うが、負数を許すと limit_counter 判定が常時 truthy
+    # になって実 POST 上限が壊れる。他の閾値も 1 未満だと本来の役割を果たせないので弾く。
     if args.daily_budget < 0:
         print("--daily-budget は 0 以上を指定してください。", file=sys.stderr)
         return 1
@@ -1602,7 +1528,7 @@ def _main_impl() -> int:
 
     profiles_dir = Path(args.profiles_dir).resolve()
 
-    # --mark-completed は state を編集して即終了する (ブラウザ起動なし)。
+    # --mark-completed は state を編集して即終了する (ブラウザ起動なし)
     if args.mark_completed is not None:
         if args.account is None:
             print(
@@ -1623,7 +1549,6 @@ def _main_impl() -> int:
                 file=sys.stderr,
             )
             return 1
-        # UserInputError は main() のトップレベルで捕捉される。
         return 0
 
     profiles = resolve_profiles(profiles_dir, args.account)
@@ -1643,7 +1568,6 @@ def _main_impl() -> int:
         )
         return 1
 
-    # 実行対象を判定する。`--checkin` と `--no-mission` の組み合わせで挙動を切り替える。
     run_mission = not args.no_mission
     run_checkin = args.checkin
     if args.no_mission and not args.checkin:
@@ -1652,8 +1576,8 @@ def _main_impl() -> int:
             file=sys.stderr,
         )
         return 1
-    # 実行ゲート単独指定を拒否する。対応する対象フラグが無いと黙って dry-run で終わり、
-    # 「実 POST を送ったつもりが送られていない」誤運用に繋がるため。
+    # 実行ゲート単独指定を弾く。対応する対象フラグが無いと黙って dry-run になり、
+    # 「実 POST を送ったつもりが送られていない」誤運用に繋がる。
     if args.execute_mission and not run_mission:
         print(
             "--execute-mission は --no-mission と併用できません。",
@@ -1667,10 +1591,9 @@ def _main_impl() -> int:
         )
         return 1
 
-    # `profiles_dir` が git ignore 対象か検証する。Cookie 書き込みは login や実 POST 経路
-    # だけでなく、GET のみのドライラン中の persistent context 経由でも起こりうる
-    # (Playwright は cookie・cache・metadata を随時同期する)。そのため実行モードに関係なく、
-    # gitignore 未対応なら停止させる。
+    # Playwright は GET のみのドライラン中でも persistent context で cookie・cache・
+    # metadata を同期する。Cookie 誤コミットを防ぐため、実行モードに関係なく gitignore
+    # 未対応の profiles_dir は拒否する。
     if not args.allow_unignored_profiles_dir:
         if not _profiles_dir_is_gitignored(profiles_dir):
             print(
@@ -1712,7 +1635,7 @@ def _main_impl() -> int:
             if code != 0:
                 exit_code = code
             if args.login:
-                # ログインは 1 アカウントのみ。process_account の戻り値をそのまま返す。
+                # --login は 1 アカウントのみ処理して抜ける
                 return code
 
     if len(profiles) > 1:
