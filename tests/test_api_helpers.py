@@ -33,15 +33,15 @@ class TestAsStrDict:
     @pytest.mark.parametrize(
         "value",
         [
-            ("[1, 2]",),
-            (None,),
-            (123,),
-            ("text",),
+            "[1, 2]",
+            None,
+            123,
+            "text",
         ],
     )
-    def test_dict以外はNoneを返す(self, value: tuple[object]) -> None:
+    def test_dict以外はNoneを返す(self, value: object) -> None:
         """list・None・数値・文字列は None に丸められる。"""
-        assert canvasser._as_str_dict(value[0]) is None
+        assert canvasser._as_str_dict(value) is None
 
 
 class TestExtractEcode:
@@ -55,18 +55,18 @@ class TestExtractEcode:
     @pytest.mark.parametrize(
         "body",
         [
-            (None,),
-            ("non-json-text",),
-            ({},),
-            ({"payload": {}},),
-            ({"payload": None},),
-            ({"payload": "text"},),
-            ({"payload": [1, 2]},),
+            None,
+            "non-json-text",
+            {},
+            {"payload": {}},
+            {"payload": None},
+            {"payload": "text"},
+            {"payload": [1, 2]},
         ],
     )
-    def test_ecodeが無ければNone(self, body: tuple[object]) -> None:
+    def test_ecodeが無ければNone(self, body: object) -> None:
         """body・payload が dict でない、または ecode 欠落はすべて None。"""
-        assert canvasser._extract_ecode(body[0]) is None
+        assert canvasser._extract_ecode(body) is None
 
 
 class TestIsSuccessResponse:
@@ -150,13 +150,13 @@ class TestCheckLogin:
     @pytest.mark.parametrize(
         "response",
         [
-            ({"status": "SUCCESS", "payload": {"is_login": False}},),
-            ({"status": "SUCCESS", "payload": {}},),
-            ({"status": "ERROR", "payload": {}},),
-            ({"status": "ERROR", "payload": None},),
+            {"status": "SUCCESS", "payload": {"is_login": False}},
+            {"status": "SUCCESS", "payload": {}},
+            {"status": "ERROR", "payload": {}},
+            {"status": "ERROR", "payload": None},
         ],
     )
-    def test_未ログインや異常応答はFalse(self, response: tuple[object]) -> None:
+    def test_未ログインや異常応答はFalse(self, response: object) -> None:
         """is_login 欠落・False・エラー応答はすべて未ログイン扱い。"""
-        fake = FakePage([response[0]])
+        fake = FakePage([response])
         assert canvasser.check_login(_as_page(fake)) is False

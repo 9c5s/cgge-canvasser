@@ -171,13 +171,13 @@ class TestParseCheckinDeadline:
     @pytest.mark.parametrize(
         "raw",
         [
-            (None,),
-            ("",),
-            (20260731,),
-            ("31/07/2026",),
-            ("invalid",),
+            None,
+            "",
+            20260731,
+            "31/07/2026",
+            "invalid",
         ],
     )
-    def test_パース不能はNone(self, raw: tuple[object]) -> None:
+    def test_パース不能はNone(self, raw: object) -> None:
         """欠落・非文字列・未知形式はすべて None を返す。"""
-        assert canvasser.parse_checkin_deadline(self._spot(raw[0])) is None
+        assert canvasser.parse_checkin_deadline(self._spot(raw)) is None

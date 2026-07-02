@@ -213,8 +213,12 @@ class TestResumeContext:
 class TestMarkSpotsCompleted:
     """mark_spots_completed の手動登録。"""
 
-    def test_slugを昇順で追記する(self, tmp_path: Path) -> None:
-        """既存の completed_spots とマージしてソート順で保存する。"""
+    def test_slugを辞書順で追記する(self, tmp_path: Path) -> None:
+        """既存の completed_spots とマージして辞書順 (文字列順) で保存する。
+
+        ソートは差分の読みやすさのための決定的順序であり、数値としての昇順
+        (3 → 5 → 10) は仕様ではない。
+        """
         canvasser.save_account_state(tmp_path, {"completed_spots": ["cg_vote2026_5"]})
 
         canvasser.mark_spots_completed(tmp_path, ["cg_vote2026_3", "cg_vote2026_10"])

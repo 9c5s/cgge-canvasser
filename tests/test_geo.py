@@ -64,10 +64,10 @@ class TestDistanceM:
 class TestRandomPointInCircle:
     """random_point_in_circle の生成点の性質。"""
 
-    @pytest.mark.parametrize("seed", [(0,), (1,), (42,), (1234,)])
-    def test_生成点は半径内に収まる(self, seed: tuple[int]) -> None:
+    @pytest.mark.parametrize("seed", [0, 1, 42, 1234])
+    def test_生成点は半径内に収まる(self, seed: int) -> None:
         """どの乱数系列でも生成点は指定半径 (+近似誤差 1%) に収まる。"""
-        random.seed(seed[0])
+        random.seed(seed)
         for _ in range(100):
             lat, lng = canvasser.random_point_in_circle(35.0, 135.0, 500.0)
             d = canvasser._distance_m(35.0, 135.0, lat, lng)
