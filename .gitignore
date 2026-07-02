@@ -1,0 +1,20 @@
+# 認証情報を含むブラウザプロファイル (複数アカウント対応)
+profiles/
+imas_profile/
+*_profile/
+
+# Playwright MCP のデバッグ用ダンプ
+.playwright-mcp/
+
+# 調査中に落ちた大きめの JSON / スナップショット
+mission-response.json
+premium-snapshot.md
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env

@@ -1,0 +1,1160 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "playwright>=1.40.0",
+#     "pycryptodome>=3.19",
+#     "googlemaps>=4.10",
+#     "python-dotenv>=1.0",
+# ]
+# ///
+"""シンデレラガール総選挙2026 ミッション自動回収スクリプト.
+
+Playwrightのpersistent contextでブラウザセッションを保持し, フロントが叩いている
+内部APIをそのまま呼び出して達成報告と投票券受取を自動化する.
+
+初回のみ `--login` で手動ログインし, 以降は headless で毎日実行する運用を想定.
+`--checkin` フラグでチェックイン (#99, 全国スポットへの GPS 位置認証) も自動化する.
+
+推奨実行方法: `uv run canvasser.py [--login] [--checkin]`
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+from dotenv import load_dotenv
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import Page, sync_playwright
+
+# .env をカレントディレクトリからロード. GMAPS_KEY など秘密情報を透過的に注入する.
+load_dotenv()
+
+# Next.js のチャンクから抽出した API 定数. 総選挙2026 用の名前空間.
+API_HOST = "https://api.idolmaster-official.jp"
+API_V1 = f"{API_HOST}/api/v1_1_0"
+API_BASE = "/api/v1_1_0/mileage_vote/cinderellagirls_vote_2026"
+API_KEY = "MEW6XfDHZVtpUxuERAGTaP6AfipAe53kCEFWEMAJ"
+CHECKIN_EVENT_SLUG = "cg_vote2026"
+MISSION_PAGE_URL = (
+    "https://idolmaster-official.jp/cinderellagirls/vote2026/vote/mission"
+)
+CHECKIN_PAGE_URL = f"https://idolmaster-official.jp/mydesk/spot/{CHECKIN_EVENT_SLUG}"
+LOGIN_CHECK_URL = f"{API_HOST}/api/v1_1_0/auths/login/check"
+
+# 地球の1度緯度に対応する距離 (メートル). WGS84近似.
+METERS_PER_DEG_LAT = 111_320.0
+# チェックイン許容半径を少し内側に絞って境界事故を避けるための係数.
+CHECKIN_RADIUS_MARGIN = 0.85
+
+
+def call_api(page: Page, method: str, path: str) -> dict[str, Any]:
+    """ページ内で fetch を実行し, Cookie 付きで API を叩く.
+
+    - 送信元は idolmaster-official.jp, API は api.idolmaster-official.jp と別ホストだが
+      サーバ側で CORS allow-credentials が有効なので credentials=include で通る.
+    - x-api-key はフロント公開の固定値.
+    """
+    url = f"{API_HOST}{API_BASE}{path}"
+    return page.evaluate(
+        """
+        async ([url, method, apiKey]) => {
+          const res = await fetch(url, {
+            method,
+            credentials: 'include',
+            headers: {
+              'x-api-key': apiKey,
+              'accept': 'application/json, text/plain, */*'
+            }
+          });
+          const raw = await res.text();
+          try { return {status: res.status, body: JSON.parse(raw)}; }
+          catch { return {status: res.status, body: raw}; }
+        }
+        """,
+        [url, method, API_KEY],
+    )
+
+
+def check_login(page: Page) -> bool:
+    """auths/login/check を叩いて認証状態を確認する."""
+    result = page.evaluate(
+        """
+        async ([url, apiKey]) => {
+          const res = await fetch(url, {
+            credentials: 'include',
+            headers: {'x-api-key': apiKey}
+          });
+          return await res.json();
+        }
+        """,
+        [LOGIN_CHECK_URL, API_KEY],
+    )
+    return bool(result.get("payload", {}).get("is_login", False))
+
+
+def collect_missions(page: Page) -> int:
+    """API 経由で完了可能な全ミッションを消化する.
+
+    - mission_complete_api_call_flag=True のみ対象.
+      あいことばやチェックインは外部トリガー起因なのでスキップする.
+    - 未達成かつ残挑戦回数ありなら 達成 POST -> 受取 PUT.
+    - 達成済み未受取なら 受取 PUT のみ.
+
+    戻り値は今回獲得した投票券数の合計.
+    """
+    listing = call_api(page, "GET", "/missions?mission_type=0&limit=300")
+    if listing["status"] != 200 or listing["body"].get("status") != "SUCCESS":
+        raise RuntimeError(f"ミッション一覧の取得に失敗: {listing}")
+
+    payload = listing["body"]["payload"]
+    print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
+
+    gained = 0
+    for m in payload["missions"]:
+        mid: int = m["mission_id"]
+        name: str = m["mission_name"]
+        pts: int = m["mission_point"]
+
+        action = m.get("action") or {}
+        if not action.get("mission_complete_api_call_flag"):
+            continue
+
+        completed = bool(m.get("is_mission_completed"))
+        received = bool(m.get("is_mission_received"))
+        remaining = m.get("remaining_completable_count") or 0
+
+        if completed and not received:
+            gained += _receive(page, mid, name, pts)
+            continue
+
+        if not completed and remaining > 0:
+            outcome = _complete(page, mid, name)
+            # 累計達成数系ミッション (#100-104) は他ミッション達成の副作用で
+            # サーバー側は達成扱いになるが, 一覧の completed フラグ更新は遅延する.
+            # 達成POSTが "既に達成済み" を返した場合も受取PUTは通るので試す.
+            if outcome in ("ok", "already_done"):
+                gained += _receive(page, mid, name, pts)
+
+    print(f"今回獲得: {gained}枚")
+    return gained
+
+
+def _complete(page: Page, mid: int, name: str) -> str:
+    """ミッション達成の POST を送る.
+
+    注意: 一覧取得は `/missions` (複数形) だが個別操作は `/mission` (単数形).
+    フロントの `b.eq` 定数が単数形であることをチャンク解析で確認済み.
+
+    戻り値:
+      - "ok"             : 達成成功
+      - "already_done"   : E1906 既に達成済み (受取PUTは試すべき)
+      - "condition_unmet": E1924 達成条件未満 (静かにスキップ)
+      - "error"          : その他失敗
+    """
+    print(f"[達成] #{mid} {name}")
+    res = call_api(page, "POST", f"/mission/{mid}")
+    body = res.get("body") or {}
+    if res["status"] == 200 and body.get("status") == "SUCCESS":
+        print("  -> 成功")
+        return "ok"
+
+    ecode = ((body.get("payload") or {}).get("ecode")) if isinstance(body, dict) else None
+    if ecode == "E1906":
+        print("  -> 既に達成済み (受取を試す)")
+        return "already_done"
+    if ecode == "E1924":
+        print("  -> 条件未達, スキップ")
+        return "condition_unmet"
+
+    print(f"  -> 失敗: HTTP {res['status']} body={body}")
+    return "error"
+
+
+def _receive(page: Page, mid: int, name: str, pts: int) -> int:
+    """投票券受取の PUT を送る. 成功時は加算票数を返す."""
+    print(f"[受取] #{mid} {name} (+{pts})")
+    res = call_api(page, "PUT", f"/mission/{mid}/receive")
+    ok = res["status"] == 200 and (res.get("body") or {}).get("status") == "SUCCESS"
+    if ok:
+        received = ((res.get("body") or {}).get("payload") or {}).get("received_point")
+        print(f"  -> 成功 (received_point={received})")
+        return pts
+    print(f"  -> 失敗: HTTP {res['status']} body={res.get('body')}")
+    return 0
+
+
+# -------------------- チェックイン (#99) 関連 --------------------
+
+def encrypt_coords(coords: dict[str, Any], password: str = API_KEY) -> str:
+    """位置情報 JSON を AES-CBC(PBKDF2, 500iter, SHA-1) で暗号化する.
+
+    フロントエンドの crypto-js 実装を Python 側で再現:
+      - key = PBKDF2(password, salt=random16, iterations=500, keySize=8 words=32B, hasher=SHA1)
+      - iv = random16
+      - ciphertext = AES-CBC(key, iv, PKCS7(JSON.stringify(coords)))
+      - payload = f"{salt.hex()},{iv.hex()},{ct.hex()}"
+    """
+    salt = os.urandom(16)
+    iv = os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha1", password.encode(), salt, 500, dklen=32)
+    plaintext = json.dumps(coords, separators=(",", ":")).encode()
+    ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, 16))
+    return f"{salt.hex()},{iv.hex()},{ciphertext.hex()}"
+
+
+def random_point_in_circle(
+    center_lat: float, center_lng: float, radius_m: float
+) -> tuple[float, float]:
+    """半径 radius_m [m] の円内から面積一様分布でランダム点を返す.
+
+    d = r*sqrt(u), theta = 2*pi*v で面積一様(中心密集を避ける).
+    経度スケールは緯度によって変わるので cos(lat) で補正する.
+    """
+    u = random.random()
+    theta = random.random() * 2 * math.pi
+    d = radius_m * math.sqrt(u)
+    d_lat = (d * math.cos(theta)) / METERS_PER_DEG_LAT
+    d_lng = (d * math.sin(theta)) / (
+        METERS_PER_DEG_LAT * math.cos(math.radians(center_lat))
+    )
+    return center_lat + d_lat, center_lng + d_lng
+
+
+def _natural_accuracy() -> float:
+    """モバイル GPS 屋外の実測分布に近い精度値をランダムに返す [m].
+
+    実機の accuracy は 8〜30m あたりに強く集中し, 稀に 30〜80m の外れ値を出す.
+    一様乱数だと分布フラットで統計的に不自然なので, 正規分布 + 外れ値混合で再現する.
+    """
+    if random.random() < 0.15:
+        # 外れ値: 屋内寄り or マルチパス影響
+        val = random.uniform(30.0, 80.0)
+    else:
+        # 中央値18m 標準偏差6mの正規分布. 5m未満は非現実的なのでクランプ
+        val = max(5.0, random.gauss(18.0, 6.0))
+    return round(val, 3)
+
+
+def _natural_altitude() -> tuple[float | None, float | None]:
+    """altitude / altitudeAccuracy をリアルに乱択して返す.
+
+    - 大多数のケース (80%) は取得不可 → None
+    - 20%は GPS 側で取れた想定. 日本の都市部平地 5〜80m 程度に散らばらせる
+    """
+    if random.random() < 0.20:
+        alt = round(random.uniform(5.0, 80.0), 1)
+        alt_acc = round(random.uniform(20.0, 50.0), 1)
+        return alt, alt_acc
+    return None, None
+
+
+def make_checkin_coords(spot: dict[str, Any]) -> dict[str, Any]:
+    """スポット情報から, 円内ランダム点 + 自然化した coords を組んで返す.
+
+    サーバ側 (あるいは将来の異常検知) で分布統計が取られた場合に BOT っぽくならない
+    ように, accuracy / altitude を実機挙動に近い分布で乱択する.
+    """
+    radius = float(spot.get("checkin_radius") or 500)
+    lat, lng = random_point_in_circle(
+        float(spot["location_latitude"]),
+        float(spot["location_longitude"]),
+        radius * CHECKIN_RADIUS_MARGIN,
+    )
+    alt, alt_acc = _natural_altitude()
+    return {
+        "accuracy": _natural_accuracy(),
+        "latitude": lat,
+        "longitude": lng,
+        "altitude": alt,
+        "altitudeAccuracy": alt_acc,
+        # チェックイン時は「静止して端末を見ている」想定なので heading/speed は null
+        "heading": None,
+        "speed": None,
+    }
+
+
+def call_checkin_api(
+    page: Page,
+    method: str,
+    path: str,
+    body: str | None = None,
+) -> dict[str, Any]:
+    """checkins 系エンドポイントを叩く. body があれば text/plain で送る."""
+    url = f"{API_V1}/checkins{path}"
+    return page.evaluate(
+        """
+        async ([url, method, apiKey, body]) => {
+          try {
+            const res = await fetch(url, {
+              method,
+              credentials: 'include',
+              headers: {
+                'x-api-key': apiKey,
+                'accept': 'application/json, text/plain, */*',
+                ...(body ? {'content-type': 'text/plain;charset=UTF-8'} : {})
+              },
+              body: body ?? undefined,
+            });
+            const raw = await res.text();
+            try { return {status: res.status, body: JSON.parse(raw)}; }
+            catch { return {status: res.status, body: raw}; }
+          } catch (e) {
+            return {status: 0, error: String(e)};
+          }
+        }
+        """,
+        [url, method, API_KEY, body],
+    )
+
+
+# チェックイン API の既知エラーコード. UI 側から抽出したもの.
+# チャンクの表示コードから: "E5005" (チェックイン範囲外), それ以外 (既達成含む) は未確認.
+# 実運用で判明したものを随時 ECODE_* に追加する.
+ECODE_OUT_OF_RANGE = "E5005"
+ECODES_ALREADY_DONE = ("E5006", "E5007", "E5008")  # 既達成/1日1回上限の推定. 実観測して補正する
+
+
+def order_spots_by_proximity(
+    spots: list[dict[str, Any]],
+    start_index: int | None = None,
+    start_location: tuple[float, float] | None = None,
+) -> list[dict[str, Any]]:
+    """最近傍法でスポット順序を決める. 現実の人間の移動に近いルートを生成する.
+
+    - start_location が指定なら, 現在地に最も近いスポットを1件目とする
+      (state.json から前回位置を渡す想定)
+    - start_location 未指定 + start_index 未指定なら開始スポットを乱択
+    - 以降は現在地から Haversine 直線距離が最小のスポットを次に選ぶ
+    - 単純な greedy TSP 近似. 最適ではないが「近場をまとめて回る」自然な挙動になる
+    """
+    if not spots:
+        return []
+    unvisited = list(spots)
+
+    if start_location is not None:
+        # 前回位置に最も近いスポットを1件目に据える
+        cur_lat, cur_lng = start_location
+        nearest_idx = 0
+        nearest_d = float("inf")
+        for i, s in enumerate(unvisited):
+            d = _distance_m(
+                cur_lat, cur_lng,
+                float(s["location_latitude"]), float(s["location_longitude"]),
+            )
+            if d < nearest_d:
+                nearest_d = d
+                nearest_idx = i
+        current = unvisited.pop(nearest_idx)
+    else:
+        if start_index is None:
+            start_index = random.randrange(len(unvisited))
+        current = unvisited.pop(start_index)
+
+    ordered = [current]
+    cur_lat = float(current["location_latitude"])
+    cur_lng = float(current["location_longitude"])
+
+    while unvisited:
+        nearest_idx = 0
+        nearest_d = float("inf")
+        for i, s in enumerate(unvisited):
+            d = _distance_m(
+                cur_lat, cur_lng,
+                float(s["location_latitude"]), float(s["location_longitude"]),
+            )
+            if d < nearest_d:
+                nearest_d = d
+                nearest_idx = i
+        current = unvisited.pop(nearest_idx)
+        ordered.append(current)
+        cur_lat = float(current["location_latitude"])
+        cur_lng = float(current["location_longitude"])
+
+    return ordered
+
+
+def collect_checkins(
+    page: Page,
+    execute: bool = False,
+    daily_budget: int = 0,
+    consecutive_failure_limit: int = 2,
+    profile_dir: Path | None = None,
+    now_fn: Any = datetime.now,
+) -> int:
+    """全スポットに対してチェックインを試みる. 戻り値は獲得票数の見込み.
+
+    セーフティ:
+      - execute=False (デフォルト) は完全ドライラン (POST を送らない, sleep なし)
+      - 既達成スポットは ecode でスキップ
+      - 連続失敗 (`E5005` を除く不明エラー) が consecutive_failure_limit 件で全体中断
+      - daily_budget > 0 で件数上限. daily_budget=0 は無制限.
+      - スポット間には交通機関稼働時間帯 (06:00-24:00) を考慮した移動時間の待機を挟む.
+        深夜帯にまたがる長距離移動は翌朝まで自動的に押される.
+      - 到着時刻がスポットの `checkin_end_datetime` を過ぎたら中断.
+      - 各スポットで 10〜30分の滞在時間を挟む (人間の店内滞在を模擬).
+      - profile_dir があれば state.json に前回最終チェックイン地点を保存し, 次回起動時に
+        そこから続きを再開する.
+    """
+    listing = call_checkin_api(page, "GET", f"/event/{CHECKIN_EVENT_SLUG}")
+    if listing["status"] != 200 or (listing.get("body") or {}).get("status") != "SUCCESS":
+        raise RuntimeError(f"チェックインイベント取得に失敗: {listing}")
+
+    spots = ((listing["body"]) or {}).get("payload", {}).get("spots", [])
+    if not spots:
+        print("チェックイン対象スポットが空でした.")
+        return 0
+
+    # state.json から前回の最終チェックイン地点と仮想時刻を復元.
+    resume_lat: float | None = None
+    resume_lng: float | None = None
+    resume_at: datetime | None = None
+    if profile_dir is not None:
+        resume_lat, resume_lng, resume_at = resume_context(profile_dir)
+
+    # 開始地点: state に前回位置あれば「そこに最も近いスポット」を起点にする.
+    #          なければランダム開始. 以降は最近傍で辿る.
+    start_loc = (
+        (resume_lat, resume_lng) if resume_lat is not None and resume_lng is not None else None
+    )
+    spots = order_spots_by_proximity(spots, start_location=start_loc)
+
+    budget_label = "無制限" if daily_budget <= 0 else f"{daily_budget}件"
+    travel_backend = (
+        "gmaps (公共交通)" if _get_gmaps_client() is not None else "haversine (自前計算)"
+    )
+    print(f"チェックイン対象スポット: {len(spots)}件")
+    print(f"モード: {'EXECUTE (本番)' if execute else 'DRY-RUN (POST送信なし)'}")
+    print(f"移動時間バックエンド: {travel_backend}")
+    print(f"1日あたり上限: {budget_label} / 連続失敗中断: {consecutive_failure_limit}件")
+    print(f"開始スポット: {spots[0]['slug']} {spots[0]['name']}")
+
+    gained = 0
+    successful = 0
+    consecutive_failures = 0
+
+    # 現在時刻を追跡. state に前回終了時刻があれば now と比較して大きい方を採用する.
+    # これで「前回23:50に終わって翌日12:00に再開」も自然に連続扱いになる.
+    virtual_now: datetime = now_fn()
+    if resume_at is not None and resume_at > virtual_now:
+        virtual_now = resume_at
+    resumed = start_loc is not None
+    print(f"開始時刻(仮想): {virtual_now:%Y-%m-%d %H:%M}"
+          + (f" (前回位置から再開: {resume_lat:.4f},{resume_lng:.4f})" if resumed else ""))
+
+    # 「1件目に前回位置がある」場合, 直前スポットは前回位置扱いなので
+    # 1件目の前にも移動時間を計算する必要がある. resumed で分岐制御する.
+    prev_lat: float | None = resume_lat if resumed else None
+    prev_lng: float | None = resume_lng if resumed else None
+
+    for i, spot in enumerate(spots, 1):
+        if daily_budget > 0 and successful >= daily_budget:
+            print(f"  日次上限 {daily_budget}件に到達. 残り {len(spots) - i + 1}件は次回以降.")
+            break
+
+        slug = spot["slug"]
+        name = spot["name"]
+        s_lat = float(spot["location_latitude"])
+        s_lng = float(spot["location_longitude"])
+
+        # 前回位置(直前スポット or state 復元位置)からの移動時間を計算.
+        if prev_lat is not None:
+            secs, mode = estimate_travel_seconds(
+                prev_lat, prev_lng, s_lat, s_lng,
+                departure_time=virtual_now,
+            )
+            if mode == "gmaps-transit":
+                # transit の duration は Google が始発待ち等を含めて計算済み.
+                # 追加で翌朝発に押し戻すと二重加算になるのでそのまま加算する.
+                arrival = virtual_now + timedelta(seconds=secs)
+            else:
+                # driving / haversine は 24時間稼働前提の計算. 深夜跨ぎを翌朝に押し戻す.
+                arrival = next_arrival_time(virtual_now, secs)
+            wait_seconds = (arrival - virtual_now).total_seconds()
+            straight_km = _distance_m(prev_lat, prev_lng, s_lat, s_lng) / 1000
+            deferred_seconds = wait_seconds - secs
+            deferred_note = (
+                f", 翌朝発に押戻し +{humanize_duration(deferred_seconds)}"
+                if deferred_seconds > 60
+                else ""
+            )
+            print(
+                f"  移動待機: {humanize_duration(wait_seconds)} ({mode}, 直線 {straight_km:.1f}km"
+                f"{deferred_note}) -> 到着 {arrival:%m/%d %H:%M}"
+            )
+            if execute:
+                time.sleep(wait_seconds)
+            virtual_now = arrival
+
+        # スポットのチェックイン期間を過ぎていないか確認
+        deadline = parse_checkin_deadline(spot)
+        if deadline and virtual_now > deadline:
+            print(f"  スポット期限 ({deadline:%m/%d %H:%M}) を過ぎたため中断.")
+            break
+
+        coords = make_checkin_coords(spot)
+        distance_m = _distance_m(s_lat, s_lng, coords["latitude"], coords["longitude"])
+        body = encrypt_coords(coords)
+
+        print(
+            f"[{i:3}/{len(spots)}] {slug} {name}"
+            f" (offset {distance_m:.1f}m, acc={coords['accuracy']}m, alt={coords['altitude']})"
+        )
+
+        # 1件処理成功後は「滞在時間」を挟んでから次スポットへ進む.
+        def _post_checkin_stay() -> None:
+            """チェックイン後の滞在時間を仮想now/実sleep に反映.
+
+            nonlocal は使えない (関数内関数の参照キャプチャ) ため, virtual_now は
+            返り値ではなく外側で加算する形にする.
+            """
+
+        stay_secs = natural_stay_seconds()
+
+        if not execute:
+            print(f"       body={body[:60]}...(len={len(body)})  [DRY-RUN]")
+            gained += 10
+            successful += 1
+            prev_lat, prev_lng = s_lat, s_lng
+            virtual_now = virtual_now + timedelta(seconds=stay_secs)
+            print(f"       滞在 {humanize_duration(stay_secs)} -> 出発 {virtual_now:%m/%d %H:%M}")
+            if profile_dir is not None:
+                update_checkin_state(profile_dir, spot, virtual_now)
+            continue
+
+        res = call_checkin_api(
+            page,
+            "POST",
+            f"/event/{CHECKIN_EVENT_SLUG}/spot/{slug}/checkin",
+            body=body,
+        )
+        body_resp = res.get("body") or {}
+        ecode = ((body_resp.get("payload") or {}).get("ecode")) if isinstance(body_resp, dict) else None
+
+        if res["status"] == 200 and body_resp.get("status") == "SUCCESS":
+            print(f"       -> 成功")
+            gained += 10
+            successful += 1
+            consecutive_failures = 0
+            prev_lat, prev_lng = s_lat, s_lng
+            virtual_now = now_fn()
+            time.sleep(stay_secs)
+            virtual_now = virtual_now + timedelta(seconds=stay_secs)
+            print(f"       滞在 {humanize_duration(stay_secs)} -> 出発 {virtual_now:%m/%d %H:%M}")
+            if profile_dir is not None:
+                update_checkin_state(profile_dir, spot, virtual_now)
+            continue
+
+        if ecode in ECODES_ALREADY_DONE:
+            print(f"       -> 既達成 ({ecode}), スキップ")
+            consecutive_failures = 0
+            # 位置は spot に到達しているので prev を更新. 滞在は入れない (立ち寄り扱い).
+            prev_lat, prev_lng = s_lat, s_lng
+            continue
+
+        if ecode == ECODE_OUT_OF_RANGE:
+            print(f"       -> 範囲外 ({ecode}), スキップ")
+            consecutive_failures = 0
+            continue
+
+        # 未知の失敗: BAN 検知シグナルの可能性. 連続 N 件で全体中断.
+        consecutive_failures += 1
+        print(f"       -> 失敗 (連続{consecutive_failures}件目): HTTP {res['status']} body={body_resp}")
+        if consecutive_failures >= consecutive_failure_limit:
+            print(
+                f"  連続失敗が {consecutive_failure_limit}件に達したため中断. "
+                "BAN 検知の可能性があるので後続スポットはスキップします.",
+                file=sys.stderr,
+            )
+            break
+
+    label = "獲得見込み" if not execute else "獲得"
+    print(f"{label}: 約{gained}票 ({successful}スポット成功, 仮想終了時刻 {virtual_now:%m/%d %H:%M})")
+    return gained
+
+
+def _distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """2点間の距離 [m] を Haversine 近似で計算する."""
+    R = 6371000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+# 実移動時間の推定用パラメータ. 直線距離を実道路距離に補正するための係数.
+ROAD_DISTANCE_FACTOR = 1.35
+
+# Google Maps Directions API 統合. GMAPS_KEY 環境変数があれば有効化.
+# キャッシュキーは (lat1, lng1, lat2, lng2, departure_bucket_iso) で構成する.
+# departure_time は 30 分単位で丸めてキャッシュヒット率を確保する.
+_GMAPS_CACHE: dict[tuple[float, float, float, float, str], tuple[float, str]] = {}
+_gmaps_client: Any = None
+_gmaps_probed: bool = False
+_GMAPS_TIME_BUCKET_MINUTES = 30
+
+
+def _get_gmaps_client() -> Any:
+    """遅延初期化. GMAPS_KEY 未設定なら None."""
+    global _gmaps_client, _gmaps_probed
+    if _gmaps_probed:
+        return _gmaps_client
+    _gmaps_probed = True
+    key = os.environ.get("GMAPS_KEY")
+    if not key:
+        return None
+    try:
+        import googlemaps
+        _gmaps_client = googlemaps.Client(key=key, timeout=15)
+    except Exception as e:
+        print(
+            f"Google Maps クライアント初期化失敗: {e}. Haversine にフォールバックします.",
+            file=sys.stderr,
+        )
+        _gmaps_client = None
+    return _gmaps_client
+
+
+def _estimate_travel_seconds_gmaps(
+    lat1: float, lng1: float, lat2: float, lng2: float,
+    departure_time: datetime,
+) -> tuple[float, str] | None:
+    """Google Maps Directions API で公共交通機関の実移動時間を取得.
+
+    departure_time を渡すことで, 深夜出発 → 始発待ち込みの実運行 duration が
+    Google 側から返る (例: 22時に東京→札幌 transit 検索で「翌朝始発 + 移動」時間).
+    キーなし/APIエラーは None を返し, 呼び出し側でHaversine にフォールバック.
+    """
+    client = _get_gmaps_client()
+    if client is None:
+        return None
+    # departure_time を 30分単位で丸めてキャッシュ粒度に. 秒/微秒を落とす.
+    bucket_minute = (departure_time.minute // _GMAPS_TIME_BUCKET_MINUTES) * _GMAPS_TIME_BUCKET_MINUTES
+    bucketed = departure_time.replace(minute=bucket_minute, second=0, microsecond=0)
+    cache_key = (
+        round(lat1, 4), round(lng1, 4), round(lat2, 4), round(lng2, 4),
+        bucketed.isoformat(),
+    )
+    if cache_key in _GMAPS_CACHE:
+        return _GMAPS_CACHE[cache_key]
+    try:
+        # transit モードで日本の JR/私鉄/バス/地下鉄を含む経路検索.
+        # departure_time を過去時刻にすると 400 になるので, 過去ならnowにフォールバック.
+        depart_arg: Any = departure_time if departure_time > datetime.now() else "now"
+        result = client.directions(
+            (lat1, lng1), (lat2, lng2),
+            mode="transit",
+            departure_time=depart_arg,
+            language="ja",
+            alternatives=False,
+        )
+    except Exception as e:
+        print(f"  gmaps directions 失敗: {e}", file=sys.stderr)
+        return None
+
+    if not result:
+        # transit で経路が見つからなかった (深夜帯や公共交通が届かない場所) → driving で再試行
+        try:
+            result = client.directions(
+                (lat1, lng1), (lat2, lng2),
+                mode="driving",
+                departure_time=depart_arg,
+                language="ja",
+            )
+        except Exception:
+            return None
+        if not result:
+            return None
+        leg = result[0]["legs"][0]
+        seconds = float(leg["duration"]["value"])
+        pair = (seconds, "gmaps-driving")
+        _GMAPS_CACHE[cache_key] = pair
+        return pair
+
+    leg = result[0]["legs"][0]
+    seconds = float(leg["duration"]["value"])
+    pair = (seconds, "gmaps-transit")
+    _GMAPS_CACHE[cache_key] = pair
+    return pair
+
+
+def _estimate_travel_seconds_haversine(
+    lat1: float, lng1: float, lat2: float, lng2: float
+) -> tuple[float, str]:
+    """フォールバック: Haversine + 距離レンジ別平均速度で下限を推定.
+
+    Haversine 直線距離 × ROAD_DISTANCE_FACTOR で実道路距離を推定, 距離レンジで手段を
+    自動選択, 手段固有の乗換/準備オーバーヘッドを足す.
+    """
+    straight_m = _distance_m(lat1, lng1, lat2, lng2)
+    road_m = straight_m * ROAD_DISTANCE_FACTOR
+
+    if road_m < 500:
+        seconds = road_m / (5000 / 3600)
+        return seconds, "walk"
+    if road_m < 30_000:
+        seconds = road_m / (40_000 / 3600) + 5 * 60
+        return seconds, "car/local"
+    if road_m < 500_000:
+        seconds = road_m / (200_000 / 3600) + 30 * 60
+        return seconds, "shinkansen"
+    seconds = road_m / (500_000 / 3600) + 90 * 60
+    return seconds, "flight"
+
+
+def estimate_travel_seconds(
+    lat1: float, lng1: float, lat2: float, lng2: float,
+    departure_time: datetime | None = None,
+) -> tuple[float, str]:
+    """2点間の常識的な最短移動時間 [秒] と使用手段名を返す.
+
+    GMAPS_KEY があれば Google Maps Directions API を使い実移動時間を取得.
+    departure_time を渡せば, 始発待ちや終電の運行時刻も加味された duration が返る.
+    キーなし or API失敗時は Haversine + 距離レンジ別平均速度にフォールバック.
+    """
+    if departure_time is None:
+        departure_time = datetime.now()
+    gmaps_result = _estimate_travel_seconds_gmaps(
+        lat1, lng1, lat2, lng2, departure_time=departure_time
+    )
+    if gmaps_result is not None:
+        return gmaps_result
+    return _estimate_travel_seconds_haversine(lat1, lng1, lat2, lng2)
+
+
+def humanize_duration(seconds: float) -> str:
+    """秒を人間が読める文字列 (1h32m 等) に変換する."""
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+# 交通機関の稼働時間帯. 深夜帯(24:00-06:00)は移動不可とする.
+# 早朝始発以前の長距離移動はJRも私鉄も動いておらず, 車移動でも人間の睡眠時間帯なので不自然.
+TRAVEL_ACTIVE_START_HOUR = 6
+TRAVEL_ACTIVE_END_HOUR = 24  # 24 = 翌0時. 24時ちょうどを非稼働の開始として扱う.
+
+# 1スポット滞在時間の想定範囲 [秒]. 店に入り, チェックインし, 買い物や食事をしてから
+# 次のスポットへ移動する自然な滞在を模擬する.
+STAY_DURATION_MIN_SEC = 10 * 60
+STAY_DURATION_MAX_SEC = 30 * 60
+
+
+def natural_stay_seconds() -> float:
+    """1スポットあたりの滞在時間を [10分, 30分] の一様分布で返す."""
+    return random.uniform(STAY_DURATION_MIN_SEC, STAY_DURATION_MAX_SEC)
+
+
+def next_arrival_time(now: datetime, travel_seconds: float) -> datetime:
+    """now から travel_seconds 移動した場合の現実的な到着時刻を返す.
+
+    現実の交通機関は深夜帯 (24:00-06:00) に動かない. 「移動の途中で駅に泊まって朝に再開」
+    は不可能なので, 出発時点で「今日中に完了できない旅」は旅そのものを **翌朝 06:00 発** に
+    押し戻す. 翌日も収まらないケース (24時間超の移動) はさらに翌日に押される.
+    """
+    if travel_seconds <= 0:
+        return now
+
+    cursor = now
+    # 早朝すぎる場合は始発想定の 06:00 まで待機
+    if cursor.hour < TRAVEL_ACTIVE_START_HOUR:
+        cursor = cursor.replace(
+            hour=TRAVEL_ACTIVE_START_HOUR, minute=0, second=0, microsecond=0
+        )
+
+    while True:
+        # 今日の稼働終了時刻 (24:00 = 翌日 00:00)
+        day_end = (cursor + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        arrival = cursor + timedelta(seconds=travel_seconds)
+        if arrival <= day_end:
+            return arrival
+        # 今日中に着かない → 旅程ごと翌朝 06:00 発に押し戻す
+        cursor = day_end.replace(hour=TRAVEL_ACTIVE_START_HOUR)
+
+
+def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
+    """spot["checkin_end_datetime"] を naive datetime にパース. 失敗時は None."""
+    raw = spot.get("checkin_end_datetime")
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
+# --- state 永続化 ---
+#
+# アカウントごとに profile_dir/canvasser_state.json に前回終了状態を保存する.
+# 「日を跨ぐ場合前回の最終チェックイン地点から再開したい」という要求を満たすため,
+# チェックイン成功のたびに last_location を更新し, 次回起動時に開始地点として使う.
+_STATE_FILENAME = "canvasser_state.json"
+
+
+def load_account_state(profile_dir: Path) -> dict[str, Any]:
+    """profile_dir/canvasser_state.json を読み込む. 存在しない/壊れていれば空dict."""
+    state_file = profile_dir / _STATE_FILENAME
+    if not state_file.exists():
+        return {}
+    try:
+        return json.loads(state_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_account_state(profile_dir: Path, state: dict[str, Any]) -> None:
+    """profile_dir/canvasser_state.json に state を書き出す."""
+    state_file = profile_dir / _STATE_FILENAME
+    state_file.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def update_checkin_state(
+    profile_dir: Path, spot: dict[str, Any], virtual_now: datetime
+) -> None:
+    """1件チェックイン成功したら state を更新する."""
+    state = load_account_state(profile_dir)
+    state["last_checkin"] = {
+        "spot_slug": spot["slug"],
+        "spot_name": spot["name"],
+        "location_latitude": float(spot["location_latitude"]),
+        "location_longitude": float(spot["location_longitude"]),
+        "virtual_completed_at": virtual_now.isoformat(),
+        "real_completed_at": datetime.now().isoformat(),
+    }
+    save_account_state(profile_dir, state)
+
+
+def resume_context(profile_dir: Path) -> tuple[float | None, float | None, datetime | None]:
+    """state.json から前回位置と仮想終了時刻を復元する.
+
+    戻り値: (last_lat, last_lng, resume_at).
+      - last_lat/lng: 前回最終チェックイン地点. なければ None
+      - resume_at: 前回終了時刻(仮想) + 1件分の滞在時間. 現在時刻より過去なら現在時刻を優先.
+                   これで「深夜またぎで停止 → 翌朝再開」も自然に扱える.
+    """
+    state = load_account_state(profile_dir)
+    last = state.get("last_checkin") or {}
+    lat = last.get("location_latitude")
+    lng = last.get("location_longitude")
+    raw = last.get("virtual_completed_at")
+    resume_at: datetime | None = None
+    if raw:
+        try:
+            resume_at = datetime.fromisoformat(raw)
+        except ValueError:
+            resume_at = None
+    return (
+        float(lat) if lat is not None else None,
+        float(lng) if lng is not None else None,
+        resume_at,
+    )
+
+
+def ensure_chromium_installed() -> None:
+    """Playwright の Chromium バイナリが未取得なら `playwright install chromium` を走らせる.
+
+    uv run の初回起動でも自動で解決したいので冪等に呼べるようにしておく.
+    """
+    with sync_playwright() as p:
+        exe = p.chromium.executable_path
+        if exe and Path(exe).exists():
+            return
+
+    print("Chromium バイナリを取得します (初回のみ)...", file=sys.stderr)
+    subprocess.check_call(
+        [sys.executable, "-m", "playwright", "install", "chromium"]
+    )
+
+
+def run_login_flow(page: Page, timeout_sec: int = 600, interval_sec: float = 3.0) -> int:
+    """headed で起動し, ログイン成功を is_login フラグでポーリング検知する.
+
+    対話入力に頼らないので, bash-input のような非対話環境でも動く.
+    ブラウザを閉じる or Ctrl+C で中断可能.
+    """
+    print("ブラウザが立ち上がりました.", file=sys.stderr)
+    print(
+        "BNIDでログインしてください. ログイン成功を検知したら自動で終了します.",
+        file=sys.stderr,
+    )
+    print(
+        f"(最大 {timeout_sec // 60} 分待機, Ctrl+C で中断可能)",
+        file=sys.stderr,
+    )
+
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        try:
+            if check_login(page):
+                print(
+                    "ログイン状態を確認しました. 次回から --login なしで実行できます.",
+                    file=sys.stderr,
+                )
+                return 0
+        except PlaywrightError:
+            # ページ遷移中や, ログイン画面へのリダイレクト中はfetchが失敗する.
+            # 次のポーリングを待つ.
+            pass
+        time.sleep(interval_sec)
+
+    print(
+        "タイムアウト. ログインを検出できませんでした. 再度お試しください.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def resolve_profiles(
+    profiles_dir: Path,
+    account: str | None,
+    legacy_profile: str | None,
+) -> list[tuple[str, Path]]:
+    """CLI引数から処理対象のプロファイル一覧 [(表示名, ディレクトリ), ...] を決定する.
+
+    優先順位:
+      1. --profile 指定 (後方互換)
+      2. --account 指定
+      3. --profiles-dir 配下のサブディレクトリ全列挙
+    """
+    if legacy_profile:
+        return [("default", Path(legacy_profile).resolve())]
+    if account:
+        return [(account, (profiles_dir / account).resolve())]
+    if not profiles_dir.exists():
+        return []
+    return [
+        (entry.name, entry.resolve())
+        for entry in sorted(profiles_dir.iterdir())
+        if entry.is_dir()
+    ]
+
+
+def open_persistent_context(p, profile_dir: Path, headless: bool):
+    """persistent_context を開く. Chromium 未取得なら install してリトライする."""
+    kwargs: dict[str, Any] = {
+        "headless": headless,
+        "viewport": {"width": 1280, "height": 900},
+    }
+    try:
+        return p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
+    except PlaywrightError as e:
+        if "playwright install" in str(e).lower():
+            subprocess.check_call(
+                [sys.executable, "-m", "playwright", "install", "chromium"]
+            )
+            return p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
+        raise
+
+
+def process_account(
+    p: Any,
+    name: str,
+    profile_dir: Path,
+    login_mode: bool,
+    run_mission: bool,
+    run_checkin: bool,
+    checkin_execute: bool,
+    daily_budget: int,
+    consecutive_failure_limit: int,
+) -> tuple[int, int]:
+    """1アカウント分の処理. 戻り値は (獲得票数, exit_code).
+
+    - login_mode=True のときは獲得票数を集計しない (returnは獲得0).
+    - 未ログイン検知時は exit_code=1 を返し, 呼び出し側で他アカウントに進む.
+    - run_mission=True でミッション回収, run_checkin=True でチェックインを実施.
+      checkin_execute=False の場合は POST を送らないドライラン.
+    """
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    ctx = open_persistent_context(p, profile_dir, headless=not login_mode)
+    try:
+        page = ctx.new_page()
+        page.goto(MISSION_PAGE_URL, wait_until="domcontentloaded")
+
+        if login_mode:
+            return 0, run_login_flow(page)
+
+        if not check_login(page):
+            print(
+                f"[{name}] 未ログイン. "
+                f"`uv run canvasser.py --login --account {name}` を実行してください.",
+                file=sys.stderr,
+            )
+            return 0, 1
+
+        gained = 0
+        if run_mission:
+            gained += collect_missions(page)
+        if run_checkin:
+            # チェックインページにも navigate しておく (Refererを合わせる意図)
+            page.goto(CHECKIN_PAGE_URL, wait_until="domcontentloaded")
+            gained += collect_checkins(
+                page,
+                execute=checkin_execute,
+                daily_budget=daily_budget,
+                consecutive_failure_limit=consecutive_failure_limit,
+                profile_dir=profile_dir,
+            )
+        return gained, 0
+    finally:
+        ctx.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="シンデレラガール総選挙2026 デイリーミッション自動回収 (複数アカウント対応)"
+    )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="初回ログイン用. Chromium を可視状態で起動する (--account か --profile とセット)",
+    )
+    parser.add_argument(
+        "--account",
+        help="対象アカウント名. profiles-dir 配下のサブディレクトリ名として扱う",
+    )
+    parser.add_argument(
+        "--profiles-dir",
+        default="./profiles",
+        help="複数アカウントの親ディレクトリ (デフォルト: ./profiles)",
+    )
+    parser.add_argument(
+        "--profile",
+        help="単一プロファイルディレクトリを直接指定 (旧版との後方互換用)",
+    )
+    parser.add_argument(
+        "--checkin",
+        action="store_true",
+        help="チェックイン (#99) も処理する. 単独指定時はミッションはスキップ",
+    )
+    parser.add_argument(
+        "--no-mission",
+        action="store_true",
+        help="ミッション回収をスキップする. --checkin と組み合わせて使う",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="チェックインを実POSTする. デフォルトはドライラン (POST送信なし). "
+             "BAN対策実装後に明示的に有効化するためのゲート",
+    )
+    parser.add_argument(
+        "--daily-budget",
+        type=int,
+        default=0,
+        help="1回の実行あたりのチェックイン成功件数上限 (デフォルト: 0 = 無制限). "
+             "時間帯制約(深夜移動不可)で自然に上限がかかるので通常は指定不要. "
+             "緊急停止したいときだけ小さな値を指定する",
+    )
+    parser.add_argument(
+        "--consecutive-failure-limit",
+        type=int,
+        default=2,
+        help="未知エラーが連続で何件出たら全体中断するか (デフォルト: 2)",
+    )
+    args = parser.parse_args()
+
+    profiles_dir = Path(args.profiles_dir).resolve()
+    profiles = resolve_profiles(profiles_dir, args.account, args.profile)
+
+    if not profiles:
+        legacy = Path("./imas_profile")
+        if legacy.exists() and legacy.is_dir():
+            print(
+                "プロファイルが見つかりません. 旧版の ./imas_profile が残っているようです.\n"
+                "以下のどちらかで移行してください:\n"
+                "  A) ディレクトリ移動:   mv imas_profile profiles/main\n"
+                "  B) 単発で明示指定:     uv run canvasser.py --profile ./imas_profile",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"プロファイルが見つかりません ({profiles_dir}).\n"
+                "初回は `uv run canvasser.py --login --account NAME` でアカウントを追加してください.",
+                file=sys.stderr,
+            )
+        return 1
+
+    if args.login and len(profiles) != 1:
+        print(
+            "--login は --account または --profile で1アカウントに絞ってください.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # 実行対象の判定. --checkin と --no-mission の組合せで挙動を切り替える.
+    run_mission = not args.no_mission
+    run_checkin = args.checkin
+    if args.no_mission and not args.checkin:
+        print(
+            "--no-mission は --checkin と組み合わせて使ってください.",
+            file=sys.stderr,
+        )
+        return 1
+
+    ensure_chromium_installed()
+
+    exit_code = 0
+    results: list[tuple[str, int]] = []
+    with sync_playwright() as p:
+        for name, profile_dir in profiles:
+            print(f"\n=== アカウント: {name} ({profile_dir}) ===")
+            try:
+                gained, code = process_account(
+                    p,
+                    name,
+                    profile_dir,
+                    args.login,
+                    run_mission=run_mission,
+                    run_checkin=run_checkin,
+                    checkin_execute=args.execute,
+                    daily_budget=args.daily_budget,
+                    consecutive_failure_limit=args.consecutive_failure_limit,
+                )
+            except Exception as e:  # 1アカウントの失敗で全体を止めない
+                print(f"[{name}] 実行中に例外: {e}", file=sys.stderr)
+                exit_code = 1
+                results.append((name, 0))
+                continue
+            results.append((name, gained))
+            if code != 0:
+                exit_code = code
+            if args.login:
+                # ログインは1アカウントのみ. process_account の戻り値をそのまま返す.
+                return code
+
+    if len(profiles) > 1:
+        print("\n=== サマリ ===")
+        total = 0
+        for name, gained in results:
+            print(f"  {name}: +{gained}枚")
+            total += gained
+        print(f"  合計: +{total}枚")
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
