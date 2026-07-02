@@ -41,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,11 @@ LOGIN_CHECK_URL = f"{API_HOST}/api/v1_1_0/auths/login/check"
 METERS_PER_DEG_LAT = 111_320.0
 # チェックイン許容半径を少し内側に絞って境界事故を避けるための係数.
 CHECKIN_RADIUS_MARGIN = 0.85
+
+
+def _default_now() -> datetime:
+    """collect_checkins の now_fn の既定値. 現在 JST 時刻を返す."""
+    return datetime.now(JST)
 
 
 def call_api(page: Page, method: str, path: str) -> dict[str, Any]:
@@ -456,7 +462,7 @@ def collect_checkins(
     consecutive_failure_limit: int = 1,
     out_of_range_limit: int = 3,
     profile_dir: Path | None = None,
-    now_fn: Any = None,
+    now_fn: Callable[[], datetime] | None = None,
 ) -> int:
     """全スポットに対してチェックインを試みる. 戻り値は獲得票数の見込み.
 
@@ -479,7 +485,7 @@ def collect_checkins(
         の疑いがあるため, 実POST 51件全部を撃たせない).
     """
     if now_fn is None:
-        now_fn = lambda: datetime.now(JST)
+        now_fn = _default_now
     listing = call_checkin_api(page, "GET", f"/event/{CHECKIN_EVENT_SLUG}")
     body = listing.get("body")
     if listing["status"] != 200 or not isinstance(body, dict) or body.get("status") != "SUCCESS":
@@ -614,9 +620,13 @@ def collect_checkins(
             if execute:
                 raise FailClosedError(msg)
             print(f"  {msg} (dry-run: skip)", file=sys.stderr)
+            # 移動時間は消費済み. 次スポットの travel は現地点から計算する.
+            prev_lat, prev_lng = s_lat, s_lng
             continue
         if virtual_now > deadline:
             print(f"  [{slug}] スポット期限 ({deadline:%m/%d %H:%M %Z}) 経過, skip.")
+            # 到着はしているので, 次スポットの移動計算は現地点起点にする.
+            prev_lat, prev_lng = s_lat, s_lng
             continue
 
         coords = make_checkin_coords(spot)
@@ -1185,11 +1195,20 @@ def resume_context(
         except ValueError:
             resume_at = None
     completed = set(state.get("completed_spots") or [])
-    # 旧schema 自動移行: last_checkin.spot_slug は「実POST 成功済み」を示すので
+    # 旧schema 自動移行: last_checkin.spot_slug は「実POST 成功済み」の記録なので
     # completed_spots に補完する. これで syota のように completed_spots が空でも
     # 過去成功スポットに実POST を再送しない.
+    # ただし過去に dry-run が state を書いていた版がある場合, その spot_slug は
+    # 「実POST 成功済み」ではない. 現行版が実POST 時のみ記録する real_completed_at の
+    # 有無を「実POST の痕跡」として使い, これが無いレコードは移行しない.
     legacy_slug = last.get("spot_slug")
-    if isinstance(legacy_slug, str) and _SPOT_SLUG_RE.fullmatch(legacy_slug):
+    real_completed_at = last.get("real_completed_at")
+    if (
+        isinstance(legacy_slug, str)
+        and _SPOT_SLUG_RE.fullmatch(legacy_slug)
+        and isinstance(real_completed_at, str)
+        and real_completed_at
+    ):
         completed.add(legacy_slug)
     return (
         float(lat) if lat is not None else None,
@@ -1303,14 +1322,23 @@ def _ensure_within(base: Path, candidate: Path) -> None:
 def _profiles_dir_is_gitignored(profiles_dir: Path) -> bool:
     """profiles_dir が git ignore 対象なら True.
 
+    profiles_dir がまだ存在しない (初回 --login 前) ケースでも判定したいので, path 末尾
+    に `/` を付けてディレクトリ扱いを git に明示する. `.gitignore` の `profiles/` の
+    ようにディレクトリ限定パターンは, path 側が「ディレクトリと分かる」形でないと
+    match しないため.
+
     git repo 外なら False (誤コミット経路がないので判定不能扱い → 拒否側にする).
     git 自体が使えない環境も False. `git check-ignore --quiet` は
     exit 0=ignored, 1=not ignored, 128=error (repo外) を返す.
     """
+    # Windows の path 区切りは git に渡す前に正規化. 末尾 / でディレクトリと明示する.
+    path_arg = str(profiles_dir).replace("\\", "/").rstrip("/") + "/"
+    parent = profiles_dir.parent
+    cwd = parent if parent.is_dir() else Path.cwd()
     try:
         result = subprocess.run(
-            ["git", "check-ignore", "--quiet", str(profiles_dir)],
-            cwd=profiles_dir.parent if profiles_dir.exists() else Path.cwd(),
+            ["git", "check-ignore", "--quiet", path_arg],
+            cwd=cwd,
             capture_output=True,
             timeout=10,
         )
@@ -1410,12 +1438,15 @@ def process_account(
         gained = 0
         exit_code = 0
         if run_mission:
-            gained += collect_missions(page, execute=execute_mission)
+            # 実POST しないドライランの見込み枚数は集計に混ぜない (アカウント総計を汚さない).
+            mission_gain = collect_missions(page, execute=execute_mission)
+            if execute_mission:
+                gained += mission_gain
         if run_checkin:
             # チェックインページにも navigate しておく (Refererを合わせる意図)
             page.goto(CHECKIN_PAGE_URL, wait_until="domcontentloaded")
             try:
-                gained += collect_checkins(
+                checkin_gain = collect_checkins(
                     page,
                     execute=execute_checkin,
                     daily_budget=daily_budget,
@@ -1423,6 +1454,8 @@ def process_account(
                     out_of_range_limit=out_of_range_limit,
                     profile_dir=profile_dir,
                 )
+                if execute_checkin:
+                    gained += checkin_gain
             except FailClosedError as e:
                 # state 破損 / deadline パース不能 など「安全に継続できない」ケース.
                 # ログを stderr に流して exit_code を nonzero にする.
@@ -1521,6 +1554,22 @@ def _main_impl() -> int:
     )
     args = parser.parse_args()
 
+    # 上限系 CLI 引数の範囲検証. --daily-budget は 0=無制限扱いだが負数を許すと
+    # limit_counter 判定が常時 truthy になり実POST 上限が壊れる. その他の閾値も
+    # 1 未満だと本来の役割 (連続失敗打ち切り, 範囲外累積打ち切り) を果たせない.
+    if args.daily_budget < 0:
+        print("--daily-budget は 0 以上を指定してください.", file=sys.stderr)
+        return 1
+    if args.consecutive_failure_limit < 1:
+        print(
+            "--consecutive-failure-limit は 1 以上を指定してください.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.max_out_of_range < 1:
+        print("--max-out-of-range は 1 以上を指定してください.", file=sys.stderr)
+        return 1
+
     profiles_dir = Path(args.profiles_dir).resolve()
 
     # --mark-completed: state を編集して即終了 (ブラウザ起動なし).
@@ -1574,11 +1623,11 @@ def _main_impl() -> int:
         )
         return 1
 
-    # Cookie 書き込みが発生する経路 (login または実POST) では profiles_dir が
-    # git ignore 対象か検証する. Cookie入り persistent profile を誤って commit する
-    # 事故は login 時点でも起きるので, 実POST に限定しない.
-    any_cookie_write = args.login or args.execute_mission or args.execute_checkin
-    if any_cookie_write and not args.allow_unignored_profiles_dir:
+    # profiles_dir が git ignore 対象か検証する. Cookie 書き込みは login や実POST 経路
+    # だけでなく, GET-only ドライラン中の persistent context 経由でも起こりうる
+    # (Playwright は cookie/cache/metadata を随時同期する). そのため実行モードに関係なく
+    # gitignore 未対応なら停止させる.
+    if not args.allow_unignored_profiles_dir:
         if not _profiles_dir_is_gitignored(profiles_dir):
             print(
                 f"{profiles_dir} が git ignore 対象になっていません. "
