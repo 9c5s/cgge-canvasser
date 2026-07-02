@@ -60,10 +60,12 @@ class TestExtractEcode:
             ({},),
             ({"payload": {}},),
             ({"payload": None},),
+            ({"payload": "text"},),
+            ({"payload": [1, 2]},),
         ],
     )
     def test_ecodeが無ければNone(self, body: tuple[object]) -> None:
-        """body が dict でない・payload 欠落・ecode 欠落はすべて None。"""
+        """body・payload が dict でない、または ecode 欠落はすべて None。"""
         assert canvasser._extract_ecode(body[0]) is None
 
 

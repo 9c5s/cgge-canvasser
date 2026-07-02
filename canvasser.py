@@ -140,11 +140,17 @@ def _as_str_dict(value: object) -> dict[str, Any] | None:
 
 
 def _extract_ecode(body: object) -> str | None:
-    """API 応答の body から ecode を安全に取り出す。"""
+    """API 応答の body から ecode を安全に取り出す。
+
+    body・payload のどちらが dict 以外でも None に丸め、想定外形式の応答で
+    AttributeError にならないようにする。
+    """
     body_dict = _as_str_dict(body)
     if body_dict is None:
         return None
-    payload = cast("dict[str, Any]", body_dict.get("payload") or {})
+    payload = _as_str_dict(body_dict.get("payload"))
+    if payload is None:
+        return None
     return payload.get("ecode")
 
 

@@ -19,23 +19,29 @@ pre-commit:
       glob: lefthook.yml
       run: uvx lefthook validate
 
-    - name: ruff
-      glob:
-        - '**/*.{py,pyi}'
-      run: >
-        uvx ruff check --fix {staged_files} &&
-        uvx ruff format {staged_files}
-      stage_fixed: true
+    # ruff の --fix / format が走っている最中に pyright / pytest が並走すると
+    # 修正前後どちらのファイルを検証したか不定になるため、piped で直列化する。
+    - name: python
+      group:
+        piped: true
+        jobs:
+          - name: ruff
+            glob:
+              - '**/*.{py,pyi}'
+            run: >
+              uvx ruff check --fix {staged_files} &&
+              uvx ruff format {staged_files}
+            stage_fixed: true
 
-    - name: pyright
-      glob:
-        - '**/*.py'
-      run: uvx pyright {staged_files}
+          - name: pyright
+            glob:
+              - '**/*.py'
+            run: uvx pyright {staged_files}
 
-    - name: pytest
-      glob:
-        - '**/*.py'
-      run: uv run pytest -q --cov
+          - name: pytest
+            glob:
+              - '**/*.py'
+            run: uv run pytest -q --cov
 
 post-merge:
   jobs:
