@@ -6,7 +6,7 @@ Playwright の persistent context でブラウザセッションを保持し、�
 
 ## 前提
 
-- Windows / macOS / Linux、Python 3.10 以上。
+- Windows / macOS / Linux、Python 3.14 以上。
 - [uv](https://docs.astral.sh/uv/) が必須。
 - Google Cloud Console で Directions API を有効化した API キー (任意。`.env` の `GMAPS_KEY` に設定するとチェックインの移動時間計算が公共交通機関の実運行情報ベースになる)。
 - BNID (バンダイナムコID) の着信認証を設定済みであること。

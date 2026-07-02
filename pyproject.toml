@@ -1,7 +1,7 @@
 [project]
 name = "cgge-canvasser"
 version = "0.0.0"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 dependencies = [
   "googlemaps>=4.10",
   "playwright>=1.40.0",
@@ -23,7 +23,7 @@ source = ["."]
 show_missing = true
 
 [tool.pyright]
-pythonVersion = "3.10"
+pythonVersion = "3.14"
 typeCheckingMode = "strict"
 venvPath = "."
 venv = ".venv"
@@ -32,7 +32,7 @@ venv = ".venv"
 testpaths = ["tests"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py314"
 line-length = 88
 indent-width = 4
 preview = true
