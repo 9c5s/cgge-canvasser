@@ -8,12 +8,15 @@ pre-commit:
     - name: protect-branch
       run: >
         d=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null|sed 's#^origin/##')&&
+        [ -n "$d" ]&&
         [ $(git symbolic-ref --short HEAD) = $d ]&&
         echo Direct commits to $d are not allowed. Use a feature branch.&&
         exit 1;true
 
+    # --no-index: index 済みファイルには ignore 規則が適用されないため、
+    # git add -f で強制追加された秘密ファイルも検出できるようにする。
     - name: ignored-files
-      run: "! git check-ignore {staged_files}"
+      run: "! git check-ignore --no-index {staged_files}"
 
     - name: lefthook
       glob: lefthook.yml

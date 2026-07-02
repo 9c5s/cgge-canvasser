@@ -11,7 +11,6 @@ class Client:
         self,
         origin: tuple[float, float],
         destination: tuple[float, float],
-        *,
         mode: str | None = None,
         departure_time: datetime | str | None = None,
         language: str | None = None,

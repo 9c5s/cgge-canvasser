@@ -18,6 +18,8 @@ dev = [
 
 [tool.coverage.run]
 source = ["."]
+# カバレッジ率を実装コードの実態に合わせるため、テスト自身は計測から外す
+omit = ["tests/*"]
 
 [tool.coverage.report]
 show_missing = true
