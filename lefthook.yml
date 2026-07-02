@@ -1,0 +1,50 @@
+colors: false
+no_tty: true
+glob_matcher: doublestar
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: protect-branch
+      run: >
+        d=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null|sed 's#^origin/##')&&
+        [ $(git symbolic-ref --short HEAD) = $d ]&&
+        echo Direct commits to $d are not allowed. Use a feature branch.&&
+        exit 1;true
+
+    - name: ignored-files
+      run: "! git check-ignore {staged_files}"
+
+    - name: lefthook
+      glob: lefthook.yml
+      run: uvx lefthook validate
+
+    - name: ruff
+      glob:
+        - '**/*.{py,pyi}'
+      run: >
+        uvx ruff check --fix {staged_files} &&
+        uvx ruff format {staged_files}
+      stage_fixed: true
+
+    - name: pyright
+      glob:
+        - '**/*.py'
+      run: uvx pyright {staged_files}
+
+    # テスト未整備のため skip。tests/ を追加したら skip を外す。
+    - name: pytest
+      skip: true
+      glob:
+        - '**/*.py'
+      run: uv run pytest -q --cov
+
+post-merge:
+  jobs:
+    - name: uv-sync
+      run: uv sync
+
+post-rewrite:
+  jobs:
+    - name: uv-sync
+      run: 'if [ x{1} = xrebase ]; then uv sync; fi'
