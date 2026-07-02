@@ -618,7 +618,7 @@ def collect_checkins(
                 "がパースできません. サーバ側の日付形式が変わった可能性があります."
             )
             if execute:
-                raise FailClosedError(msg)
+                raise FailClosedError(msg, partial_gained=gained)
             print(f"  {msg} (dry-run: skip)", file=sys.stderr)
             # 移動時間は消費済み. 次スポットの travel は現地点から計算する.
             prev_lat, prev_lng = s_lat, s_lng
@@ -717,8 +717,11 @@ def collect_checkins(
                 raise FailClosedError(
                     f"範囲外 (E5005) が {out_of_range_count} 件. crypto/body/radius の "
                     "実装不一致の疑いがあるため停止. 座標計算とペイロード整合性を確認して "
-                    "から --max-out-of-range を上げて再実行してください."
+                    "から --max-out-of-range を上げて再実行してください.",
+                    partial_gained=gained,
                 )
+            # 移動時間は消費済みなので次スポットの travel 計算は現地点を起点にする.
+            prev_lat, prev_lng = s_lat, s_lng
             continue
 
         if ecode in ECODES_ALREADY_DONE:
@@ -744,7 +747,8 @@ def collect_checkins(
             # unknown ecode が limit を超えた = 想定外の状況. exit_code=1 で明示する.
             raise FailClosedError(
                 f"連続失敗が {consecutive_failure_limit}件に達したため中断. "
-                "body の ecode を確認して意味を確定してから再実行してください."
+                "body の ecode を確認して意味を確定してから再実行してください.",
+                partial_gained=gained,
             )
 
     label = "獲得見込み" if not execute else "獲得"
@@ -1019,7 +1023,16 @@ class FailClosedError(Exception):
 
     process_account でキャッチして exit_code=1 に反映する. タスクスケジューラや
     運用ログ上でも「正常終了」に見えないよう確実に nonzero で抜ける.
+
+    partial_gained: この例外を投げるまでに集計済みの獲得見込み (実POST 成功済み分).
+    collect_checkins が途中で fail-closed する場合でも, サーバー側で成功した POST の
+    reward を集計から落とさないために持たせる. 例外を投げない通常経路の gained と
+    合流させる責務は呼び出し側にある.
     """
+
+    def __init__(self, msg: str, partial_gained: int = 0) -> None:
+        super().__init__(msg)
+        self.partial_gained = partial_gained
 
 
 class UserInputError(Exception):
@@ -1446,7 +1459,11 @@ def process_account(
             except FailClosedError as e:
                 # state 破損 / deadline パース不能 など「安全に継続できない」ケース.
                 # ログを stderr に流して exit_code を nonzero にする.
+                # fail-closed 前にサーバー側で成功済みの POST 分は e.partial_gained に
+                # 入っているので集計から落とさない.
                 print(f"[{name}] fail closed: {e}", file=sys.stderr)
+                if execute_checkin:
+                    gained += e.partial_gained
                 exit_code = 1
         return gained, exit_code
     finally:
