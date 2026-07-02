@@ -224,6 +224,32 @@ class TestEncryptCoords:
         p2 = canvasser.encrypt_coords(self._COORDS)
         assert p1 != p2
 
+    def test_固定乱数での出力を回帰固定する(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """salt と iv を固定したときのペイロード全体をリテラルで固定する。
+
+        CryptoJS 互換性そのものの独立検証ではない (互換性は実 UI 経由の POST
+        観測で確定済み)。PBKDF2 パラメータや連結形式が意図せず変わった場合に
+        検出するための回帰テストである。
+        """
+
+        def fixed_urandom(n: int) -> bytes:
+            """連番バイト列を返す決定的な os.urandom 代替。"""
+            return bytes(range(n))
+
+        monkeypatch.setattr(canvasser.os, "urandom", fixed_urandom)
+
+        payload = canvasser.encrypt_coords(self._COORDS)
+
+        fixed_hex = "000102030405060708090a0b0c0d0e0f"
+        expected_ct = (
+            "S+fKzRddxmmh0zybpJzsGEZf64HcJIJ80fA56bGIj1EUuveeoZePLkStEzCDrxJn"
+            "ugQdyyCqAAYYNl8LYq5lTF+5/MWOBFAvUWIRYwVy3cMfIqR0DsfvIT6wPTW4rB5d"
+            "TVrjWLUG68uE4c1bmxBd8wvW25NSvqj3gwXQvtPn+RjPrMCNQKShFSmndI7zLxW/"
+        )
+        assert payload == f"{fixed_hex},{fixed_hex},{expected_ct}"
+
 
 def _spot_at(slug: str, lat: float, lng: float) -> dict[str, Any]:
     """順序決定テスト用の最小スポット dict を組み立てる。"""

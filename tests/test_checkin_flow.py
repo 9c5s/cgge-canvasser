@@ -383,3 +383,84 @@ class TestCollectCheckinsDryRun:
             canvasser.collect_checkins(
                 _as_page(fake), _settings(execute=True, profile_dir=tmp_path)
             )
+
+
+_POST_OK: dict[str, Any] = {"status": 200, "body": {"status": "SUCCESS"}}
+
+
+def _no_sleep(_seconds: float) -> None:
+    """実待機を無効化する time.sleep 代替。"""
+
+
+class TestCollectCheckinsExecute:
+    """collect_checkins の execute (実 POST) 成功経路。
+
+    time.sleep は外部境界 (実時間待機) としてモックし、待機の発生自体は
+    呼び出し記録で検証する。
+    """
+
+    def test_成功POSTで票と状態を確定する(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """2 スポット成功で 20 票獲得し completed_spots に両 slug が入る。"""
+        random.seed(0)
+        sleeps: list[float] = []
+        monkeypatch.setattr(canvasser.time, "sleep", sleeps.append)
+        spots = [_spot(1, 35.00, 135.0), _spot(2, 35.01, 135.0)]
+        fake = FakePage([_listing(spots), _POST_OK, _POST_OK])
+
+        gained = canvasser.collect_checkins(
+            _as_page(fake), _settings(execute=True, profile_dir=tmp_path)
+        )
+
+        assert gained == 20
+        assert len(fake.calls) == 3
+        state = canvasser.load_account_state(tmp_path)
+        assert state["completed_spots"] == ["cg_vote2026_1", "cg_vote2026_2"]
+        assert state["last_checkin"]["schema_version"] == 2
+        # 1 件目の滞在と 2 件目への移動で実待機が発生している
+        assert len(sleeps) == 2
+        assert all(s > 0 for s in sleeps)
+
+    def test_daily_budgetが実POST試行を打ち切る(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """daily_budget=1 では実 POST を 1 件だけ送って停止する。"""
+        random.seed(0)
+        monkeypatch.setattr(canvasser.time, "sleep", _no_sleep)
+        spots = [_spot(1, 35.00, 135.0), _spot(2, 35.01, 135.0)]
+        fake = FakePage([_listing(spots), _POST_OK])
+
+        gained = canvasser.collect_checkins(
+            _as_page(fake),
+            _settings(execute=True, daily_budget=1, profile_dir=tmp_path),
+        )
+
+        assert gained == 10
+        # listing GET + POST 1 件のみで、2 件目の POST は送られない
+        assert len(fake.calls) == 2
+        state = canvasser.load_account_state(tmp_path)
+        assert len(state["completed_spots"]) == 1
+
+    def test_未知ecodeは1件目で中断し獲得分を保持する(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """成功 1 件の後の未知 ecode で partial_gained=10 の fail closed になる。"""
+        random.seed(0)
+        monkeypatch.setattr(canvasser.time, "sleep", _no_sleep)
+        spots = [_spot(1, 35.00, 135.0), _spot(2, 35.01, 135.0)]
+        unknown = {
+            "status": 400,
+            "body": {"status": "ERROR", "payload": {"ecode": "E9999"}},
+        }
+        fake = FakePage([_listing(spots), _POST_OK, unknown])
+
+        with pytest.raises(FailClosedError, match="連続失敗") as ei:
+            canvasser.collect_checkins(
+                _as_page(fake), _settings(execute=True, profile_dir=tmp_path)
+            )
+
+        assert ei.value.partial_gained == 10
+        # 成功済み 1 件分の state は中断後も残っている
+        state = canvasser.load_account_state(tmp_path)
+        assert len(state["completed_spots"]) == 1
