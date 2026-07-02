@@ -150,10 +150,11 @@ def collect_missions(page: Page, execute: bool = False) -> int:
     戻り値は今回獲得した投票券数の合計 (dry-run 時は「もし実行したら得るはずの見込み」).
     """
     listing = call_api(page, "GET", "/missions?mission_type=0&limit=300")
-    if listing["status"] != 200 or (listing.get("body") or {}).get("status") != "SUCCESS":
+    body = listing.get("body")
+    if listing["status"] != 200 or not isinstance(body, dict) or body.get("status") != "SUCCESS":
         raise RuntimeError(f"ミッション一覧の取得に失敗: {listing}")
 
-    payload = listing["body"]["payload"]
+    payload = body["payload"]
     print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
     print(f"ミッションモード: {'EXECUTE (本番)' if execute else 'DRY-RUN (POST/PUT送信なし)'}")
 
@@ -207,8 +208,8 @@ def _complete(page: Page, mid: int, name: str, execute: bool = False) -> str:
         print("  -> DRY-RUN (POST送信なし)")
         return "ok"
     res = call_api(page, "POST", f"/mission/{mid}")
-    body = res.get("body") or {}
-    if res["status"] == 200 and body.get("status") == "SUCCESS":
+    body = res.get("body")
+    if res["status"] == 200 and isinstance(body, dict) and body.get("status") == "SUCCESS":
         print("  -> 成功")
         return "ok"
 
@@ -235,8 +236,8 @@ def _receive(page: Page, mid: int, name: str, pts: int, execute: bool = False) -
         print("  -> DRY-RUN (PUT送信なし)")
         return pts
     res = call_api(page, "PUT", f"/mission/{mid}/receive")
-    body = res.get("body") or {}
-    ok = res["status"] == 200 and body.get("status") == "SUCCESS"
+    body = res.get("body")
+    ok = res["status"] == 200 and isinstance(body, dict) and body.get("status") == "SUCCESS"
     if ok:
         received = (body.get("payload") or {}).get("received_point")
         print(f"  -> 成功 (received_point={received})")
@@ -480,10 +481,11 @@ def collect_checkins(
     if now_fn is None:
         now_fn = lambda: datetime.now(JST)
     listing = call_checkin_api(page, "GET", f"/event/{CHECKIN_EVENT_SLUG}")
-    if listing["status"] != 200 or (listing.get("body") or {}).get("status") != "SUCCESS":
+    body = listing.get("body")
+    if listing["status"] != 200 or not isinstance(body, dict) or body.get("status") != "SUCCESS":
         raise RuntimeError(f"チェックインイベント取得に失敗: {listing}")
 
-    all_spots = ((listing["body"]) or {}).get("payload", {}).get("spots", [])
+    all_spots = body.get("payload", {}).get("spots", [])
     if not all_spots:
         print("チェックイン対象スポットが空でした.")
         return 0
@@ -664,10 +666,10 @@ def collect_checkins(
             f"/event/{CHECKIN_EVENT_SLUG}/spot/{slug}/checkin",
             body=body,
         )
-        body_resp = res.get("body") or {}
+        body_resp = res.get("body")
         ecode = ((body_resp.get("payload") or {}).get("ecode")) if isinstance(body_resp, dict) else None
 
-        if res["status"] == 200 and body_resp.get("status") == "SUCCESS":
+        if res["status"] == 200 and isinstance(body_resp, dict) and body_resp.get("status") == "SUCCESS":
             print(f"       -> 成功")
             gained += 10
             successful += 1
@@ -1331,7 +1333,7 @@ def resolve_profiles(
         target = (profiles_dir / account).resolve()
         _ensure_within(profiles_dir, target)
         return [(account, target)]
-    if not profiles_dir.exists():
+    if not profiles_dir.is_dir():
         return []
     result: list[tuple[str, Path]] = []
     for entry in sorted(profiles_dir.iterdir()):
