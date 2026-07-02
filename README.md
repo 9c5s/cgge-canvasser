@@ -174,7 +174,7 @@ Next.js チャンク解析で判明した仕様。
 
 ### 認証
 
-- `x-api-key: MEW6XfDHZVtpUxuERAGTaP6AfipAe53kCEFWEMAJ` (フロント公開の固定値)
+- `x-api-key: <FRONTEND_PUBLIC_API_KEY>` (フロント公開の固定値。実際の値は `canvasser.py` の `API_KEY` を参照)
 - `Cookie` (BNID セッション, `credentials: 'include'` で自動付与)
 - `Referer: https://idolmaster-official.jp/`
 
