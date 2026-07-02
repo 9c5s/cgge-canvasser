@@ -32,9 +32,7 @@ pre-commit:
         - '**/*.py'
       run: uvx pyright {staged_files}
 
-    # テスト未整備のため skip。tests/ を追加したら skip を外す。
     - name: pytest
-      skip: true
       glob:
         - '**/*.py'
       run: uv run pytest -q --cov

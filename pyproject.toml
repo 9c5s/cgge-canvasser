@@ -28,8 +28,16 @@ typeCheckingMode = "strict"
 venvPath = "."
 venv = ".venv"
 
-[tool.pytest]
+# テストは private 関数を直接検証する (ruff 側の SLF001 除外と対) ため、
+# reportPrivateUsage のみ緩める。
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["."]
+reportPrivateUsage = false
+
+[tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py314"
@@ -167,8 +175,12 @@ keep-runtime-typing = true
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = [
   "ARG",
+  # 日本語テスト名 (ドキュメント性優先) と、それに伴う小文字始まり規約の除外
+  "D403",
   "FBT",
   "INP001",
+  "N802",
+  "PLC2401",
   "PLC0415",
   "PLR0913",
   "PLR2004",
