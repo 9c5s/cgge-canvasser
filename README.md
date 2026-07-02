@@ -7,12 +7,12 @@ Playwright の persistent context でブラウザセッションを保持し、�
 ## 前提
 
 - Windows / macOS / Linux、Python 3.10 以上。
-- [uv](https://docs.astral.sh/uv/) が必須 (依存関係は PEP 723 の inline script metadata で管理する)。
+- [uv](https://docs.astral.sh/uv/) が必須。
 - Google Cloud Console で Directions API を有効化した API キー (任意。`.env` の `GMAPS_KEY` に設定するとチェックインの移動時間計算が公共交通機関の実運行情報ベースになる)。
 - BNID (バンダイナムコID) の着信認証を設定済みであること。
 - アイドルマスター ポータルにログイン可能であること。
 
-`canvasser.py` は PEP 723 の inline script metadata を持っているので、事前セットアップなしで `uv run` から直接実行できる。
+依存関係は `pyproject.toml` (開発・リポジトリ運用向け) と `canvasser.py` の PEP 723 inline script metadata (スクリプト単体を任意のディレクトリで `uv run` する用) の両方で管理する。両者は同じ依存を宣言する。事前セットアップなしで `uv run canvasser.py` を実行できる。
 
 ## セットアップ
 
