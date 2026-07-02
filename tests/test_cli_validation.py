@@ -20,39 +20,39 @@ class TestValidateAccountName:
     @pytest.mark.parametrize(
         "name",
         [
-            ("main",),
-            ("sub-01",),
-            ("user.name",),
-            ("a",),
-            ("A" * 64,),
+            "main",
+            "sub-01",
+            "user.name",
+            "a",
+            "A" * 64,
         ],
     )
-    def test_安全な名前は通る(self, name: tuple[str]) -> None:
+    def test_安全な名前は通る(self, name: str) -> None:
         """英数字と '_' '-' '.' のみ 64 文字以内は許可される。"""
-        canvasser._validate_account_name(name[0])
+        canvasser._validate_account_name(name)
 
     @pytest.mark.parametrize(
         "name",
         [
-            ("",),
-            ("A" * 65,),
-            ("日本語",),
-            ("a b",),
-            ("a/b",),
-            ("a\\b",),
-            ("../x",),
+            "",
+            "A" * 65,
+            "日本語",
+            "a b",
+            "a/b",
+            "a\\b",
+            "../x",
         ],
     )
-    def test_危険な名前はUserInputError(self, name: tuple[str]) -> None:
+    def test_危険な名前はUserInputError(self, name: str) -> None:
         """空・長すぎ・非 ASCII・空白・パス区切りは拒否される。"""
         with pytest.raises(UserInputError):
-            canvasser._validate_account_name(name[0])
+            canvasser._validate_account_name(name)
 
-    @pytest.mark.parametrize("name", [(".",), ("..",)])
-    def test_ドット単体はパスとして拒否する(self, name: tuple[str]) -> None:
+    @pytest.mark.parametrize("name", [".", ".."])
+    def test_ドット単体はパスとして拒否する(self, name: str) -> None:
         """正規表現を通過する '.' と '..' も追加防御で弾く。"""
         with pytest.raises(UserInputError, match="パスとして危険"):
-            canvasser._validate_account_name(name[0])
+            canvasser._validate_account_name(name)
 
 
 class TestEnsureWithin:
