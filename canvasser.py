@@ -7,20 +7,25 @@
 #     "python-dotenv>=1.0",
 # ]
 # ///
-"""シンデレラガール総選挙2026 ミッション自動回収スクリプト.
+"""シンデレラガール総選挙2026 デイリー自動化スクリプト.
 
 Playwrightのpersistent contextでブラウザセッションを保持し, フロントが叩いている
-内部APIをそのまま呼び出して達成報告と投票券受取を自動化する.
+内部APIをそのまま呼び出してミッション回収と (--checkin なら) チェックインを自動化する.
+複数アカウントを ./profiles/{account}/ に分けて運用する構成が前提.
 
-初回のみ `--login` で手動ログインし, 以降は headless で毎日実行する運用を想定.
-`--checkin` フラグでチェックイン (#99, 全国スポットへの GPS 位置認証) も自動化する.
+初回のみ `--login --account NAME` で手動ログイン, 以降は `uv run canvasser.py` で
+全アカウントを headless に順次処理する.
 
-推奨実行方法: `uv run canvasser.py [--login] [--checkin]`
+  uv run canvasser.py --login --account main          # 初回ログイン
+  uv run canvasser.py                                 # ミッション回収 (全アカウント)
+  uv run canvasser.py --checkin --execute             # ミッション + チェックイン本番
+  uv run canvasser.py --checkin --no-mission          # ドライラン (POST送信なし)
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import math
@@ -205,14 +210,18 @@ def encrypt_coords(coords: dict[str, Any], password: str = API_KEY) -> str:
       - key = PBKDF2(password, salt=random16, iterations=500, keySize=8 words=32B, hasher=SHA1)
       - iv = random16
       - ciphertext = AES-CBC(key, iv, PKCS7(JSON.stringify(coords)))
-      - payload = f"{salt.hex()},{iv.hex()},{ct.hex()}"
+      - payload = f"{salt.hex()},{iv.hex()},{ct_base64}"
+
+    重要: salt と iv は hex, **ciphertext は Base64** で連結する (crypto-js の
+    Hex/Base64 混在フォーマットを再現). 実UI経由の POST 観測で確定した仕様.
     """
     salt = os.urandom(16)
     iv = os.urandom(16)
     key = hashlib.pbkdf2_hmac("sha1", password.encode(), salt, 500, dklen=32)
     plaintext = json.dumps(coords, separators=(",", ":")).encode()
     ciphertext = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext, 16))
-    return f"{salt.hex()},{iv.hex()},{ciphertext.hex()}"
+    ct_b64 = base64.b64encode(ciphertext).decode()
+    return f"{salt.hex()},{iv.hex()},{ct_b64}"
 
 
 def random_point_in_circle(
@@ -292,7 +301,12 @@ def call_checkin_api(
     path: str,
     body: str | None = None,
 ) -> dict[str, Any]:
-    """checkins 系エンドポイントを叩く. body があれば text/plain で送る."""
+    """checkins 系エンドポイントを叩く.
+
+    body があれば application/x-www-form-urlencoded で送る. これは実UIの POST を
+    キャプチャして確定した仕様 (axios が data:string を送るときの既定Content-Type).
+    body は "salt_hex,iv_hex,ct_base64" の文字列をそのまま (URL エンコードせずに) 載せる.
+    """
     url = f"{API_V1}/checkins{path}"
     return page.evaluate(
         """
@@ -304,7 +318,7 @@ def call_checkin_api(
               headers: {
                 'x-api-key': apiKey,
                 'accept': 'application/json, text/plain, */*',
-                ...(body ? {'content-type': 'text/plain;charset=UTF-8'} : {})
+                ...(body ? {'content-type': 'application/x-www-form-urlencoded'} : {})
               },
               body: body ?? undefined,
             });
@@ -443,6 +457,7 @@ def collect_checkins(
 
     gained = 0
     successful = 0
+    attempted = 0  # 実POSTを送った回数. execute=True の時のみ加算.
     consecutive_failures = 0
 
     # 現在時刻を追跡. state に前回終了時刻があれば now と比較して大きい方を採用する.
@@ -460,7 +475,12 @@ def collect_checkins(
     prev_lng: float | None = resume_lng if resumed else None
 
     for i, spot in enumerate(spots, 1):
-        if daily_budget > 0 and successful >= daily_budget:
+        # 上限判定は「実行モードで意味のあるカウンタ」で行う.
+        # - execute=True: 実POST試行回数 (成功/既達成/範囲外/失敗を問わず1リクエスト = 1消費)
+        # - execute=False: 仮想成功数 (ドライラン獲得見込みの目安)
+        # これで --execute --daily-budget 1 は「実POSTを1回だけ送る」を厳密に保証する.
+        limit_counter = attempted if execute else successful
+        if daily_budget > 0 and limit_counter >= daily_budget:
             print(f"  日次上限 {daily_budget}件に到達. 残り {len(spots) - i + 1}件は次回以降.")
             break
 
@@ -513,27 +533,38 @@ def collect_checkins(
             f" (offset {distance_m:.1f}m, acc={coords['accuracy']}m, alt={coords['altitude']})"
         )
 
-        # 1件処理成功後は「滞在時間」を挟んでから次スポットへ進む.
-        def _post_checkin_stay() -> None:
-            """チェックイン後の滞在時間を仮想now/実sleep に反映.
-
-            nonlocal は使えない (関数内関数の参照キャプチャ) ため, virtual_now は
-            返り値ではなく外側で加算する形にする.
-            """
-
         stay_secs = natural_stay_seconds()
 
+        def will_continue_after(next_attempted: int, next_successful: int) -> bool:
+            """このスポット処理後に次のループへ進むか判定する.
+
+            - 最終スポットなら False (もう次はない)
+            - daily_budget を使い切ったら False (次のループ冒頭で break される)
+            - execute=True と False で使うカウンタが違う (attempted vs successful)
+            """
+            if i >= len(spots):
+                return False
+            if daily_budget <= 0:
+                return True
+            counter = next_attempted if execute else next_successful
+            return counter < daily_budget
+
         if not execute:
+            # ドライランは POST を送らず, state.json も汚染しない.
+            # 実POST 実行時の resume を狂わせないため, ここで state を書き換えないのは重要.
             print(f"       body={body[:60]}...(len={len(body)})  [DRY-RUN]")
             gained += 10
             successful += 1
             prev_lat, prev_lng = s_lat, s_lng
-            virtual_now = virtual_now + timedelta(seconds=stay_secs)
-            print(f"       滞在 {humanize_duration(stay_secs)} -> 出発 {virtual_now:%m/%d %H:%M}")
-            if profile_dir is not None:
-                update_checkin_state(profile_dir, spot, virtual_now)
+            if will_continue_after(attempted, successful):
+                virtual_now = virtual_now + timedelta(seconds=stay_secs)
+                print(f"       滞在 {humanize_duration(stay_secs)} -> 出発 {virtual_now:%m/%d %H:%M}")
             continue
 
+        # --- 実POST 分岐 ---
+        # POST 送信の直前に attempted を加算する. これで daily_budget が「実POST試行回数」で
+        # 厳密に働き, 既達成/範囲外/失敗を問わず 1 リクエスト = 1 消費として扱える.
+        attempted += 1
         res = call_checkin_api(
             page,
             "POST",
@@ -550,9 +581,14 @@ def collect_checkins(
             consecutive_failures = 0
             prev_lat, prev_lng = s_lat, s_lng
             virtual_now = now_fn()
-            time.sleep(stay_secs)
-            virtual_now = virtual_now + timedelta(seconds=stay_secs)
-            print(f"       滞在 {humanize_duration(stay_secs)} -> 出発 {virtual_now:%m/%d %H:%M}")
+            # 次のスポットに進む場合のみ滞在時間を消化する.
+            # 最終スポット or budget 到達時は無駄な sleep を避ける.
+            if will_continue_after(attempted, successful):
+                time.sleep(stay_secs)
+                virtual_now = virtual_now + timedelta(seconds=stay_secs)
+                print(f"       滞在 {humanize_duration(stay_secs)} -> 出発 {virtual_now:%m/%d %H:%M}")
+            # state 更新は「実際にサーバ側で成功した」ケースだけに限定する.
+            # 既達成/範囲外/失敗では位置情報を汚染しない.
             if profile_dir is not None:
                 update_checkin_state(profile_dir, spot, virtual_now)
             continue
@@ -581,7 +617,11 @@ def collect_checkins(
             break
 
     label = "獲得見込み" if not execute else "獲得"
-    print(f"{label}: 約{gained}票 ({successful}スポット成功, 仮想終了時刻 {virtual_now:%m/%d %H:%M})")
+    footer = f"{successful}スポット成功"
+    if execute:
+        footer += f", 実POST試行 {attempted}件"
+    footer += f", 仮想終了時刻 {virtual_now:%m/%d %H:%M}"
+    print(f"{label}: 約{gained}票 ({footer})")
     return gained
 
 
@@ -930,17 +970,12 @@ def run_login_flow(page: Page, timeout_sec: int = 600, interval_sec: float = 3.0
 def resolve_profiles(
     profiles_dir: Path,
     account: str | None,
-    legacy_profile: str | None,
 ) -> list[tuple[str, Path]]:
     """CLI引数から処理対象のプロファイル一覧 [(表示名, ディレクトリ), ...] を決定する.
 
-    優先順位:
-      1. --profile 指定 (後方互換)
-      2. --account 指定
-      3. --profiles-dir 配下のサブディレクトリ全列挙
+    - --account NAME 指定なら 1 アカウント固定
+    - 未指定なら --profiles-dir 配下のサブディレクトリを全列挙 (複数アカウント運用)
     """
-    if legacy_profile:
-        return [("default", Path(legacy_profile).resolve())]
     if account:
         return [(account, (profiles_dir / account).resolve())]
     if not profiles_dir.exists():
@@ -1029,20 +1064,17 @@ def main() -> int:
     parser.add_argument(
         "--login",
         action="store_true",
-        help="初回ログイン用. Chromium を可視状態で起動する (--account か --profile とセット)",
+        help="初回ログイン用. Chromium を可視状態で起動する (--account とセット必須)",
     )
     parser.add_argument(
         "--account",
-        help="対象アカウント名. profiles-dir 配下のサブディレクトリ名として扱う",
+        help="対象アカウント名. profiles-dir 配下のサブディレクトリ名として扱う. "
+             "未指定なら profiles-dir 内のすべてのアカウントを順次処理する",
     )
     parser.add_argument(
         "--profiles-dir",
         default="./profiles",
         help="複数アカウントの親ディレクトリ (デフォルト: ./profiles)",
-    )
-    parser.add_argument(
-        "--profile",
-        help="単一プロファイルディレクトリを直接指定 (旧版との後方互換用)",
     )
     parser.add_argument(
         "--checkin",
@@ -1077,29 +1109,19 @@ def main() -> int:
     args = parser.parse_args()
 
     profiles_dir = Path(args.profiles_dir).resolve()
-    profiles = resolve_profiles(profiles_dir, args.account, args.profile)
+    profiles = resolve_profiles(profiles_dir, args.account)
 
     if not profiles:
-        legacy = Path("./imas_profile")
-        if legacy.exists() and legacy.is_dir():
-            print(
-                "プロファイルが見つかりません. 旧版の ./imas_profile が残っているようです.\n"
-                "以下のどちらかで移行してください:\n"
-                "  A) ディレクトリ移動:   mv imas_profile profiles/main\n"
-                "  B) 単発で明示指定:     uv run canvasser.py --profile ./imas_profile",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"プロファイルが見つかりません ({profiles_dir}).\n"
-                "初回は `uv run canvasser.py --login --account NAME` でアカウントを追加してください.",
-                file=sys.stderr,
-            )
+        print(
+            f"プロファイルが見つかりません ({profiles_dir}).\n"
+            "初回は `uv run canvasser.py --login --account NAME` でアカウントを追加してください.",
+            file=sys.stderr,
+        )
         return 1
 
-    if args.login and len(profiles) != 1:
+    if args.login and args.account is None:
         print(
-            "--login は --account または --profile で1アカウントに絞ってください.",
+            "--login は --account で 1 アカウント指定してください.",
             file=sys.stderr,
         )
         return 1
