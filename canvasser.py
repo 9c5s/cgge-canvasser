@@ -219,10 +219,15 @@ def check_login(page: Page) -> bool:
 
 
 def collect_missions(page: Page, *, execute: bool = False) -> int:
-    """API 経由で完了可能なミッションをまとめて消化する。
+    """API 経由で完了可能なミッションと、外部トリガー達成分の受取をまとめて消化する。
 
-    - `mission_complete_api_call_flag=True` のみを対象にする。あいことばやチェックインは
-      外部トリガー起因のため、この関数からは触らない。
+    - `mission_complete_api_call_flag=True` は達成 POST と受取 PUT の両方を送る対象。
+      #100-104 のような累計達成数系や、動画視聴などフロントが達成 POST を出すもの。
+    - `mission_complete_api_call_flag=False` でも「達成済みかつ未受取」なら受取 PUT
+      だけは送る。ASOBI STORE プレミアム会員のログインボーナスやチェックインボーナス
+      など、外部トリガーで達成扱いになる分の投票券が受け取り漏れになるのを防ぐため。
+    - あいことばなど、達成条件が UI 経由のみのミッションは flag=False かつ未達成の
+      ままなので、達成 POST も受取 PUT も送らない。
     - `execute=False` (デフォルト) は完全ドライラン。GET のみ実行し、POST/PUT は
       送らない。
 
@@ -241,15 +246,20 @@ def collect_missions(page: Page, *, execute: bool = False) -> int:
         pts: int = m["mission_point"]
 
         action = cast("dict[str, Any]", m.get("action") or {})
-        if not action.get("mission_complete_api_call_flag"):
-            continue
-
+        api_completable = bool(action.get("mission_complete_api_call_flag"))
         completed = bool(m.get("is_mission_completed"))
         received = bool(m.get("is_mission_received"))
         remaining = m.get("remaining_completable_count") or 0
 
+        # 達成済みかつ未受取なら、flag に関係なく受取 PUT を送る。
+        # 外部トリガー達成 (ログイン系・チェックイン系など) の取りこぼしを防ぐ。
         if completed and not received:
             gained += _receive(page, mid, name, pts, execute=execute)
+            continue
+
+        # 達成 POST は API 完了可能ミッションだけに送る。
+        # あいことば等 UI 経由のミッションを誤って POST しないため。
+        if not api_completable:
             continue
 
         if not completed and remaining > 0:

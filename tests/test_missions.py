@@ -82,8 +82,36 @@ class TestCollectMissions:
         assert len(fake.calls) == 2
 
     def test_APIフラグなしミッションは対象外(self) -> None:
-        """mission_complete_api_call_flag=False は達成も受取も送らない。"""
+        """flag=False かつ未達成なら達成も受取も送らない。"""
         fake = FakePage([_listing([_mission(3, 50, flag=False)])])
+
+        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+
+        assert gained == 0
+        assert len(fake.calls) == 1
+
+    def test_APIフラグなしでも達成済み未受取は受取のみ行う(self) -> None:
+        """flag=False でも completed かつ未受取なら受取 PUT だけを送る。
+
+        ASOBI STORE プレミアム会員のログインボーナスやチェックインボーナスなど、
+        外部トリガーで達成扱いになる分の取りこぼしを防ぐ。
+        """
+        receive_ok = success_response({"received_point": 15})
+        fake = FakePage([
+            _listing([_mission(6, 15, flag=False, completed=True, received=False)]),
+            receive_ok,
+        ])
+
+        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+
+        assert gained == 15
+        assert len(fake.calls) == 2
+
+    def test_APIフラグなしで達成済み受取済みは何もしない(self) -> None:
+        """flag=False かつ既に受取済みなら PUT も送らない (重複受取回避)。"""
+        fake = FakePage([
+            _listing([_mission(7, 15, flag=False, completed=True, received=True)]),
+        ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
 
