@@ -125,7 +125,7 @@ Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trig
 3. **移動時間を反映**：
    - `GMAPS_KEY` があれば Google Maps Directions API の `mode=transit` (フォールバック `driving`) を呼び、`departure_time` に仮想現在時刻を渡す。実運行時刻を含んだ duration が返る。
    - なければ Haversine と距離レンジ別平均速度で下限を推定する。
-4. **深夜帯 (24:00-06:00) は移動不可**：`next_arrival_time` で「今日中に到着できない旅は翌朝 06:00 発へ押し戻す」を強制する。ただし `gmaps-transit` の結果には運行時刻が含まれているので押し戻しは行わない。
+4. **深夜帯 (24:00-06:00) は移動不可**：`next_arrival_time` で「今日中に到着できない旅は翌朝 06:00 発へ押し戻す」を強制する。ただし `gmaps-transit` の結果には運行時刻が含まれているので押し戻しは行わない。稼働枠 (06:00-24:00 の 18 時間) を超える長旅も夜行便等の連続移動として押し戻さずそのまま加算する。
 5. **スポットで滞在**：10〜30 分をランダムに滞在してから次スポットへ移る (最終スポットや `daily-budget` 到達時は滞在を省く)。
 6. **座標を自然化**：スポット中心から `checkin_radius * 0.85` 内の円内ランダム点を選ぶ。accuracy は正規分布 μ=18m σ=6m に 15% の外れ値を混ぜ、altitude は 20% の確率で 5〜80m を割り当てる。
 7. **AES 暗号化して POST**：`AES-CBC(PBKDF2(API_KEY, salt=r16, iter=500, sha1, keySize=32B), iv=r16)` で座標 JSON を暗号化し、`Content-Type: application/x-www-form-urlencoded` で `{salt_hex},{iv_hex},{ct_base64}` 形式を送信する。
