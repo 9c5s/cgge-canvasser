@@ -1808,6 +1808,16 @@ def _ensure_within(base: Path, candidate: Path) -> None:
         raise UserInputError(msg) from e
 
 
+# ruff preview format が `except (A, B, C):` の外側カッコを削除するため、
+# tuple はモジュールレベルの定数に切り出す (Python 3.14 はカッコなし表記も許容するが、
+# 可搬性と可読性のため tuple 形式で catch する)。
+_GIT_CHECK_IGNORE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    FileNotFoundError,
+    subprocess.TimeoutExpired,
+    OSError,
+)
+
+
 def _profiles_dir_is_gitignored(profiles_dir: Path) -> bool:
     """`profiles_dir` が git ignore 対象なら True。
 
@@ -1839,7 +1849,7 @@ def _profiles_dir_is_gitignored(profiles_dir: Path) -> bool:
             timeout=10,
             check=False,
         )
-    except FileNotFoundError, subprocess.TimeoutExpired, OSError:
+    except _GIT_CHECK_IGNORE_EXCEPTIONS:
         return False
     return result.returncode == 0
 
