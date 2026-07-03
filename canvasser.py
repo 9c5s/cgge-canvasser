@@ -11,17 +11,18 @@
 """シンデレラガール総選挙2026 デイリー自動化スクリプト。
 
 Playwright の persistent context でブラウザセッションを保持し、フロントが叩く
-内部 API をそのまま呼び出してミッション回収と (--checkin ならば) チェックインを
-自動化する。複数アカウントは ./profiles/{account}/ 配下に分けて運用する。
+内部 API をそのまま呼び出してミッション回収とチェックインを自動化する。
+複数アカウントは ./profiles/{account}/ 配下に分けて運用する。
 
-  uv run canvasser.py --login --account main               # 初回ログイン
-  uv run canvasser.py                                      # 全アカウント完全ドライラン
-  uv run canvasser.py --execute-mission                    # ミッションだけ本番
-  uv run canvasser.py --checkin --execute-checkin          # チェックインだけ本番
-  uv run canvasser.py --checkin --execute-mission --execute-checkin  # 両方本番
+  uv run canvasser.py login --account main                   # 初回ログイン
+  uv run canvasser.py run                                    # ミッションのみドライラン
+  uv run canvasser.py run --execute                          # ミッションのみ本番
+  uv run canvasser.py run --tasks mission,checkin            # 両方ドライラン
+  uv run canvasser.py run --tasks mission,checkin --execute  # 両方本番
+  uv run canvasser.py mark-completed --account main cg_vote2026_17  # 手動完了登録
 
-`--execute-mission` と `--execute-checkin` は独立したゲート。どちらも未指定なら
-GET のみのドライランとなり、POST/PUT は一切送らない。
+`--execute` は `--tasks` で選択したタスクにのみ適用される。未指定なら GET のみの
+ドライランとなり、POST/PUT は一切送らない。
 """
 
 # print はこの CLI の仕様そのもの (標準出力が UI) のため、T201 はファイル全体で
@@ -193,7 +194,7 @@ def check_login(page: Page) -> bool:
     """auths/login/check を叩いて認証状態を確認する。
 
     fetch 例外や非 JSON 応答は未ログインと同義に丸める。Cookie 期限切れや
-    ネットワーク不通も「未ログインなら --login を促す」ルートに合流させるため。
+    ネットワーク不通も「未ログインなら login を促す」ルートに合流させるため。
     """
     result = page.evaluate(
         """
@@ -850,7 +851,7 @@ class _CheckinRunner:
                 f"範囲外 (E5005) が {self.out_of_range_count} 件。"
                 "crypto・body・radius の実装不一致の疑いがあるため停止する。"
                 "座標計算とペイロードの整合性を確認してから"
-                " --max-out-of-range を上げて再実行する。"
+                " --out-of-range-limit を上げて再実行する。"
             )
             raise FailClosedError(msg, partial_gained=self.gained)
         self._move_origin_to(spot)
@@ -1438,8 +1439,8 @@ def resume_context(
 
     旧版の dry-run 経路も `update_checkin_state` を叩いていたため、`last_checkin` から
     「実 POST 成功済み」を後方推定する手段がない。誤って dry-run 由来の slug を完了扱い
-    すると次回 `--execute-checkin` で reward を落とすので、自動移行はしない。旧 state の
-    補完が必要なら `--mark-completed` を明示的に使う。
+    すると次回のチェックイン実 POST で reward を落とすので、自動移行はしない。
+    旧 state の補完が必要なら `mark-completed` を明示的に使う。
     """
     state = load_account_state(profile_dir, strict=strict)
     last = cast("dict[str, Any]", state.get("last_checkin") or {})
@@ -1528,7 +1529,7 @@ def run_login_flow(
         with contextlib.suppress(PlaywrightError):
             if check_login(page):
                 print(
-                    "ログイン状態を確認しました。次回から --login なしで実行できます。",
+                    "ログイン状態を確認しました。次回から run で実行できます。",
                     file=sys.stderr,
                 )
                 return 0
@@ -1578,7 +1579,7 @@ def _ensure_within(base: Path, candidate: Path) -> None:
 def _profiles_dir_is_gitignored(profiles_dir: Path) -> bool:
     """`profiles_dir` が git ignore 対象なら True。
 
-    profiles_dir がまだ存在しない (初回 `--login` 前) ケースでも判定できるよう、
+    profiles_dir がまだ存在しない (初回 `login` 前) ケースでも判定できるよう、
     path 末尾に `/` を付けてディレクトリと明示する。`.gitignore` の `profiles/` の
     ようなディレクトリ限定パターンは、path 側もディレクトリと分かる形でないと
     match しない。
@@ -1667,16 +1668,20 @@ def open_persistent_context(
 
 @dataclass(kw_only=True)
 class RunOptions:
-    """CLI 引数から組み立てる 1 実行分の動作設定。"""
+    """CLI 引数から組み立てる 1 実行分の動作設定。
 
-    login_mode: bool
-    run_mission: bool
-    run_checkin: bool
-    execute_mission: bool
-    execute_checkin: bool
-    daily_budget: int
-    consecutive_failure_limit: int
-    out_of_range_limit: int
+    デフォルトは「何も実行しない完全ドライラン」で、login サブコマンドは
+    `login_mode=True` のみを立てて使う。
+    """
+
+    login_mode: bool = False
+    run_mission: bool = False
+    run_checkin: bool = False
+    execute_mission: bool = False
+    execute_checkin: bool = False
+    daily_budget: int = 0
+    consecutive_failure_limit: int = 1
+    out_of_range_limit: int = 3
 
 
 def process_account(
@@ -1703,7 +1708,7 @@ def process_account(
         if not check_login(page):
             print(
                 f"[{name}] 未ログイン。"
-                f"`uv run canvasser.py --login --account {name}` を実行してください。",
+                f"`uv run canvasser.py login --account {name}` を実行してください。",
                 file=sys.stderr,
             )
             return 0, 1
@@ -1755,58 +1760,88 @@ def main() -> int:
         return 1
 
 
+_TASK_CHOICES = ("mission", "checkin")
+
+
+def _parse_tasks(value: str) -> tuple[str, ...]:
+    """--tasks のカンマ区切り値を検証し、初出順の重複なし tuple へ正規化する。"""
+    items = [t.strip() for t in value.split(",") if t.strip()]
+    if not items:
+        msg = f"タスクを 1 つ以上指定してください ({' / '.join(_TASK_CHOICES)})"
+        raise argparse.ArgumentTypeError(msg)
+    invalid = [t for t in items if t not in _TASK_CHOICES]
+    if invalid:
+        msg = f"不明なタスク: {', '.join(invalid)} ({' / '.join(_TASK_CHOICES)} のみ)"
+        raise argparse.ArgumentTypeError(msg)
+    return tuple(dict.fromkeys(items))
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    """CLI 引数パーサを構築する。"""
+    """CLI 引数パーサを構築する。login / run / mark-completed の 3 サブコマンド。
+
+    サブコマンドで必須引数を構造的に表現し、フラグの組み合わせ検証を不要にする。
+    """
     parser = argparse.ArgumentParser(
         description=(
             "シンデレラガール総選挙2026 デイリーミッション自動回収 (複数アカウント対応)"
         )
     )
-    parser.add_argument(
-        "--login",
-        action="store_true",
-        help=(
-            "初回ログイン用。Chromium を可視状態で起動する"
-            " (--account とセットで指定する)"
-        ),
-    )
-    parser.add_argument(
-        "--account",
-        help="対象アカウント名。profiles-dir 配下のサブディレクトリ名として扱う。"
-        "未指定なら profiles-dir 内のすべてのアカウントを順次処理する",
-    )
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # 全サブコマンド共通の親パーサ
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
         "--profiles-dir",
         default="./profiles",
         help="複数アカウントの親ディレクトリ (デフォルト: ./profiles)",
     )
-    parser.add_argument(
-        "--checkin",
+
+    # ブラウザを起動するサブコマンド (login / run) 共通の親パーサ
+    browser = argparse.ArgumentParser(add_help=False)
+    browser.add_argument(
+        "--allow-unignored-profiles-dir",
         action="store_true",
-        help=(
-            "チェックイン (#99) も処理する。"
-            "未指定時はミッションのみ処理する (dry-run または本番)。"
-        ),
+        help="--profiles-dir が git ignore 対象でない場合の警告を無視する。"
+        "デフォルトはモードに関係なく未 ignore の profiles-dir を拒否する "
+        "(Cookie 誤コミット防止)。",
     )
-    parser.add_argument(
-        "--no-mission",
+
+    login = subparsers.add_parser(
+        "login",
+        parents=[common, browser],
+        help="初回ログイン。Chromium を可視状態で起動する",
+    )
+    login.add_argument(
+        "--account",
+        required=True,
+        help="対象アカウント名。profiles-dir 配下のサブディレクトリ名として扱う",
+    )
+
+    run = subparsers.add_parser(
+        "run",
+        parents=[common, browser],
+        help="ミッション・チェックインを処理する (デフォルトはドライラン)",
+    )
+    run.add_argument(
+        "--account",
+        help="対象アカウント名。未指定なら profiles-dir 内のすべてのアカウントを"
+        "順次処理する",
+    )
+    run.add_argument(
+        "--tasks",
+        type=_parse_tasks,
+        default=("mission",),
+        metavar="TASK1,TASK2",
+        help=f"処理するタスクのカンマ区切り ({' / '.join(_TASK_CHOICES)}。"
+        "デフォルト: mission)",
+    )
+    run.add_argument(
+        "--execute",
         action="store_true",
-        help="ミッション回収をスキップする。--checkin と組み合わせて使う",
+        help="選択したタスクを実 POST/PUT する。未指定は GET のみのドライラン "
+        "(チェックインの sleep も skip)。",
     )
-    parser.add_argument(
-        "--execute-mission",
-        action="store_true",
-        help="ミッションを実 POST/PUT する。未指定はドライラン (GET のみ)。",
-    )
-    parser.add_argument(
-        "--execute-checkin",
-        action="store_true",
-        help=(
-            "チェックインを実 POST する。"
-            "未指定はドライラン (GET のみで、sleep も skip)。"
-        ),
-    )
-    parser.add_argument(
+    run.add_argument(
         "--daily-budget",
         type=int,
         default=0,
@@ -1816,7 +1851,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "時間帯制約 (深夜移動不可) で自然に上限がかかるため、通常は指定不要。"
         "緊急停止したいときにだけ小さな値を指定する。",
     )
-    parser.add_argument(
+    run.add_argument(
         "--consecutive-failure-limit",
         type=int,
         default=1,
@@ -1825,8 +1860,8 @@ def _build_parser() -> argparse.ArgumentParser:
             " (デフォルト: 1 = 1 件目で即停止)。"
         ),
     )
-    parser.add_argument(
-        "--max-out-of-range",
+    run.add_argument(
+        "--out-of-range-limit",
         type=int,
         default=3,
         help=(
@@ -1834,19 +1869,22 @@ def _build_parser() -> argparse.ArgumentParser:
             "crypto や座標の実装不一致で 51 件全部を撃たないための安全弁。"
         ),
     )
-    parser.add_argument(
-        "--mark-completed",
-        metavar="SLUG1,SLUG2,...",
-        help="実 POST 済みスポットを state.completed_spots に手動追加して終了する。"
-        "--account NAME と組み合わせて使う。例: "
-        "--account syota --mark-completed cg_vote2026_17,cg_vote2026_19",
+
+    mark = subparsers.add_parser(
+        "mark-completed",
+        parents=[common],
+        help="実 POST 済みスポットを state.completed_spots に手動追加して終了する",
     )
-    parser.add_argument(
-        "--allow-unignored-profiles-dir",
-        action="store_true",
-        help="--profiles-dir が git ignore 対象でない場合の警告を無視する。"
-        "デフォルトはモードに関係なく未 ignore の profiles-dir を拒否する "
-        "(Cookie 誤コミット防止)。",
+    mark.add_argument(
+        "--account",
+        required=True,
+        help="対象アカウント名。profiles-dir 配下のサブディレクトリ名として扱う",
+    )
+    mark.add_argument(
+        "slugs",
+        nargs="+",
+        metavar="SLUG",
+        help="登録する spot_slug (例: cg_vote2026_17)",
     )
     return parser
 
@@ -1864,46 +1902,43 @@ def _validate_thresholds(args: argparse.Namespace) -> None:
     if args.consecutive_failure_limit < 1:
         msg = "--consecutive-failure-limit は 1 以上を指定してください。"
         raise UserInputError(msg)
-    if args.max_out_of_range < 1:
-        msg = "--max-out-of-range は 1 以上を指定してください。"
+    if args.out_of_range_limit < 1:
+        msg = "--out-of-range-limit は 1 以上を指定してください。"
         raise UserInputError(msg)
 
 
-def _validate_mode_flags(args: argparse.Namespace) -> None:
-    """フラグの組み合わせを検証する。
+def _build_run_options(args: argparse.Namespace) -> RunOptions:
+    """パース済み引数から RunOptions を組み立てる。
 
-    実行ゲート単独指定を弾く。対応する対象フラグが無いと黙って dry-run になり、
-    「実 POST を送ったつもりが送られていない」誤運用に繋がる。
+    `--execute` は `--tasks` で選択したタスクにのみ適用し、選択外タスクの
+    実行ゲートは開かない。
     """
-    if args.login and args.account is None:
-        msg = "--login は --account で 1 アカウントを指定してください。"
-        raise UserInputError(msg)
-    if args.no_mission and not args.checkin:
-        msg = "--no-mission は --checkin と組み合わせて使ってください。"
-        raise UserInputError(msg)
-    if args.execute_mission and args.no_mission:
-        msg = "--execute-mission は --no-mission と併用できません。"
-        raise UserInputError(msg)
-    if args.execute_checkin and not args.checkin:
-        msg = "--execute-checkin は --checkin と組み合わせて使ってください。"
-        raise UserInputError(msg)
+    if args.command == "login":
+        return RunOptions(login_mode=True)
+    run_mission = "mission" in args.tasks
+    run_checkin = "checkin" in args.tasks
+    return RunOptions(
+        run_mission=run_mission,
+        run_checkin=run_checkin,
+        execute_mission=args.execute and run_mission,
+        execute_checkin=args.execute and run_checkin,
+        daily_budget=args.daily_budget,
+        consecutive_failure_limit=args.consecutive_failure_limit,
+        out_of_range_limit=args.out_of_range_limit,
+    )
 
 
 def _run_mark_completed(args: argparse.Namespace, profiles_dir: Path) -> int:
-    """--mark-completed の処理。state を編集して即終了する (ブラウザ起動なし)。"""
-    if args.account is None:
-        msg = "--mark-completed は --account NAME と組み合わせて使ってください。"
-        raise UserInputError(msg)
+    """mark-completed の処理。state を編集して即終了する (ブラウザ起動なし)。"""
     _validate_account_name(args.account)
     target_dir = (profiles_dir / args.account).resolve()
     _ensure_within(profiles_dir, target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    slugs = [s.strip() for s in args.mark_completed.split(",") if s.strip()]
     try:
-        mark_spots_completed(target_dir, slugs)
+        mark_spots_completed(target_dir, args.slugs)
     except StateFileCorruptedError as e:
         print(
-            f"state.json が破損しているため --mark-completed で上書きできません: {e}",
+            f"state.json が破損しているため mark-completed で上書きできません: {e}",
             file=sys.stderr,
         )
         return 1
@@ -1942,36 +1977,29 @@ def _print_summary(results: list[tuple[str, int]]) -> None:
 
 def _main_impl() -> int:
     args = _build_parser().parse_args()
-    _validate_thresholds(args)
 
     profiles_dir = Path(args.profiles_dir).resolve()
 
-    # --mark-completed は state を編集して即終了する (ブラウザ起動なし)
-    if args.mark_completed is not None:
+    # mark-completed は state を編集して即終了する (ブラウザ起動なし)
+    if args.command == "mark-completed":
         return _run_mark_completed(args, profiles_dir)
+
+    login_mode = args.command == "login"
+    if not login_mode:
+        _validate_thresholds(args)
 
     profiles = resolve_profiles(profiles_dir, args.account)
     if not profiles:
         msg = (
             f"プロファイルが見つかりません ({profiles_dir})。\n"
-            "初回は `uv run canvasser.py --login --account NAME` で"
+            "初回は `uv run canvasser.py login --account NAME` で"
             "アカウントを追加してください。"
         )
         raise UserInputError(msg)
 
-    _validate_mode_flags(args)
     _ensure_profiles_dir_ignored(args, profiles_dir)
 
-    options = RunOptions(
-        login_mode=args.login,
-        run_mission=not args.no_mission,
-        run_checkin=args.checkin,
-        execute_mission=args.execute_mission,
-        execute_checkin=args.execute_checkin,
-        daily_budget=args.daily_budget,
-        consecutive_failure_limit=args.consecutive_failure_limit,
-        out_of_range_limit=args.max_out_of_range,
-    )
+    options = _build_run_options(args)
 
     ensure_chromium_installed()
 
@@ -1991,8 +2019,8 @@ def _main_impl() -> int:
             results.append((name, gained))
             if code != 0:
                 exit_code = code
-            if args.login:
-                # --login は 1 アカウントのみ処理して抜ける
+            if login_mode:
+                # login は 1 アカウント (--account 必須) のみ処理して抜ける
                 return code
 
     if len(profiles) > 1:

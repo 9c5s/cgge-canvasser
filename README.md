@@ -29,8 +29,8 @@ GMAPS_KEY=AIzaSy...
 ### 初回ログイン (アカウントごとに1回)
 
 ```powershell
-uv run canvasser.py --login --account main
-uv run canvasser.py --login --account sub
+uv run canvasser.py login --account main
+uv run canvasser.py login --account sub
 ```
 
 - `--account NAME` は必須。`./profiles/NAME/` にプロファイルが作られる。
@@ -39,53 +39,47 @@ uv run canvasser.py --login --account sub
 ### 日次実行 (ミッション回収、全アカウント)
 
 ```powershell
-uv run canvasser.py --execute-mission
+uv run canvasser.py run --execute
 ```
 
 `./profiles/` 配下の全アカウントを順次処理する。ミッション回収 (ログインボーナス、動画視聴、公式 X フォロー、達成回数など) を実行する。
 
-`--execute-mission` を付けない場合は完全ドライラン (GET のみ、POST/PUT なし)。
+`--execute` を付けない場合は完全ドライラン (GET のみ、POST/PUT なし)。
 
 ### 特定アカウントのみ実行
 
 ```powershell
-uv run canvasser.py --account main
+uv run canvasser.py run --account main
 ```
 
 ### ドライランで動作確認 (POST/PUT は一切送らない)
 
 ```powershell
-uv run canvasser.py --checkin
+uv run canvasser.py run --tasks mission,checkin
 ```
 
-両ゲートを付けなかった場合は完全ドライランとして扱う (GET のみ、POST/PUT は送らず、sleep も skip)。ペイロード生成、経路シミュレーション、state を触らないダミーループだけを回す。
+`--execute` を付けなかった場合は完全ドライランとして扱う (GET のみ、POST/PUT は送らず、sleep も skip)。ペイロード生成、経路シミュレーション、state を触らないダミーループだけを回す。
 
-### ミッションだけ本番
+### 処理タスクの選択
+
+- `--tasks mission,checkin`：処理するタスクをカンマ区切りで選択する (デフォルト: `mission`)。
+- `--execute`：選択したタスクを実 POST/PUT する。`--tasks` で選択していないタスクには適用されない。
 
 ```powershell
-uv run canvasser.py --execute-mission
+uv run canvasser.py run --execute                          # ミッションのみ本番
+uv run canvasser.py run --tasks mission,checkin --execute  # 両方本番
+uv run canvasser.py run --tasks checkin --execute          # チェックインのみ本番
 ```
-
-### チェックインも本番
-
-```powershell
-uv run canvasser.py --checkin --execute-mission --execute-checkin
-```
-
-- `--execute-mission`：ミッション POST/PUT のゲート。
-- `--execute-checkin`：チェックイン POST のゲート。
-- 両ゲートは独立している。片方だけドライラン、片方だけ本番、といった運用も可能。
 
 ### 慎重に少数件から試す
 
 ```powershell
-uv run canvasser.py --account main --checkin --no-mission --execute-checkin --daily-budget 3
+uv run canvasser.py run --account main --tasks checkin --execute --daily-budget 3
 ```
 
 - `--daily-budget N`：1 回の実行あたり N 件の実 POST 試行で終了する (未指定なら無制限)。成功件数ではなく試行回数を数えるので、既達成・範囲外・未観測 ecode も 1 件消費する。
-- `--no-mission`：ミッション回収をスキップし、チェックインだけ実行する。
 - `--consecutive-failure-limit N`：未観測 ecode が連続 N 件で全体を中断する (デフォルト 1 = 1 件目で即停止 / fail closed)。
-- `--max-out-of-range N`：E5005 (範囲外) の累積が N 件で停止する (デフォルト 3)。crypto と座標の実装不一致で 51 件を撃ち切らないための安全弁。
+- `--out-of-range-limit N`：E5005 (範囲外) の累積が N 件で停止する (デフォルト 3)。crypto と座標の実装不一致で 51 件を撃ち切らないための安全弁。
 - `--allow-unignored-profiles-dir`：`--profiles-dir` が `.gitignore` 対象でない場合の警告を無視する (デフォルトは実 POST 拒否、Cookie 誤コミット防止)。
 
 ### 既に消化済みスポットを state に手動登録
@@ -93,7 +87,7 @@ uv run canvasser.py --account main --checkin --no-mission --execute-checkin --da
 state.json の `completed_spots` に外部で成功済みのスポットを追加できる。実 POST 前に既知の消化分を入れておくと、初回起動で未観測 ecode に突入して停止する事故を避けられる。
 
 ```powershell
-uv run canvasser.py --account syota --mark-completed cg_vote2026_17,cg_vote2026_19
+uv run canvasser.py mark-completed --account syota cg_vote2026_17 cg_vote2026_19
 ```
 
 ## Windows タスクスケジューラ登録例
@@ -103,7 +97,7 @@ uv run canvasser.py --account syota --mark-completed cg_vote2026_17,cg_vote2026_
 ```powershell
 $dir = "D:\projects\cgge-canvasser"
 $action  = New-ScheduledTaskAction -Execute "uv" `
-             -Argument "run canvasser.py --checkin --execute-mission --execute-checkin --profiles-dir $dir\profiles" `
+             -Argument "run canvasser.py run --tasks mission,checkin --execute --profiles-dir $dir\profiles" `
              -WorkingDirectory $dir
 $trigger = New-ScheduledTaskTrigger -Daily -At 12:05
 Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trigger `
@@ -135,13 +129,13 @@ Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trig
 | ecode | 挙動 |
 |---|---|
 | `SUCCESS` | 成功、投票券獲得、state 更新 (成功直後と滞在後の 2 回)、滞在時間を消費 |
-| `E5005` (範囲外) | スキップし `out_of_range_count` を +1。`--max-out-of-range` (デフォルト 3) 到達で FailClosedError を送出し全体中断 (crypto や座標の実装不一致検知) |
+| `E5005` (範囲外) | スキップし `out_of_range_count` を +1。`--out-of-range-limit` (デフォルト 3) 到達で FailClosedError を送出し全体中断 (crypto や座標の実装不一致検知) |
 | `ECODES_ALREADY_DONE` (初期値は空 tuple) | 実観測で意味を確定した ecode のみを追加する。追加後は既達成扱いで skip |
 | 未観測 ecode | `consecutive_failures` を加算。`--consecutive-failure-limit` (デフォルト 1) 到達で FailClosedError を送出し全体中断 (fail closed) |
 
 初回実行時は既達成に相当する ecode をまだ観測できていないため、既達成スポットを踏むと未観測 ecode として即停止する。停止時のログで ecode・body・UI 表示を確認し、意味が「サーバ側では成功済み (次回以降は skip してよい)」だと判断できた場合の対応は次のとおり。
 
-1. `--mark-completed cg_vote2026_19` (実 slug 形式) で state に流し込んで再実行する (単発対応)。
+1. `mark-completed --account NAME cg_vote2026_19` (実 slug 形式) で state に流し込んで再実行する (単発対応)。
 2. `ECODES_ALREADY_DONE` にその ecode を追加してコミットする (恒常対応)。
 
 FailClosedError は `process_account` で捕捉され、`exit_code=1` として返る。タスクスケジューラや運用ログ上でも正常終了に見えないよう nonzero で抜ける仕様になっている。
@@ -166,7 +160,7 @@ FailClosedError は `process_account` で捕捉され、`exit_code=1` として�
 
 - `completed_spots` は次回起動時の事前フィルタに使う。既に成功したスポットへは実 POST を送らない。
 - `spot_slug` は正規表現 `^cg_vote2026_[0-9]{1,6}$` にマッチする形式が必須 (schema 検証で strict チェック)。手動編集する場合は `cg_vote2026_19` のような実 slug 形式を守る。
-- state.json の JSON パース失敗や schema 不整合は、`--execute-checkin` 時に fail closed として即停止する。手動で確認・修復してから再実行する。
+- state.json の JSON パース失敗や schema 不整合は、チェックイン実 POST (`--tasks checkin --execute`) 時に fail closed として即停止する。手動で確認・修復してから再実行する。
 - ドライランでは破損した state を空 dict として扱い、そのまま続行する。
 
 ## API 仕様 (参考)
@@ -207,7 +201,7 @@ Next.js チャンク解析で判明した仕様。
 
 - `profiles/{name}/` にはセッション Cookie が保存されるため、Git 管理外に置き、他人へ共有しない。
 - `.env` も Git 管理外に置く (`.gitignore` 設定済み)。
-- 実 POST または `--login` 時に `--profiles-dir` が `.gitignore` 対象になっているかを `git check-ignore` で自動検証する。未 ignore の場合は実行を拒否する (Cookie 誤コミット防止)。回避したい場合は `--allow-unignored-profiles-dir` を明示する。
+- `login` / `run` 実行時に `--profiles-dir` が `.gitignore` 対象になっているかを `git check-ignore` で自動検証する。未 ignore の場合は実行を拒否する (Cookie 誤コミット防止)。回避したい場合は `--allow-unignored-profiles-dir` を明示する。
 - キャンペーン規約に自動化禁止条項がある場合は、自己責任で判断する。
-- Cookie の有効期限が切れた場合は `--login --account NAME` で再ログインする。
+- Cookie の有効期限が切れた場合は `login --account NAME` で再ログインする。
 - 未観測 ecode が 1 件出たら fail closed で即停止する (デフォルト)。BAN シグナル・認証切れ・予期せぬ状態のいずれかとして扱う。
