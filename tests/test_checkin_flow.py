@@ -176,6 +176,45 @@ class TestSpotFromApi:
         with pytest.raises(ValueError, match="正の値でない"):
             canvasser.Spot.from_api(raw)
 
+    def test_radius_ゼロは既定値で丸めず境界拒否する(self) -> None:
+        """`0` は falsy だが「値はあるが不正」なので既定 500m に化けさせない。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_radius"] = 0
+
+        with pytest.raises(ValueError, match="正の値でない"):
+            canvasser.Spot.from_api(raw)
+
+    def test_radius_Falseは既定値で丸めず境界拒否する(self) -> None:
+        """`False` は bool として境界で TypeError にする (既定値に化けさせない)。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_radius"] = False
+
+        with pytest.raises(TypeError, match="数値ではない"):
+            canvasser.Spot.from_api(raw)
+
+    def test_radius_空文字は既定値で丸めず境界拒否する(self) -> None:
+        """`""` は falsy だが数値として通じないので TypeError にする。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_radius"] = ""
+
+        with pytest.raises(TypeError, match="変換できない"):
+            canvasser.Spot.from_api(raw)
+
+    def test_radius_文字列0は非正として拒否する(self) -> None:
+        """`"0"` は float() で 0.0 になり、正の値でないため ValueError にする。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_radius"] = "0"
+
+        with pytest.raises(ValueError, match="正の値でない"):
+            canvasser.Spot.from_api(raw)
+
+    def test_radiusのNoneは既定500mになる(self) -> None:
+        """None は「キー欠落と同等」なので既定 500m を採用する (仕様維持)。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_radius"] = None
+
+        assert canvasser.Spot.from_api(raw).radius == 500.0
+
 
 class TestFetchCheckinSpots:
     """_fetch_checkin_spots の応答ハンドリング。"""
@@ -285,23 +324,32 @@ class TestWithinDeadline:
 
         assert runner._within_deadline(spot) is True
 
-    def test_期限切れはskipして移動起点を進める(self) -> None:
-        """期限超過スポットは skip しつつ prev 座標を現地点へ更新する。"""
+    def test_期限切れskipではoriginを更新しない(self) -> None:
+        """skip 判定は移動 sleep 前に走るので、行っていない spot に origin を進めない。
+
+        origin を skip spot へ進めると次スポットの travel 計算が壊れる
+        (前回到達地点から見た距離ではなく、行っていない spot からの距離になる)。
+        """
         runner = _runner()
+        runner.prev_lat, runner.prev_lng = 34.99, 135.0
+
         spot = _typed(1, 35.0, 135.0, deadline="2026-01-01 00:00:00")
 
         assert runner._within_deadline(spot) is False
-        assert (runner.prev_lat, runner.prev_lng) == (35.0, 135.0)
+        # origin は skip spot に瞬間移動せず、前回到達地点を維持する
+        assert (runner.prev_lat, runner.prev_lng) == (34.99, 135.0)
 
     def test_パース不能はdryrunでskipする(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """dry-run では期限パース失敗を警告付き skip に丸める。"""
+        """dry-run では期限パース失敗を警告付き skip に丸め、origin も維持する。"""
         runner = _runner()
+        runner.prev_lat, runner.prev_lng = 34.99, 135.0
         spot = _typed(1, 35.0, 135.0, deadline="31/07/2026")
 
         assert runner._within_deadline(spot) is False
         assert "パースできません" in capsys.readouterr().err
+        assert (runner.prev_lat, runner.prev_lng) == (34.99, 135.0)
 
     def test_パース不能はexecuteでfail_closed(self) -> None:
         """execute では期限パース失敗を FailClosedError で即停止する。"""
@@ -319,12 +367,14 @@ class TestWithinDeadline:
     ) -> None:
         """virtual_now が期限内でも、planned_arrival が期限超過なら skip する。"""
         runner = _runner()
+        runner.prev_lat, runner.prev_lng = 34.99, 135.0
         # virtual_now=10:00 (fixture)、deadline=10:30、planned_arrival=12:00
         spot = _typed(1, 35.0, 135.0, deadline="2026-07-03 10:30:00")
         planned = datetime(2026, 7, 3, 12, 0, tzinfo=JST)
 
         assert runner._within_deadline(spot, planned) is False
-        assert (runner.prev_lat, runner.prev_lng) == (35.0, 135.0)
+        # 到着予定超過 skip でも origin は更新しない (実際には行っていない)
+        assert (runner.prev_lat, runner.prev_lng) == (34.99, 135.0)
         assert "到着予定" in capsys.readouterr().out
 
     def test_到着予定が期限内なら継続(self) -> None:
@@ -364,6 +414,43 @@ class TestPlanTravelTo:
         assert plan is not None
         assert plan.arrival > before  # 到着時刻は先だが
         assert runner.virtual_now == before  # 実際の時刻は進んでいない
+
+
+class TestSkipDoesNotAdvanceOrigin:
+    """skip 経路で origin が誤って skip spot に瞬間移動する regression 用テスト。"""
+
+    def test_期限切れskip後の次spot移動は前回到達地点から計算する(self) -> None:
+        """遠距離期限切れ spot が中間にあっても、次 spot への travel は前回位置基準。
+
+        order: 1 (成功) → 2 (遠い、期限切れ、skip) → 3 (1 に近い、成功)。
+        origin が skip した 2 に瞬間移動していれば 2→3 は約 555km で
+        flight モード 3 時間超の実待機。修正後は origin を 1 のまま維持し、
+        1→3 は 0.01 度 (約 1.1km) で car/local モード数分の実待機になる。
+        """
+        random.seed(0)
+        sleeps: list[float] = []
+        settings = _settings(execute=True, sleep_fn=sleeps.append)
+        spot1 = _typed(1, 35.00, 135.0)
+        spot2 = _typed(2, 40.00, 135.0, deadline="2026-01-01 00:00:00")
+        spot3 = _typed(3, 35.01, 135.0)
+        runner = canvasser._CheckinRunner(
+            page=_as_page(FakePage([_POST_OK, _POST_OK])),
+            settings=settings,
+            spots=[spot1, spot2, spot3],
+            virtual_now=_FIXED_NOW,
+        )
+
+        gained = runner.run()
+
+        assert gained == 20  # 1 と 3 が成功、2 は skip
+        # sleeps: 1 滞在 + 1→3 移動 の 2 件
+        # (spot1 は first で travel なし、spot2 は skip で travel/滞在なし、
+        #  spot3 は最後で滞在なし)
+        assert len(sleeps) == 2
+        # 1→3 移動 sleep は 1.1km の car/local モードで数分程度
+        # origin バグでは 2→3 が 555km の flight モードで 3 時間超
+        move_between_1_and_3 = sleeps[1]
+        assert move_between_1_and_3 < 3600
 
 
 class TestOutOfRangeHandling:

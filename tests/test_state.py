@@ -84,6 +84,11 @@ class TestLoadAccountState:
             # JSON 標準外の NaN/Infinity は parse_constant 経路で拒否する
             ('{"last_checkin": {"location_latitude": NaN}}', "非有限値"),
             ('{"last_checkin": {"location_longitude": Infinity}}', "非有限値"),
+            # Spot.from_api と同じ緯度経度範囲を state 側にも適用する
+            ('{"last_checkin": {"location_latitude": 91}}', "latitude 期待"),
+            ('{"last_checkin": {"location_latitude": -91}}', "latitude 期待"),
+            ('{"last_checkin": {"location_longitude": 181}}', "longitude 期待"),
+            ('{"last_checkin": {"location_longitude": -181}}', "longitude 期待"),
         ],
     )
     def test_スキーマ違反はstrictで例外(
@@ -252,6 +257,25 @@ class TestResumeContext:
 
         assert lat is None
         assert lng == 135.0
+
+    def test_範囲外座標は非strictでNoneに丸める(self, tmp_path: Path) -> None:
+        """緯度 91 や経度 181 は範囲外で resume 起点として採用しない。"""
+        canvasser.save_account_state(
+            tmp_path,
+            {
+                "last_checkin": {
+                    "schema_version": 2,
+                    "location_latitude": 91.0,
+                    "location_longitude": 181.0,
+                    "virtual_completed_at": "2026-07-03T12:30:00+09:00",
+                }
+            },
+        )
+
+        lat, lng, _resume_at, _completed = canvasser.resume_context(tmp_path)
+
+        assert lat is None
+        assert lng is None
 
     def test_stateが無ければ全て空(self, tmp_path: Path) -> None:
         """初回実行相当では位置・時刻・完了集合すべて空になる。"""
