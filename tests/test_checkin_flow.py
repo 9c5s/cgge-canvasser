@@ -62,6 +62,10 @@ def _listing(spots: list[dict[str, Any]]) -> dict[str, Any]:
     return success_response({"spots": spots})
 
 
+def _no_sleep(_seconds: float) -> None:
+    """実待機を無効化する sleep_fn 代替。"""
+
+
 def _settings(
     *,
     execute: bool = False,
@@ -70,8 +74,9 @@ def _settings(
     out_of_range_limit: int = 3,
     profile_dir: Path | None = None,
     now_fn: Callable[[], datetime] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> CheckinSettings:
-    """固定時刻の dry-run 設定を組み立てる。"""
+    """固定時刻・実待機なしのテスト用設定を組み立てる。"""
     return CheckinSettings(
         execute=execute,
         daily_budget=daily_budget,
@@ -79,6 +84,7 @@ def _settings(
         out_of_range_limit=out_of_range_limit,
         profile_dir=profile_dir,
         now_fn=now_fn or (lambda: _FIXED_NOW),
+        sleep_fn=sleep_fn or _no_sleep,
     )
 
 
@@ -431,29 +437,22 @@ class TestCollectCheckinsDryRun:
 _POST_OK: dict[str, Any] = success_response()
 
 
-def _no_sleep(_seconds: float) -> None:
-    """実待機を無効化する time.sleep 代替。"""
-
-
 class TestCollectCheckinsExecute:
     """collect_checkins の execute (実 POST) 成功経路。
 
-    time.sleep は外部境界 (実時間待機) としてモックし、待機の発生自体は
-    呼び出し記録で検証する。
+    実待機は sleep_fn 注入で無効化し、待機の発生自体は呼び出し記録で検証する。
     """
 
-    def test_成功POSTで票と状態を確定する(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_成功POSTで票と状態を確定する(self, tmp_path: Path) -> None:
         """2 スポット成功で 20 票獲得し completed_spots に両 slug が入る。"""
         random.seed(0)
         sleeps: list[float] = []
-        monkeypatch.setattr(canvasser.time, "sleep", sleeps.append)
         spots = [_spot(1, 35.00, 135.0), _spot(2, 35.01, 135.0)]
         fake = FakePage([_listing(spots), _POST_OK, _POST_OK])
 
         gained = canvasser.collect_checkins(
-            _as_page(fake), _settings(execute=True, profile_dir=tmp_path)
+            _as_page(fake),
+            _settings(execute=True, profile_dir=tmp_path, sleep_fn=sleeps.append),
         )
 
         assert gained == 20
@@ -465,12 +464,9 @@ class TestCollectCheckinsExecute:
         assert len(sleeps) == 2
         assert all(s > 0 for s in sleeps)
 
-    def test_daily_budgetが実POST試行を打ち切る(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_daily_budgetが実POST試行を打ち切る(self, tmp_path: Path) -> None:
         """daily_budget=1 では実 POST を 1 件だけ送って停止する。"""
         random.seed(0)
-        monkeypatch.setattr(canvasser.time, "sleep", _no_sleep)
         spots = [_spot(1, 35.00, 135.0), _spot(2, 35.01, 135.0)]
         fake = FakePage([_listing(spots), _POST_OK])
 
@@ -485,12 +481,9 @@ class TestCollectCheckinsExecute:
         state = canvasser.load_account_state(tmp_path)
         assert len(state["completed_spots"]) == 1
 
-    def test_未知ecodeは1件目で中断し獲得分を保持する(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_未知ecodeは1件目で中断し獲得分を保持する(self, tmp_path: Path) -> None:
         """成功 1 件の後の未知 ecode で partial_gained=10 の fail closed になる。"""
         random.seed(0)
-        monkeypatch.setattr(canvasser.time, "sleep", _no_sleep)
         spots = [_spot(1, 35.00, 135.0), _spot(2, 35.01, 135.0)]
         fake = FakePage([_listing(spots), _POST_OK, error_response("E9999")])
 
