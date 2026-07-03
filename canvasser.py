@@ -737,12 +737,17 @@ class _CheckinRunner:
                     f"残り {remaining}件は次回以降。"
                 )
                 break
-            # 移動 sleep を発生させる前に deadline を確定させる。期限切れや
-            # パース不能スポットへ何時間も実待機してから skip / fail-closed
-            # する事故を防ぐため、travel は「計画」と「消化」に分ける。
+            # 段 1: travel estimation を発生させる前の deadline 判定。
+            # パース不能・現在時点で期限切れの spot は、gmaps API 呼び出しも
+            # 実 sleep も起こさずに skip / fail-closed する。
+            if not self._deadline_ok_before_travel(spot):
+                continue
             plan = self._plan_travel_to(spot)
-            planned_arrival = plan.arrival if plan is not None else self.virtual_now
-            if not self._within_deadline(spot, planned_arrival):
+            # 段 2: 到着予定時刻が期限を超える spot は、travel estimation 済みだが
+            # 実 sleep 前に skip する (sleep も origin 更新も発生させない)。
+            if plan is not None and not self._deadline_ok_after_travel(
+                spot, plan.arrival
+            ):
                 continue
             if plan is not None:
                 self._apply_travel_plan(plan)
@@ -824,23 +829,14 @@ class _CheckinRunner:
             self.settings.sleep_fn(plan.wait_seconds)
         self.virtual_now = plan.arrival
 
-    def _within_deadline(
-        self, spot: Spot, planned_arrival: datetime | None = None
-    ) -> bool:
-        """個別スポット期限内かを判定する純粋関数。副作用を持たない。
+    def _deadline_ok_before_travel(self, spot: Spot) -> bool:
+        """移動計画を組む前の deadline 判定 (パース不能・現在時点期限切れ)。
 
-        planned_arrival が渡されたら「到着予定時刻が期限を超えるか」も見る。
-        これで移動 sleep 前に skip / fail-closed を確定でき、期限切れスポットへ
-        長時間実待機してから skip する事故を避けられる。
+        ここで skip / fail-closed に落とせば、travel estimation (gmaps API
+        呼び出し含む) も実 sleep も避けられる。純粋判定に近い副作用 (print) のみ。
 
-        skip 時に prev_lat/lng は更新しない: この設計では skip 判定は移動 sleep
-        前に走るため、「行っていない spot」へ origin を進めると次スポットの移動
-        計算が壊れる (次スポットへの travel wait を過小評価する)。origin は
-        `_on_success` など「実際に到達したうえで結果として skip」の経路でのみ更新する。
-
-        イベント全体期限とは別で、超過したものだけ skip して後続の有効スポットは
-        処理を続ける。パース不能 (deadline=None) は execute では fail closed に
-        落として、サーバ形式変更を早期検知する (個別 skip では気付きにくい)。
+        パース不能 (deadline=None) は execute では fail closed に落として、
+        サーバ形式変更を早期検知する (個別 skip では気付きにくい)。
         """
         slug = spot.slug
         deadline = spot.deadline
@@ -853,19 +849,31 @@ class _CheckinRunner:
                 raise FailClosedError(msg, partial_gained=self.gained)
             print(f"  {msg} (dry-run: skip)", file=sys.stderr)
             return False
-        check_time = (
-            planned_arrival if planned_arrival is not None else self.virtual_now
-        )
-        if check_time > deadline:
-            if planned_arrival is not None and self.virtual_now <= deadline:
-                print(
-                    f"  [{slug}] 到着予定 {planned_arrival:%m/%d %H:%M}"
-                    f" が期限 ({deadline:%m/%d %H:%M %Z}) 超過、skip。"
-                )
-            else:
-                print(
-                    f"  [{slug}] スポット期限 ({deadline:%m/%d %H:%M %Z}) 経過、skip。"
-                )
+        if self.virtual_now > deadline:
+            print(f"  [{slug}] スポット期限 ({deadline:%m/%d %H:%M %Z}) 経過、skip。")
+            return False
+        return True
+
+    def _deadline_ok_after_travel(self, spot: Spot, planned_arrival: datetime) -> bool:
+        """移動計画を組んだ後の deadline 判定 (到着予定時刻の超過)。
+
+        呼び出し側で `_deadline_ok_before_travel` を通過している前提。deadline は
+        非 None かつ現在時点で期限内であることが保証されているため、ここでは
+        到着予定超過だけ判定する。
+
+        skip 時に prev_lat/lng は更新しない: 実 sleep を走らせていない spot に
+        origin を進めると、次スポットの travel wait を過小評価する。origin は
+        `_on_success` など「実際に到達したうえで結果として skip」の経路でのみ更新する。
+        """
+        slug = spot.slug
+        # 呼び出し側で _deadline_ok_before_travel を通過している契約なので
+        # deadline は None ではない。narrowing は cast で明示する。
+        deadline = cast("datetime", spot.deadline)
+        if planned_arrival > deadline:
+            print(
+                f"  [{slug}] 到着予定 {planned_arrival:%m/%d %H:%M}"
+                f" が期限 ({deadline:%m/%d %H:%M %Z}) 超過、skip。"
+            )
             return False
         return True
 
