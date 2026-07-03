@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import random
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -17,19 +17,17 @@ import pytest
 
 import canvasser
 from canvasser import JST, CheckinSettings, FailClosedError
-from tests._fakes import FakePage
+from tests._fakes import (
+    FakePage,
+    as_page as _as_page,
+    error_response,
+    success_response,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from playwright.sync_api import Page
-
 _FIXED_NOW = datetime(2026, 7, 3, 10, 0, tzinfo=JST)
-
-
-def _as_page(fake: FakePage) -> Page:
-    """FakePage を Page として渡すための cast ヘルパー。"""
-    return cast("Page", fake)
 
 
 def _spot(
@@ -51,10 +49,7 @@ def _spot(
 
 def _listing(spots: list[dict[str, Any]]) -> dict[str, Any]:
     """スポット一覧 GET の成功応答を組み立てる。"""
-    return {
-        "status": 200,
-        "body": {"status": "SUCCESS", "payload": {"spots": spots}},
-    }
+    return success_response({"spots": spots})
 
 
 def _settings(
@@ -385,7 +380,7 @@ class TestCollectCheckinsDryRun:
             )
 
 
-_POST_OK: dict[str, Any] = {"status": 200, "body": {"status": "SUCCESS"}}
+_POST_OK: dict[str, Any] = success_response()
 
 
 def _no_sleep(_seconds: float) -> None:
@@ -449,11 +444,7 @@ class TestCollectCheckinsExecute:
         random.seed(0)
         monkeypatch.setattr(canvasser.time, "sleep", _no_sleep)
         spots = [_spot(1, 35.00, 135.0), _spot(2, 35.01, 135.0)]
-        unknown = {
-            "status": 400,
-            "body": {"status": "ERROR", "payload": {"ecode": "E9999"}},
-        }
-        fake = FakePage([_listing(spots), _POST_OK, unknown])
+        fake = FakePage([_listing(spots), _POST_OK, error_response("E9999")])
 
         with pytest.raises(FailClosedError, match="連続失敗") as ei:
             canvasser.collect_checkins(

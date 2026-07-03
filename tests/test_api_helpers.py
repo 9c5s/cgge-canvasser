@@ -6,20 +6,15 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 import pytest
 
 import canvasser
-from tests._fakes import FakePage
-
-if TYPE_CHECKING:
-    from playwright.sync_api import Page
-
-
-def _as_page(fake: FakePage) -> Page:
-    """FakePage を Page として渡すための cast ヘルパー。"""
-    return cast("Page", fake)
+from tests._fakes import (
+    FakePage,
+    as_page as _as_page,
+)
 
 
 class TestAsStrDict:
@@ -158,5 +153,18 @@ class TestCheckLogin:
     )
     def test_未ログインや異常応答はFalse(self, response: object) -> None:
         """is_login 欠落・False・エラー応答はすべて未ログイン扱い。"""
+        fake = FakePage([response])
+        assert canvasser.check_login(_as_page(fake)) is False
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            None,
+            [1, 2],
+            "text",
+        ],
+    )
+    def test_dict以外の応答もFalseに丸める(self, response: object) -> None:
+        """サーバが配列等の想定外形式を返しても例外にせず未ログイン扱いにする。"""
         fake = FakePage([response])
         assert canvasser.check_login(_as_page(fake)) is False

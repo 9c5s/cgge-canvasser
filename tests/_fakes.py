@@ -11,6 +11,32 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from playwright.sync_api import Page
+
+
+def as_page(fake: FakePage) -> Page:
+    """FakePage を Page として渡すための cast ヘルパー。"""
+    return cast("Page", fake)
+
+
+def success_response(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """HTTP 200 + status=SUCCESS の API 応答を組み立てる。
+
+    payload を省略すると body は status のみになる (POST 成功等の最小応答)。
+    """
+    body: dict[str, Any] = {"status": "SUCCESS"}
+    if payload is not None:
+        body["payload"] = payload
+    return {"status": 200, "body": body}
+
+
+def error_response(ecode: str) -> dict[str, Any]:
+    """HTTP 400 + ecode 付きのエラー応答を組み立てる。"""
+    return {
+        "status": 400,
+        "body": {"status": "ERROR", "payload": {"ecode": ecode}},
+    }
+
 
 class FakePage:
     """`page.evaluate` をキュー応答で置き換えるテストダブル。

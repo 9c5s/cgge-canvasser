@@ -49,15 +49,21 @@ class TestLoadAccountState:
         assert canvasser.load_account_state(tmp_path) == state
 
     def test_壊れたJSONはstrictで例外(self, tmp_path: Path) -> None:
-        """JSON パース不能は strict で StateFileCorruptedError になる。"""
+        """JSON パース不能は strict で対象ファイル名入りの例外になる。"""
         _state_file(tmp_path).write_text("{{{", encoding="utf-8")
 
-        with pytest.raises(StateFileCorruptedError):
+        with pytest.raises(StateFileCorruptedError, match="canvasser_state"):
             canvasser.load_account_state(tmp_path, strict=True)
 
     def test_壊れたJSONは非strictで空dict(self, tmp_path: Path) -> None:
         """dry-run 相当の非 strict では破損を空 dict に丸める。"""
         _state_file(tmp_path).write_text("{{{", encoding="utf-8")
+
+        assert canvasser.load_account_state(tmp_path, strict=False) == {}
+
+    def test_トップレベル非dictは非strictで空dict(self, tmp_path: Path) -> None:
+        """list などのトップレベルも非 strict では空 dict に丸める。"""
+        _state_file(tmp_path).write_text("[]", encoding="utf-8")
 
         assert canvasser.load_account_state(tmp_path, strict=False) == {}
 
@@ -204,6 +210,43 @@ class TestResumeContext:
         assert resume_at is None
         assert completed == set()
 
+    def test_naiveな時刻文字列はJSTとして復元する(self, tmp_path: Path) -> None:
+        """virtual_completed_at に tz が無ければ JST を付与して読み込む。"""
+        canvasser.save_account_state(
+            tmp_path,
+            {
+                "last_checkin": {
+                    "schema_version": 2,
+                    "location_latitude": 35.0,
+                    "location_longitude": 135.0,
+                    "virtual_completed_at": "2026-07-03T12:30:00",
+                }
+            },
+        )
+
+        _lat, _lng, resume_at, _completed = canvasser.resume_context(tmp_path)
+
+        assert resume_at == datetime(2026, 7, 3, 12, 30, tzinfo=JST)
+
+    def test_数値でない座標は非strictでNoneに丸める(self, tmp_path: Path) -> None:
+        """手改変で座標が文字列でも ValueError にせず resume 情報なしに落とす。"""
+        canvasser.save_account_state(
+            tmp_path,
+            {
+                "last_checkin": {
+                    "schema_version": 2,
+                    "location_latitude": "三五度",
+                    "location_longitude": 135.0,
+                    "virtual_completed_at": "2026-07-03T12:30:00+09:00",
+                }
+            },
+        )
+
+        lat, lng, _resume_at, _completed = canvasser.resume_context(tmp_path)
+
+        assert lat is None
+        assert lng == 135.0
+
     def test_stateが無ければ全て空(self, tmp_path: Path) -> None:
         """初回実行相当では位置・時刻・完了集合すべて空になる。"""
         got = canvasser.resume_context(tmp_path)
@@ -213,7 +256,7 @@ class TestResumeContext:
         """execute 経路相当の strict=True では破損を丸めず例外を上げる。"""
         (tmp_path / "canvasser_state.json").write_text("{{{", encoding="utf-8")
 
-        with pytest.raises(StateFileCorruptedError):
+        with pytest.raises(StateFileCorruptedError, match="canvasser_state"):
             canvasser.resume_context(tmp_path, strict=True)
 
 
@@ -248,7 +291,7 @@ class TestMarkSpotsCompleted:
         """既存 state が破損していれば上書きせず例外を伝播する。"""
         _state_file(tmp_path).write_text("{{{", encoding="utf-8")
 
-        with pytest.raises(StateFileCorruptedError):
+        with pytest.raises(StateFileCorruptedError, match="canvasser_state"):
             canvasser.mark_spots_completed(tmp_path, ["cg_vote2026_1"])
 
         assert _state_file(tmp_path).read_text(encoding="utf-8") == "{{{"

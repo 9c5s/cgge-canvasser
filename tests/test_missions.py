@@ -6,20 +6,17 @@ FakePage で API 応答を差し替え、dry-run と execute の分岐・ecode �
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 import pytest
 
 import canvasser
-from tests._fakes import FakePage
-
-if TYPE_CHECKING:
-    from playwright.sync_api import Page
-
-
-def _as_page(fake: FakePage) -> Page:
-    """FakePage を Page として渡すための cast ヘルパー。"""
-    return cast("Page", fake)
+from tests._fakes import (
+    FakePage,
+    as_page as _as_page,
+    error_response as _error_response,
+    success_response,
+)
 
 
 def _mission(
@@ -45,24 +42,10 @@ def _mission(
 
 def _listing(missions: list[dict[str, Any]], point: int = 0) -> dict[str, Any]:
     """ミッション一覧 GET の成功応答を組み立てる。"""
-    return {
-        "status": 200,
-        "body": {
-            "status": "SUCCESS",
-            "payload": {"current_point": point, "missions": missions},
-        },
-    }
+    return success_response({"current_point": point, "missions": missions})
 
 
-_OK = {"status": 200, "body": {"status": "SUCCESS"}}
-
-
-def _error_response(ecode: str) -> dict[str, Any]:
-    """ecode 付きのエラー応答を組み立てる。"""
-    return {
-        "status": 400,
-        "body": {"status": "ERROR", "payload": {"ecode": ecode}},
-    }
+_OK = success_response()
 
 
 class TestCollectMissions:
@@ -79,10 +62,7 @@ class TestCollectMissions:
 
     def test_executeは達成と受取を実行して票数を返す(self) -> None:
         """execute では POST → PUT の順で送信し、成功分の pts を集計する。"""
-        receive_ok = {
-            "status": 200,
-            "body": {"status": "SUCCESS", "payload": {"received_point": 30}},
-        }
+        receive_ok = success_response({"received_point": 30})
         fake = FakePage([_listing([_mission(1, 30)]), _OK, receive_ok])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
@@ -92,10 +72,7 @@ class TestCollectMissions:
 
     def test_達成済み未受取は受取のみ行う(self) -> None:
         """is_mission_completed=True かつ未受取なら受取 PUT だけを送る。"""
-        receive_ok = {
-            "status": 200,
-            "body": {"status": "SUCCESS", "payload": {"received_point": 10}},
-        }
+        receive_ok = success_response({"received_point": 10})
         fake = FakePage([
             _listing([_mission(2, 10, completed=True, received=False)]),
             receive_ok,
@@ -117,10 +94,7 @@ class TestCollectMissions:
 
     def test_達成済みE1906でも受取を試みる(self) -> None:
         """達成 POST が E1906 (既達成) を返しても受取 PUT は送る。"""
-        receive_ok = {
-            "status": 200,
-            "body": {"status": "SUCCESS", "payload": {"received_point": 20}},
-        }
+        receive_ok = success_response({"received_point": 20})
         fake = FakePage([
             _listing([_mission(4, 20)]),
             _error_response("E1906"),
@@ -190,10 +164,7 @@ class TestReceive:
 
     def test_成功時はptsを返す(self) -> None:
         """PUT 成功で受取分の pts を返す。"""
-        response = {
-            "status": 200,
-            "body": {"status": "SUCCESS", "payload": {"received_point": 30}},
-        }
+        response = success_response({"received_point": 30})
         fake = FakePage([response])
 
         assert canvasser._receive(_as_page(fake), 1, "m", 30, execute=True) == 30
