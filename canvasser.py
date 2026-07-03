@@ -160,6 +160,19 @@ def _is_success_response(res: dict[str, Any]) -> bool:
     return res["status"] == 200 and body is not None and body.get("status") == "SUCCESS"
 
 
+def _success_payload_or_raise(res: dict[str, Any], err_prefix: str) -> dict[str, Any]:
+    """成功応答の payload を取り出す。失敗応答なら RuntimeError を送出する。
+
+    一覧取得系 (ミッション・チェックインスポット) の「成功判定 → 失敗なら
+    応答全体入りのメッセージで raise → payload を cast」の定型を束ねる。
+    """
+    if not _is_success_response(res):
+        msg = f"{err_prefix}: {res}"
+        raise RuntimeError(msg)
+    body = cast("dict[str, Any]", res["body"])
+    return cast("dict[str, Any]", body.get("payload") or {})
+
+
 def check_login(page: Page) -> bool:
     """auths/login/check を叩いて認証状態を確認する。
 
@@ -202,12 +215,7 @@ def collect_missions(page: Page, *, execute: bool = False) -> int:
     戻り値は今回獲得した投票券数の合計 (dry-run 時は実行した場合の見込み)。
     """
     listing = call_api(page, "GET", "/missions?mission_type=0&limit=300")
-    body = _as_str_dict(listing.get("body"))
-    if listing["status"] != 200 or body is None or body.get("status") != "SUCCESS":
-        msg = f"ミッション一覧の取得に失敗: {listing}"
-        raise RuntimeError(msg)
-
-    payload = cast("dict[str, Any]", body["payload"])
+    payload = _success_payload_or_raise(listing, "ミッション一覧の取得に失敗")
     print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
     mode_label = "EXECUTE (本番)" if execute else "DRY-RUN (POST/PUT送信なし)"
     print(f"ミッションモード: {mode_label}")
@@ -289,8 +297,8 @@ def _receive(
         print("  -> DRY-RUN (PUT送信なし)")
         return pts
     res = call_api(page, "PUT", f"/mission/{mid}/receive")
-    body = _as_str_dict(res.get("body"))
-    if res["status"] == 200 and body is not None and body.get("status") == "SUCCESS":
+    if _is_success_response(res):
+        body = cast("dict[str, Any]", res["body"])
         payload = cast("dict[str, Any]", body.get("payload") or {})
         received = payload.get("received_point")
         print(f"  -> 成功 (received_point={received})")
@@ -525,11 +533,7 @@ class CheckinSettings:
 def _fetch_checkin_spots(page: Page) -> list[dict[str, Any]]:
     """チェックインイベントの spot 一覧を取得する。応答が不正なら RuntimeError。"""
     listing = call_checkin_api(page, "GET", f"/event/{CHECKIN_EVENT_SLUG}")
-    body = _as_str_dict(listing.get("body"))
-    if listing["status"] != 200 or body is None or body.get("status") != "SUCCESS":
-        msg = f"チェックインイベント取得に失敗: {listing}"
-        raise RuntimeError(msg)
-    payload = cast("dict[str, Any]", body.get("payload", {}))
+    payload = _success_payload_or_raise(listing, "チェックインイベント取得に失敗")
     return cast("list[dict[str, Any]]", payload.get("spots", []))
 
 
