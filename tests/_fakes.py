@@ -4,8 +4,6 @@
 差し替える。それ以外の内部実装はモックせず、実物のロジックを通す方針である。
 """
 
-from __future__ import annotations
-
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
