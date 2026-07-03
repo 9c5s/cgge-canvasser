@@ -464,13 +464,14 @@ class TestSkipDoesNotAdvanceOrigin:
         # spot1 は first で estimate 不要、spot2 は段 1 で skip されるので不要。
         assert calls == []
 
-    def test_期限切れskip後の次spot移動は前回到達地点から計算する(self) -> None:
-        """遠距離期限切れ spot が中間にあっても、次 spot への travel は前回位置基準。
+    def test_遠距離期限切れspotは動的最近傍で後回しにされる(self) -> None:
+        """遠距離期限切れ spot は動的最近傍で後回しにされ、近い spot が先に処理される。
 
-        order: 1 (成功) → 2 (遠い、期限切れ、skip) → 3 (1 に近い、成功)。
-        origin が skip した 2 に瞬間移動していれば 2→3 は約 555km で
-        flight モード 3 時間超の実待機。修正後は origin を 1 のまま維持し、
-        1→3 は 0.01 度 (約 1.1km) で car/local モード数分の実待機になる。
+        `spots=[1, 2遠期限切れ, 3近]` を渡しても、走行時に prev から動的に最近傍を
+        pick するので順序は 1 (first) → 3 (spot1 に近い、成功) → 2 (最後で段 1 skip)
+        になる。origin 未更新に加えて動的最近傍で、静的順序が持つ「行かなかった
+        遠方 spot の隣を無駄に訪れる」問題を回避できる。1→3 の移動 sleep が
+        近距離モード (< 1 時間) に収まることで regression を検出する。
         """
         random.seed(0)
         sleeps: list[float] = []
@@ -487,15 +488,16 @@ class TestSkipDoesNotAdvanceOrigin:
 
         gained = runner.run()
 
-        assert gained == 20  # 1 と 3 が成功、2 は skip
-        # sleeps: 1 滞在 + 1→3 移動 の 2 件
-        # (spot1 は first で travel なし、spot2 は skip で travel/滞在なし、
-        #  spot3 は最後で滞在なし)
-        assert len(sleeps) == 2
-        # 1→3 移動 sleep は 1.1km の car/local モードで数分程度
-        # origin バグでは 2→3 が 555km の flight モードで 3 時間超
-        move_between_1_and_3 = sleeps[1]
-        assert move_between_1_and_3 < 3600
+        # 動的最近傍で 1 → 3 → 2 の順に処理され、1 と 3 の 2 件成功で 20 票、
+        # 2 は最後で段 1 skip される。sleeps は [1滞在, 1→3移動, 3滞在] の 3 件
+        # (2 は段 1 skip で estimation も sleep も発生しない)。
+        assert gained == 20
+        assert len(sleeps) == 3
+        # 1→3 移動 sleep は Haversine 1.1km の car/local モードで数分。
+        # 動的最近傍が壊れて 2 (40.00, 555km) を先に pick すれば flight モードで
+        # 3 時間超 (~10800 秒) になる。< 3600 で分岐を検出する。
+        move_after_first_stay = sleeps[1]
+        assert move_after_first_stay < 3600
 
 
 class TestOutOfRangeHandling:

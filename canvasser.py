@@ -44,7 +44,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
@@ -726,17 +726,34 @@ class _CheckinRunner:
     attempted: int = 0
     consecutive_failures: int = 0
     out_of_range_count: int = 0
+    # 走行中の未処理スポット。skip 後は origin から動的に最近傍を選び直すため
+    # `self.spots` (初期の静的順序、表示上の total) とは別で保持する。
+    _remaining: list[Spot] = field(init=False, default_factory=list[Spot])
 
     def run(self) -> int:
-        """全スポットを順に処理し、獲得票数 (dry-run は見込み) を返す。"""
-        for index, spot in enumerate(self.spots, 1):
+        """全スポットを順に処理し、獲得票数 (dry-run は見込み) を返す。
+
+        各 iteration で残り spot から `prev` に最も近いものを動的に pick する。
+        deadline や到着不能で skip した spot は origin を進めないため、次スポットは
+        「実際に行った場所」からの最近傍で再選択される。静的順序が持ってしまう
+        「行かなかった遠方 spot の隣を無駄に訪れる」問題を回避する目的。
+        """
+        self._remaining = list(self.spots)
+        index = 0
+        while self._remaining:
+            index += 1
             if self._budget_reached():
-                remaining = len(self.spots) - index + 1
                 print(
                     f"  日次上限 {self.settings.daily_budget}件に到達。"
-                    f"残り {remaining}件は次回以降。"
+                    f"残り {len(self._remaining)}件は次回以降。"
                 )
                 break
+            # first spot (prev 未確定) は事前計算の順序 (`order_spots_by_proximity`
+            # で開始位置に近い順) の先頭を採用。以降は現在地点からの最近傍を選ぶ。
+            if self.prev_lat is None or self.prev_lng is None:
+                spot = self._remaining.pop(0)
+            else:
+                spot = _pop_nearest(self._remaining, self.prev_lat, self.prev_lng)
             # 段 1: travel estimation を発生させる前の deadline 判定。
             # パース不能・現在時点で期限切れの spot は、gmaps API 呼び出しも
             # 実 sleep も起こさずに skip / fail-closed する。
@@ -877,13 +894,14 @@ class _CheckinRunner:
             return False
         return True
 
-    def _will_continue_after(self, index: int) -> bool:
+    def _will_continue_after(self) -> bool:
         """このスポットの後にループを継続するかを判定する。
 
-        呼び出し時点で attempted・successful は加算済みで、execute の True と
-        False で参照するカウンタが違う点だけ注意する。
+        呼び出し時点で attempted・successful は加算済み、`_remaining` からは
+        当該 spot が pop 済みという前提。execute の True と False で参照する
+        カウンタが違う点だけ注意する。
         """
-        if index >= len(self.spots):
+        if not self._remaining:
             return False
         if self.settings.daily_budget <= 0:
             return True
@@ -907,7 +925,7 @@ class _CheckinRunner:
 
         stay_secs = natural_stay_seconds()
         if not self.settings.execute:
-            self._simulate(spot, body, stay_secs, index)
+            self._simulate(spot, body, stay_secs)
             return
 
         # POST 直前に attempted を加算する。これで既達成・範囲外・失敗のいずれも
@@ -921,7 +939,7 @@ class _CheckinRunner:
         )
         ecode = _extract_ecode(res.get("body"))
         if _is_success_response(res):
-            self._on_success(spot, stay_secs, index)
+            self._on_success(spot, stay_secs)
         elif ecode == ECODE_OUT_OF_RANGE:
             self._on_out_of_range(spot, ecode)
         elif ecode in ECODES_ALREADY_DONE:
@@ -929,7 +947,7 @@ class _CheckinRunner:
         else:
             self._on_unknown_ecode(spot, res)
 
-    def _simulate(self, spot: Spot, body: str, stay_secs: float, index: int) -> None:
+    def _simulate(self, spot: Spot, body: str, stay_secs: float) -> None:
         """dry-run の 1 スポット分。state.json は書かない。
 
         実 POST 実行時の resume 起点をドライラン由来の値で汚染しないため。
@@ -938,14 +956,14 @@ class _CheckinRunner:
         self.gained += 10
         self.successful += 1
         self._move_origin_to(spot)
-        if self._will_continue_after(index):
+        if self._will_continue_after():
             self.virtual_now = self.virtual_now + timedelta(seconds=stay_secs)
             print(
                 f"       滞在 {humanize_duration(stay_secs)}"
                 f" -> 出発 {self.virtual_now:%m/%d %H:%M}"
             )
 
-    def _on_success(self, spot: Spot, stay_secs: float, index: int) -> None:
+    def _on_success(self, spot: Spot, stay_secs: float) -> None:
         """実 POST 成功の後処理。state 保存と滞在 sleep を行う。"""
         print("       -> 成功")
         self.gained += 10
@@ -957,7 +975,7 @@ class _CheckinRunner:
         # 一次 state を保存する。
         if self.settings.profile_dir is not None:
             update_checkin_state(self.settings.profile_dir, spot, self.virtual_now)
-        if self._will_continue_after(index):
+        if self._will_continue_after():
             self.settings.sleep_fn(stay_secs)
             self.virtual_now = self.virtual_now + timedelta(seconds=stay_secs)
             print(
