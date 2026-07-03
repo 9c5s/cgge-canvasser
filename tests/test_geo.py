@@ -91,7 +91,13 @@ class TestNaturalAccuracy:
     """_natural_accuracy の分布範囲。"""
 
     def test_値域は5から80mに収まる(self) -> None:
-        """クランプ下限 5m と外れ値上限 80m の範囲を出ない。"""
+        """クランプ下限 5m と外れ値経路の上限 80m の範囲を出ない。
+
+        下限 5m は実装の max() クランプが保証する。上限 80m は外れ値経路
+        (uniform) にのみ実装保証があり、gauss(18, 6) 経路は理論上の上限を
+        持たない。ただし 80m 超は 10 シグマ超の事象であり、seed 固定の本テストは
+        決定的に緑になる。分布パラメータを変える際はこの境界も見直すこと。
+        """
         random.seed(0)
         values = [canvasser._natural_accuracy() for _ in range(300)]
         assert min(values) >= 5.0
@@ -108,7 +114,11 @@ class TestNaturalAltitude:
     """_natural_altitude の分布と None の組み合わせ。"""
 
     def test_Noneか値域内ペアのどちらかを返す(self) -> None:
-        """(None, None) または (5-80m, 20-50m) のペアのみ返る。"""
+        """(None, None) または (5-80m, 20-50m) のペアのみ返る。
+
+        両パターンの出現数チェックは seed 固定で決定的。分布確率 (None 80%)
+        を大きく変えた場合は seed とサンプル数を見直すこと。
+        """
         random.seed(3)
         none_count = 0
         value_count = 0
