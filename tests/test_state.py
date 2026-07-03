@@ -79,6 +79,11 @@ class TestLoadAccountState:
                 '{"last_checkin": {"virtual_completed_at": "not-a-date"}}',
                 "ISO8601 として不正",
             ),
+            # bool は int の subclass なので、素の isinstance では通ってしまう
+            ('{"last_checkin": {"schema_version": true}}', "型が不正"),
+            # JSON 標準外の NaN/Infinity は parse_constant 経路で拒否する
+            ('{"last_checkin": {"location_latitude": NaN}}', "非有限値"),
+            ('{"last_checkin": {"location_longitude": Infinity}}', "非有限値"),
         ],
     )
     def test_スキーマ違反はstrictで例外(
@@ -89,6 +94,14 @@ class TestLoadAccountState:
 
         with pytest.raises(StateFileCorruptedError, match=message):
             canvasser.load_account_state(tmp_path, strict=True)
+
+    def test_NaNリテラルは非strictでも空dictに丸める(self, tmp_path: Path) -> None:
+        """parse_constant による NaN 拒否は非 strict でも作用し空 dict になる。"""
+        _state_file(tmp_path).write_text(
+            '{"last_checkin": {"location_latitude": NaN}}', encoding="utf-8"
+        )
+
+        assert canvasser.load_account_state(tmp_path, strict=False) == {}
 
 
 class TestSaveAccountState:
