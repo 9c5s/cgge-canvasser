@@ -243,12 +243,21 @@ def collect_missions(page: Page, *, execute: bool = False) -> int:
     戻り値は今回獲得した投票券数の合計 (dry-run 時は実行した場合の見込み)。
     """
     mode_label = "EXECUTE (本番)" if execute else "DRY-RUN (POST/PUT送信なし)"
-    gained = 0
+
+    # 両 listing を先に fetch してから POST/PUT を送る。前段で PUT (受取) を送った
+    # 後に後段 fetch が失敗すると、run summary で「そのアカウント 0 gained」と誤記録
+    # になり、サーバ側に反映済みの投票券が集計から欠落する。fetch 失敗はここで
+    # まとめて fail-closed する。
+    listings: list[tuple[int, str, dict[str, Any]]] = []
     for mt, label in _MISSION_TYPES:
         listing = call_api(page, "GET", f"/missions?mission_type={mt}&limit=300")
         payload = _success_payload_or_raise(
             listing, f"ミッション一覧 ({label}) の取得に失敗"
         )
+        listings.append((mt, label, payload))
+
+    gained = 0
+    for mt, label, payload in listings:
         if mt == 0:
             print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
         print(f"ミッションモード ({label}): {mode_label}")

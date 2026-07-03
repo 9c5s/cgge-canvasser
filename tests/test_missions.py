@@ -64,13 +64,13 @@ class TestCollectMissions:
         assert len(fake.calls) == 2
 
     def test_executeは達成と受取を実行して票数を返す(self) -> None:
-        """execute では通常 GET → POST → PUT → ASOBI STORE GET の順で送信する。"""
+        """execute では両一覧 GET を先に済ませてから POST → PUT を送る。"""
         receive_ok = success_response({"received_point": 30})
         fake = FakePage([
             _listing([_mission(1, 30)]),
+            _empty_listing(),
             _OK,
             receive_ok,
-            _empty_listing(),
         ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
@@ -83,8 +83,8 @@ class TestCollectMissions:
         receive_ok = success_response({"received_point": 10})
         fake = FakePage([
             _listing([_mission(2, 10, completed=True, received=False)]),
-            receive_ok,
             _empty_listing(),
+            receive_ok,
         ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
@@ -113,8 +113,8 @@ class TestCollectMissions:
         receive_ok = success_response({"received_point": 15})
         fake = FakePage([
             _listing([_mission(6, 15, flag=False, completed=True, received=False)]),
-            receive_ok,
             _empty_listing(),
+            receive_ok,
         ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
@@ -139,9 +139,9 @@ class TestCollectMissions:
         receive_ok = success_response({"received_point": 20})
         fake = FakePage([
             _listing([_mission(4, 20)]),
+            _empty_listing(),
             _error_response("E1906"),
             receive_ok,
-            _empty_listing(),
         ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
@@ -153,8 +153,8 @@ class TestCollectMissions:
         """達成 POST が E1924 (条件未達) なら受取 PUT を送らずスキップする。"""
         fake = FakePage([
             _listing([_mission(5, 20)]),
-            _error_response("E1924"),
             _empty_listing(),
+            _error_response("E1924"),
         ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
@@ -189,8 +189,8 @@ class TestCollectMissions:
         receive_asobi = success_response({"received_point": 2})
         fake = FakePage([
             _listing([_mission(96, 5, completed=True, received=False)]),
-            receive_normal,
             _listing([_mission(21, 2, completed=True, received=False)]),
+            receive_normal,
             receive_asobi,
         ])
 
@@ -198,6 +198,24 @@ class TestCollectMissions:
 
         assert gained == 5 + 2
         assert len(fake.calls) == 4
+
+    def test_ASOBI_STORE_fetch失敗時は通常mission_typeのPUTも送らない(self) -> None:
+        """後段 fetch エラーで前段 PUT が消えて 0 gained と誤記録される事故を防ぐ。
+
+        両 listing の取得を先に済ませてから POST/PUT を送る設計により、後段
+        fetch 失敗時は 1 件も送っていない状態で RuntimeError を上げる。既に成功
+        した PUT が run summary から消える (集計 0 gained) 事故を回避する。
+        """
+        fake = FakePage([
+            _listing([_mission(96, 5, completed=True, received=False)]),
+            {"status": 500, "body": None, "error": "boom"},
+        ])
+
+        with pytest.raises(RuntimeError, match="ASOBI STORE"):
+            canvasser.collect_missions(_as_page(fake), execute=True)
+
+        # 2 GET のみで、通常一覧の PUT は 1 件も送られていない
+        assert len(fake.calls) == 2
 
 
 class TestComplete:
