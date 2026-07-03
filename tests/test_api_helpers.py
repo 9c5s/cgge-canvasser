@@ -99,7 +99,7 @@ class TestCallApi:
 
         expected_url = f"{canvasser.API_HOST}{canvasser.API_BASE}/missions"
         assert len(fake.calls) == 1
-        assert fake.calls[0][1] == [expected_url, "GET", canvasser.API_KEY]
+        assert fake.calls[0][1] == [expected_url, "GET", canvasser.API_KEY, None]
 
     def test_応答をそのまま返す(self) -> None:
         """evaluate の戻り値を加工せず返す。"""
