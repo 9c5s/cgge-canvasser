@@ -43,6 +43,11 @@ def _listing(missions: list[dict[str, Any]], point: int = 0) -> dict[str, Any]:
     return success_response({"current_point": point, "missions": missions})
 
 
+def _empty_listing() -> dict[str, Any]:
+    """空の ASOBI STORE 一覧など、対象なし応答を組み立てる。"""
+    return _listing([])
+
+
 _OK = success_response()
 
 
@@ -50,23 +55,28 @@ class TestCollectMissions:
     """collect_missions の全体フロー。"""
 
     def test_dryrunは達成可能ミッションの見込み票数を返す(self) -> None:
-        """dry-run では GET 1 回のみで、POST/PUT を送らず見込みを集計する。"""
-        fake = FakePage([_listing([_mission(1, 30)])])
+        """dry-run では GET 2 回 (通常 + ASOBI STORE) のみで、POST/PUT を送らない。"""
+        fake = FakePage([_listing([_mission(1, 30)]), _empty_listing()])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=False)
 
         assert gained == 30
-        assert len(fake.calls) == 1
+        assert len(fake.calls) == 2
 
     def test_executeは達成と受取を実行して票数を返す(self) -> None:
-        """execute では POST → PUT の順で送信し、成功分の pts を集計する。"""
+        """execute では通常 GET → POST → PUT → ASOBI STORE GET の順で送信する。"""
         receive_ok = success_response({"received_point": 30})
-        fake = FakePage([_listing([_mission(1, 30)]), _OK, receive_ok])
+        fake = FakePage([
+            _listing([_mission(1, 30)]),
+            _OK,
+            receive_ok,
+            _empty_listing(),
+        ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
 
         assert gained == 30
-        assert len(fake.calls) == 3
+        assert len(fake.calls) == 4
 
     def test_達成済み未受取は受取のみ行う(self) -> None:
         """is_mission_completed=True かつ未受取なら受取 PUT だけを送る。"""
@@ -74,49 +84,55 @@ class TestCollectMissions:
         fake = FakePage([
             _listing([_mission(2, 10, completed=True, received=False)]),
             receive_ok,
+            _empty_listing(),
         ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
 
         assert gained == 10
-        assert len(fake.calls) == 2
+        assert len(fake.calls) == 3
 
     def test_APIフラグなしミッションは対象外(self) -> None:
         """flag=False かつ未達成なら達成も受取も送らない。"""
-        fake = FakePage([_listing([_mission(3, 50, flag=False)])])
+        fake = FakePage([
+            _listing([_mission(3, 50, flag=False)]),
+            _empty_listing(),
+        ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
 
         assert gained == 0
-        assert len(fake.calls) == 1
+        assert len(fake.calls) == 2
 
     def test_APIフラグなしでも達成済み未受取は受取のみ行う(self) -> None:
         """flag=False でも completed かつ未受取なら受取 PUT だけを送る。
 
-        ASOBI STORE プレミアム会員のログインボーナスやチェックインボーナスなど、
-        外部トリガーで達成扱いになる分の取りこぼしを防ぐ。
+        チェックインボーナス (`#99`) のように外部トリガーで達成扱いになる分の
+        取りこぼしを防ぐ。
         """
         receive_ok = success_response({"received_point": 15})
         fake = FakePage([
             _listing([_mission(6, 15, flag=False, completed=True, received=False)]),
             receive_ok,
+            _empty_listing(),
         ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
 
         assert gained == 15
-        assert len(fake.calls) == 2
+        assert len(fake.calls) == 3
 
     def test_APIフラグなしで達成済み受取済みは何もしない(self) -> None:
         """flag=False かつ既に受取済みなら PUT も送らない (重複受取回避)。"""
         fake = FakePage([
             _listing([_mission(7, 15, flag=False, completed=True, received=True)]),
+            _empty_listing(),
         ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
 
         assert gained == 0
-        assert len(fake.calls) == 1
+        assert len(fake.calls) == 2
 
     def test_達成済みE1906でも受取を試みる(self) -> None:
         """達成 POST が E1906 (既達成) を返しても受取 PUT は送る。"""
@@ -125,28 +141,63 @@ class TestCollectMissions:
             _listing([_mission(4, 20)]),
             _error_response("E1906"),
             receive_ok,
+            _empty_listing(),
         ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
 
         assert gained == 20
-        assert len(fake.calls) == 3
+        assert len(fake.calls) == 4
 
     def test_条件未達E1924は受取を送らない(self) -> None:
         """達成 POST が E1924 (条件未達) なら受取 PUT を送らずスキップする。"""
-        fake = FakePage([_listing([_mission(5, 20)]), _error_response("E1924")])
+        fake = FakePage([
+            _listing([_mission(5, 20)]),
+            _error_response("E1924"),
+            _empty_listing(),
+        ])
 
         gained = canvasser.collect_missions(_as_page(fake), execute=True)
 
         assert gained == 0
-        assert len(fake.calls) == 2
+        assert len(fake.calls) == 3
 
     def test_一覧取得失敗はRuntimeError(self) -> None:
-        """一覧 GET が失敗したら RuntimeError で全体を止める。"""
+        """通常一覧 GET が失敗すれば ASOBI STORE 到達前に RuntimeError で止める。"""
         fake = FakePage([{"status": 500, "body": None, "error": "boom"}])
 
-        with pytest.raises(RuntimeError, match="ミッション一覧の取得に失敗"):
+        with pytest.raises(RuntimeError, match="通常"):
             canvasser.collect_missions(_as_page(fake), execute=False)
+
+    def test_ASOBI_STORE一覧の取得失敗もRuntimeError(self) -> None:
+        """通常一覧が取れても ASOBI STORE 一覧が失敗すれば RuntimeError で止める。"""
+        fake = FakePage([
+            _listing([]),
+            {"status": 500, "body": None, "error": "boom"},
+        ])
+
+        with pytest.raises(RuntimeError, match="ASOBI STORE"):
+            canvasser.collect_missions(_as_page(fake), execute=False)
+
+    def test_通常とASOBI_STOREの両方から受取を集計する(self) -> None:
+        """mission_type=0 と mission_type=1 の両方で受取を実行し合算する。
+
+        ASOBI STORE 系のプレミアム会員ログインボーナス (flag=True で達成済み) を
+        単発 fetch では取りこぼす件の回帰テスト。
+        """
+        receive_normal = success_response({"received_point": 5})
+        receive_asobi = success_response({"received_point": 2})
+        fake = FakePage([
+            _listing([_mission(96, 5, completed=True, received=False)]),
+            receive_normal,
+            _listing([_mission(21, 2, completed=True, received=False)]),
+            receive_asobi,
+        ])
+
+        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+
+        assert gained == 5 + 2
+        assert len(fake.calls) == 4
 
 
 class TestComplete:
