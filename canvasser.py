@@ -218,14 +218,23 @@ def check_login(page: Page) -> bool:
     return bool(payload.get("is_login", False))
 
 
+# サーバが受け付ける `mission_type` の全集合。0=通常ミッション、1=ASOBI STORE 系。
+# 2 以上は現状 E4200 (mission_type は 0 または 1) で拒否される。
+_MISSION_TYPES: tuple[tuple[int, str], ...] = ((0, "通常"), (1, "ASOBI STORE"))
+
+
 def collect_missions(page: Page, *, execute: bool = False) -> int:
     """API 経由で完了可能なミッションと、外部トリガー達成分の受取をまとめて消化する。
+
+    通常 (`mission_type=0`) と ASOBI STORE 系 (`mission_type=1`) の両方を fetch する。
+    ASOBI STORE 系にはプレミアム会員のログインボーナス (`#21`) など日次で回収したい
+    ミッションが含まれるため、片方だけ fetch すると取りこぼす。
 
     - `mission_complete_api_call_flag=True` は達成 POST と受取 PUT の両方を送る対象。
       #100-104 のような累計達成数系や、動画視聴などフロントが達成 POST を出すもの。
     - `mission_complete_api_call_flag=False` でも「達成済みかつ未受取」なら受取 PUT
-      だけは送る。ASOBI STORE プレミアム会員のログインボーナスやチェックインボーナス
-      など、外部トリガーで達成扱いになる分の投票券が受け取り漏れになるのを防ぐため。
+      だけは送る。チェックインボーナス (`#99`) などの外部トリガー達成分の取りこぼし
+      を防ぐため。
     - あいことばなど、達成条件が UI 経由のみのミッションは flag=False かつ未達成の
       ままなので、達成 POST も受取 PUT も送らない。
     - `execute=False` (デフォルト) は完全ドライラン。GET のみ実行し、POST/PUT は
@@ -233,46 +242,59 @@ def collect_missions(page: Page, *, execute: bool = False) -> int:
 
     戻り値は今回獲得した投票券数の合計 (dry-run 時は実行した場合の見込み)。
     """
-    listing = call_api(page, "GET", "/missions?mission_type=0&limit=300")
-    payload = _success_payload_or_raise(listing, "ミッション一覧の取得に失敗")
-    print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
     mode_label = "EXECUTE (本番)" if execute else "DRY-RUN (POST/PUT送信なし)"
-    print(f"ミッションモード: {mode_label}")
-
     gained = 0
-    for m in cast("list[dict[str, Any]]", payload["missions"]):
-        mid: int = m["mission_id"]
-        name: str = m["mission_name"]
-        pts: int = m["mission_point"]
+    for mt, label in _MISSION_TYPES:
+        listing = call_api(page, "GET", f"/missions?mission_type={mt}&limit=300")
+        payload = _success_payload_or_raise(
+            listing, f"ミッション一覧 ({label}) の取得に失敗"
+        )
+        if mt == 0:
+            print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
+        print(f"ミッションモード ({label}): {mode_label}")
+        for m in cast("list[dict[str, Any]]", payload["missions"]):
+            gained += _process_one_mission(page, m, execute=execute)
 
-        action = cast("dict[str, Any]", m.get("action") or {})
-        api_completable = bool(action.get("mission_complete_api_call_flag"))
-        completed = bool(m.get("is_mission_completed"))
-        received = bool(m.get("is_mission_received"))
-        remaining = m.get("remaining_completable_count") or 0
-
-        # 達成済みかつ未受取なら、flag に関係なく受取 PUT を送る。
-        # 外部トリガー達成 (ログイン系・チェックイン系など) の取りこぼしを防ぐ。
-        if completed and not received:
-            gained += _receive(page, mid, name, pts, execute=execute)
-            continue
-
-        # 達成 POST は API 完了可能ミッションだけに送る。
-        # あいことば等 UI 経由のミッションを誤って POST しないため。
-        if not api_completable:
-            continue
-
-        if not completed and remaining > 0:
-            outcome = _complete(page, mid, name, execute=execute)
-            # 累計達成数系ミッション (#100-104) はサーバ側で自動達成されるが、
-            # 一覧の completed フラグ更新が遅延する。達成 POST が「既に達成済み」を
-            # 返した場合も受取 PUT は通る。
-            if outcome in ("ok", "already_done"):
-                gained += _receive(page, mid, name, pts, execute=execute)
-
-    label = "獲得見込み" if not execute else "獲得"
-    print(f"ミッション {label}: {gained}枚")
+    result_label = "獲得見込み" if not execute else "獲得"
+    print(f"ミッション {result_label}: {gained}枚")
     return gained
+
+
+def _process_one_mission(
+    page: Page, m: dict[str, Any], *, execute: bool = False
+) -> int:
+    """1 ミッションの達成 / 受取を行い、獲得票数を返す。
+
+    分岐:
+      - `completed and not received` → 受取 PUT を送る (flag に関わらず)
+      - `flag=True and not completed and remaining>0` → 達成 POST → 受取 PUT
+      - `flag=False and not completed` → 何もしない (UI 経由のあいことば等)
+    """
+    mid: int = m["mission_id"]
+    name: str = m["mission_name"]
+    pts: int = m["mission_point"]
+
+    action = cast("dict[str, Any]", m.get("action") or {})
+    api_completable = bool(action.get("mission_complete_api_call_flag"))
+    completed = bool(m.get("is_mission_completed"))
+    received = bool(m.get("is_mission_received"))
+    remaining = m.get("remaining_completable_count") or 0
+
+    if completed and not received:
+        return _receive(page, mid, name, pts, execute=execute)
+
+    if not api_completable:
+        return 0
+
+    if not completed and remaining > 0:
+        outcome = _complete(page, mid, name, execute=execute)
+        # 累計達成数系ミッション (#100-104) はサーバ側で自動達成されるが、
+        # 一覧の completed フラグ更新が遅延する。達成 POST が「既に達成済み」を
+        # 返した場合も受取 PUT は通る。
+        if outcome in ("ok", "already_done"):
+            return _receive(page, mid, name, pts, execute=execute)
+
+    return 0
 
 
 def _complete(page: Page, mid: int, name: str, *, execute: bool = False) -> str:
