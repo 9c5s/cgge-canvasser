@@ -137,15 +137,21 @@ class TestNaturalAltitude:
 
 
 class TestMakeCheckinCoords:
-    """make_checkin_coords の座標生成。"""
+    """make_checkin_coords の座標生成。
 
-    def _spot(self, radius: object = 500) -> dict[str, Any]:
-        """テスト用スポット dict を組み立てる。"""
-        return {
-            "location_latitude": 35.0,
-            "location_longitude": 135.0,
-            "checkin_radius": radius,
-        }
+    radius の数値変換や既定値の正規化は Spot.from_api 側 (test_checkin_flow)
+    で検証するため、ここでは正規化済み Spot を直接組み立てる。
+    """
+
+    def _spot(self, radius: float = 500.0) -> canvasser.Spot:
+        """テスト用スポットを組み立てる。"""
+        return canvasser.Spot(
+            slug="cg_vote2026_1",
+            name="テスト",
+            lat=35.0,
+            lng=135.0,
+            radius=radius,
+        )
 
     def test_geolocation互換のキーを持つ(self) -> None:
         """Geolocation API 互換の 7 キーで構成される。"""
@@ -172,29 +178,11 @@ class TestMakeCheckinCoords:
         """radius * 0.85 (CHECKIN_RADIUS_MARGIN) の内側に生成される。"""
         random.seed(0)
         for _ in range(50):
-            coords = canvasser.make_checkin_coords(self._spot(500))
+            coords = canvasser.make_checkin_coords(self._spot(500.0))
             d = canvasser._distance_m(
                 35.0, 135.0, coords["latitude"], coords["longitude"]
             )
             assert d <= 500 * canvasser.CHECKIN_RADIUS_MARGIN * 1.01
-
-    def test_radius欠落時は500mを既定にする(self) -> None:
-        """checkin_radius が無いスポットでは 500m * 0.85 に収まる。"""
-        random.seed(0)
-        spot = self._spot(None)
-        for _ in range(50):
-            coords = canvasser.make_checkin_coords(spot)
-            d = canvasser._distance_m(
-                35.0, 135.0, coords["latitude"], coords["longitude"]
-            )
-            assert d <= 500 * canvasser.CHECKIN_RADIUS_MARGIN * 1.01
-
-    def test_文字列radiusも数値として扱う(self) -> None:
-        """API が radius を文字列で返しても float に変換して使う。"""
-        random.seed(0)
-        coords = canvasser.make_checkin_coords(self._spot("100"))
-        d = canvasser._distance_m(35.0, 135.0, coords["latitude"], coords["longitude"])
-        assert d <= 100 * canvasser.CHECKIN_RADIUS_MARGIN * 1.01
 
 
 class TestEncryptCoords:
@@ -261,9 +249,9 @@ class TestEncryptCoords:
         assert payload == f"{fixed_hex},{fixed_hex},{expected_ct}"
 
 
-def _spot_at(slug: str, lat: float, lng: float) -> dict[str, Any]:
-    """順序決定テスト用の最小スポット dict を組み立てる。"""
-    return {"slug": slug, "location_latitude": lat, "location_longitude": lng}
+def _spot_at(slug: str, lat: float, lng: float) -> canvasser.Spot:
+    """順序決定テスト用の最小 Spot を組み立てる。"""
+    return canvasser.Spot(slug=slug, name=slug, lat=lat, lng=lng)
 
 
 class TestOrderSpotsByProximity:
@@ -285,7 +273,7 @@ class TestOrderSpotsByProximity:
             spots, start_location=(35.09, 135.0)
         )
 
-        assert [s["slug"] for s in ordered] == ["b", "a", "c"]
+        assert [s.slug for s in ordered] == ["b", "a", "c"]
 
     def test_start_index指定で開始スポットが固定される(self) -> None:
         """start_index=2 (c) からは近い順に b → a と辿る。"""
@@ -297,7 +285,7 @@ class TestOrderSpotsByProximity:
 
         ordered = canvasser.order_spots_by_proximity(spots, start_index=2)
 
-        assert [s["slug"] for s in ordered] == ["c", "b", "a"]
+        assert [s.slug for s in ordered] == ["c", "b", "a"]
 
     def test_全スポットが欠落なく並ぶ(self) -> None:
         """開始乱択でも結果は入力の並べ替え (欠落・重複なし) である。"""
@@ -311,7 +299,7 @@ class TestOrderSpotsByProximity:
 
         ordered = canvasser.order_spots_by_proximity(spots)
 
-        assert sorted(s["slug"] for s in ordered) == ["a", "b", "c", "d"]
+        assert sorted(s.slug for s in ordered) == ["a", "b", "c", "d"]
 
     def test_1件だけならそのまま返す(self) -> None:
         """単一スポットは順序決定の余地なくそのまま返る。"""

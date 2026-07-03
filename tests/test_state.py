@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -23,14 +23,9 @@ def _state_file(profile_dir: Path) -> Path:
     return profile_dir / "canvasser_state.json"
 
 
-def _spot(slug: str = "cg_vote2026_7") -> dict[str, Any]:
-    """state 更新テスト用のスポット dict を組み立てる。"""
-    return {
-        "slug": slug,
-        "name": "テストスポット",
-        "location_latitude": 35.0,
-        "location_longitude": 135.0,
-    }
+def _spot(slug: str = "cg_vote2026_7") -> canvasser.Spot:
+    """state 更新テスト用のスポットを組み立てる。"""
+    return canvasser.Spot(slug=slug, name="テストスポット", lat=35.0, lng=135.0)
 
 
 class TestLoadAccountState:

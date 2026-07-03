@@ -47,6 +47,16 @@ def _spot(
     }
 
 
+def _typed(
+    num: int,
+    lat: float,
+    lng: float,
+    deadline: str = "2026-12-31 23:59:59",
+) -> canvasser.Spot:
+    """正規化済み Spot を組み立てる (runner 単体メソッドのテスト用)。"""
+    return canvasser.Spot.from_api(_spot(num, lat, lng, deadline))
+
+
 def _listing(spots: list[dict[str, Any]]) -> dict[str, Any]:
     """スポット一覧 GET の成功応答を組み立てる。"""
     return success_response({"spots": spots})
@@ -73,7 +83,7 @@ def _settings(
 
 
 def _runner(
-    spots: list[dict[str, Any]] | None = None,
+    spots: list[canvasser.Spot] | None = None,
     settings: CheckinSettings | None = None,
 ) -> canvasser._CheckinRunner:
     """単体テスト用の _CheckinRunner を組み立てる。"""
@@ -85,15 +95,53 @@ def _runner(
     )
 
 
+class TestSpotFromApi:
+    """Spot.from_api の正規化。"""
+
+    def test_文字列の座標と半径もfloatへ正規化する(self) -> None:
+        """API が文字列で返しても境界で float に確定する。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["location_latitude"] = "35.5"
+        raw["checkin_radius"] = "300"
+
+        spot = canvasser.Spot.from_api(raw)
+
+        assert spot.lat == 35.5
+        assert spot.radius == 300.0
+
+    def test_radius欠落は500mを既定にする(self) -> None:
+        """checkin_radius が無いスポットは UI 既定と同じ 500m になる。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_radius"] = None
+
+        assert canvasser.Spot.from_api(raw).radius == 500.0
+
+    def test_deadlineはJSTのawareへパースし原文を保持する(self) -> None:
+        """deadline は境界で一度だけパースされ、原文は表示用に残る。"""
+        spot = canvasser.Spot.from_api(_spot(1, 35.0, 135.0))
+
+        assert spot.deadline == datetime(2026, 12, 31, 23, 59, 59, tzinfo=JST)
+        assert spot.deadline_raw == "2026-12-31 23:59:59"
+
+    def test_パース不能なdeadlineはNoneで原文を保持する(self) -> None:
+        """未知形式は deadline=None になり、エラー表示用の原文だけ残る。"""
+        spot = canvasser.Spot.from_api(_spot(1, 35.0, 135.0, deadline="31/07/2026"))
+
+        assert spot.deadline is None
+        assert spot.deadline_raw == "31/07/2026"
+
+
 class TestFetchCheckinSpots:
     """_fetch_checkin_spots の応答ハンドリング。"""
 
-    def test_成功応答からspotsを取り出す(self) -> None:
-        """payload.spots のリストがそのまま返る。"""
+    def test_成功応答からspotsをSpotへ正規化して返す(self) -> None:
+        """payload.spots の各 dict が Spot に変換されて返る。"""
         spots = [_spot(1, 35.0, 135.0)]
         fake = FakePage([_listing(spots)])
 
-        assert canvasser._fetch_checkin_spots(_as_page(fake)) == spots
+        got = canvasser._fetch_checkin_spots(_as_page(fake))
+
+        assert got == [canvasser.Spot.from_api(s) for s in spots]
 
     def test_失敗応答はRuntimeError(self) -> None:
         """HTTP エラーは RuntimeError で全体を止める。"""
@@ -108,16 +156,16 @@ class TestPartitionSpots:
 
     def test_完了済みslugを除外して件数を返す(self) -> None:
         """completed_spots にある slug は除外され skip 件数に計上される。"""
-        spots = [_spot(1, 35.0, 135.0), _spot(2, 35.1, 135.0)]
+        spots = [_typed(1, 35.0, 135.0), _typed(2, 35.1, 135.0)]
 
         remaining, skipped = canvasser._partition_spots(spots, {"cg_vote2026_1"})
 
-        assert [s["slug"] for s in remaining] == ["cg_vote2026_2"]
+        assert [s.slug for s in remaining] == ["cg_vote2026_2"]
         assert skipped == 1
 
     def test_完了なしなら全件そのまま(self) -> None:
         """completed_spots が空なら除外は発生しない。"""
-        spots = [_spot(1, 35.0, 135.0)]
+        spots = [_typed(1, 35.0, 135.0)]
 
         remaining, skipped = canvasser._partition_spots(spots, set())
 
@@ -187,14 +235,14 @@ class TestWithinDeadline:
     def test_期限内はTrue(self) -> None:
         """仮想時刻が期限より前なら処理を続行する。"""
         runner = _runner()
-        spot = _spot(1, 35.0, 135.0, deadline="2026-12-31 23:59:59")
+        spot = _typed(1, 35.0, 135.0, deadline="2026-12-31 23:59:59")
 
         assert runner._within_deadline(spot) is True
 
     def test_期限切れはskipして移動起点を進める(self) -> None:
         """期限超過スポットは skip しつつ prev 座標を現地点へ更新する。"""
         runner = _runner()
-        spot = _spot(1, 35.0, 135.0, deadline="2026-01-01 00:00:00")
+        spot = _typed(1, 35.0, 135.0, deadline="2026-01-01 00:00:00")
 
         assert runner._within_deadline(spot) is False
         assert (runner.prev_lat, runner.prev_lng) == (35.0, 135.0)
@@ -204,7 +252,7 @@ class TestWithinDeadline:
     ) -> None:
         """dry-run では期限パース失敗を警告付き skip に丸める。"""
         runner = _runner()
-        spot = _spot(1, 35.0, 135.0, deadline="31/07/2026")
+        spot = _typed(1, 35.0, 135.0, deadline="31/07/2026")
 
         assert runner._within_deadline(spot) is False
         assert "パースできません" in capsys.readouterr().err
@@ -213,7 +261,7 @@ class TestWithinDeadline:
         """execute では期限パース失敗を FailClosedError で即停止する。"""
         runner = _runner(settings=_settings(execute=True))
         runner.gained = 30
-        spot = _spot(1, 35.0, 135.0, deadline="31/07/2026")
+        spot = _typed(1, 35.0, 135.0, deadline="31/07/2026")
 
         with pytest.raises(FailClosedError, match="パースできません") as ei:
             runner._within_deadline(spot)
@@ -227,7 +275,7 @@ class TestOutOfRangeHandling:
     def test_閾値未満はskipで継続する(self) -> None:
         """E5005 が上限未満なら移動起点だけ進めて継続する。"""
         runner = _runner(settings=_settings(out_of_range_limit=3))
-        spot = _spot(1, 35.0, 135.0)
+        spot = _typed(1, 35.0, 135.0)
 
         runner._on_out_of_range(spot, "E5005")
         runner._on_out_of_range(spot, "E5005")
@@ -239,7 +287,7 @@ class TestOutOfRangeHandling:
         """E5005 が累積上限に達したら FailClosedError で全体を止める。"""
         runner = _runner(settings=_settings(out_of_range_limit=2))
         runner.gained = 10
-        spot = _spot(1, 35.0, 135.0)
+        spot = _typed(1, 35.0, 135.0)
         runner._on_out_of_range(spot, "E5005")
 
         with pytest.raises(FailClosedError, match="E5005") as ei:
@@ -261,7 +309,7 @@ class TestUnknownEcodeHandling:
         }
 
         with pytest.raises(FailClosedError, match="連続失敗") as ei:
-            runner._on_unknown_ecode(_spot(1, 35.0, 135.0), res)
+            runner._on_unknown_ecode(_typed(1, 35.0, 135.0), res)
 
         assert ei.value.partial_gained == 20
 
@@ -270,7 +318,7 @@ class TestUnknownEcodeHandling:
         runner = _runner(settings=_settings(consecutive_failure_limit=2))
         res: dict[str, Any] = {"status": 400, "body": None}
 
-        runner._on_unknown_ecode(_spot(1, 35.0, 135.0), res)
+        runner._on_unknown_ecode(_typed(1, 35.0, 135.0), res)
 
         assert runner.consecutive_failures == 1
         assert (runner.prev_lat, runner.prev_lng) == (35.0, 135.0)

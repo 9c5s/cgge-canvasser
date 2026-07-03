@@ -397,17 +397,16 @@ def _natural_altitude() -> tuple[float | None, float | None]:
     return None, None
 
 
-def make_checkin_coords(spot: dict[str, Any]) -> dict[str, Any]:
+def make_checkin_coords(spot: Spot) -> dict[str, Any]:
     """スポット情報から、円内ランダム点と自然化した coords を組む。
 
     サーバ側や将来の異常検知で分布統計が取られた場合に BOT らしい特徴が出ないよう、
     accuracy と altitude を実機挙動に近い分布で乱択する。
     """
-    radius = float(spot.get("checkin_radius") or 500)
     lat, lng = random_point_in_circle(
-        float(spot["location_latitude"]),
-        float(spot["location_longitude"]),
-        radius * CHECKIN_RADIUS_MARGIN,
+        spot.lat,
+        spot.lng,
+        spot.radius * CHECKIN_RADIUS_MARGIN,
     )
     alt, alt_acc = _natural_altitude()
     return {
@@ -444,11 +443,47 @@ ECODE_OUT_OF_RANGE = "E5005"
 ECODES_ALREADY_DONE: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, kw_only=True)
+class Spot:
+    """チェックインスポットの型付き値オブジェクト。
+
+    API 応答の生 dict は境界 (`_fetch_checkin_spots`) で一度だけ本クラスへ
+    正規化し、以降の走行ロジックは型と不変条件の確定した値として受け渡す。
+    座標・半径の数値変換、radius 既定値、deadline のパースをここへ集約する。
+    """
+
+    slug: str
+    name: str
+    lat: float
+    lng: float
+    radius: float = 500.0
+    deadline: datetime | None = None
+    # deadline パース不能時のエラーメッセージ表示用に原文を保持する
+    deadline_raw: object = None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> Spot:
+        """API 応答の spot dict から正規化済みの Spot を構築する。
+
+        checkin_radius の欠落は UI 既定と同じ 500m に丸める。座標が数値へ
+        変換できない場合は ValueError が送出され、境界で早期に検知される。
+        """
+        return cls(
+            slug=str(raw["slug"]),
+            name=str(raw.get("name") or ""),
+            lat=float(raw["location_latitude"]),
+            lng=float(raw["location_longitude"]),
+            radius=float(raw.get("checkin_radius") or 500),
+            deadline=parse_checkin_deadline(raw),
+            deadline_raw=raw.get("checkin_end_datetime"),
+        )
+
+
 def order_spots_by_proximity(
-    spots: list[dict[str, Any]],
+    spots: list[Spot],
     start_index: int | None = None,
     start_location: tuple[float, float] | None = None,
-) -> list[dict[str, Any]]:
+) -> list[Spot]:
     """最近傍法でスポット順序を決める。
 
     - `start_location` を指定すれば、そこに最も近いスポットを 1 件目にする
@@ -470,30 +505,19 @@ def order_spots_by_proximity(
 
     ordered = [current]
     while unvisited:
-        current = _pop_nearest(
-            unvisited,
-            float(current["location_latitude"]),
-            float(current["location_longitude"]),
-        )
+        current = _pop_nearest(unvisited, current.lat, current.lng)
         ordered.append(current)
     return ordered
 
 
-def _pop_nearest(
-    unvisited: list[dict[str, Any]], lat: float, lng: float
-) -> dict[str, Any]:
+def _pop_nearest(unvisited: list[Spot], lat: float, lng: float) -> Spot:
     """未訪問リストから (lat, lng) に最も近いスポットを取り除いて返す。
 
     同距離の場合はリスト前方を優先する (min の最初一致)。
     """
     nearest_idx = min(
         range(len(unvisited)),
-        key=lambda i: _distance_m(
-            lat,
-            lng,
-            float(unvisited[i]["location_latitude"]),
-            float(unvisited[i]["location_longitude"]),
-        ),
+        key=lambda i: _distance_m(lat, lng, unvisited[i].lat, unvisited[i].lng),
     )
     return unvisited.pop(nearest_idx)
 
@@ -514,11 +538,15 @@ class CheckinSettings:
     now_fn: Callable[[], datetime] = _default_now
 
 
-def _fetch_checkin_spots(page: Page) -> list[dict[str, Any]]:
-    """チェックインイベントの spot 一覧を取得する。応答が不正なら RuntimeError。"""
+def _fetch_checkin_spots(page: Page) -> list[Spot]:
+    """チェックインイベントの spot 一覧を取得し `Spot` へ正規化する。
+
+    応答が不正なら RuntimeError。以降の走行ロジックには生 dict を流さない。
+    """
     listing = call_checkin_api(page, "GET", f"/event/{CHECKIN_EVENT_SLUG}")
     payload = _success_payload_or_raise(listing, "チェックインイベント取得に失敗")
-    return cast("list[dict[str, Any]]", payload.get("spots", []))
+    raw_spots = cast("list[dict[str, Any]]", payload.get("spots", []))
+    return [Spot.from_api(raw) for raw in raw_spots]
 
 
 def _load_resume_context(
@@ -541,18 +569,18 @@ def _load_resume_context(
 
 
 def _partition_spots(
-    all_spots: list[dict[str, Any]], completed_spots: set[str]
-) -> tuple[list[dict[str, Any]], int]:
+    all_spots: list[Spot], completed_spots: set[str]
+) -> tuple[list[Spot], int]:
     """完了済みを除外した spot リストと、事前 skip した件数を返す。"""
-    skipped = [s for s in all_spots if s["slug"] in completed_spots]
+    skipped = [s for s in all_spots if s.slug in completed_spots]
     if skipped:
         print(f"事前 skip (完了済み): {len(skipped)}件")
-    return [s for s in all_spots if s["slug"] not in completed_spots], len(skipped)
+    return [s for s in all_spots if s.slug not in completed_spots], len(skipped)
 
 
 def _announce_checkin_plan(
     settings: CheckinSettings,
-    spots: list[dict[str, Any]],
+    spots: list[Spot],
     total_spots: int,
     skipped: int,
 ) -> None:
@@ -576,7 +604,7 @@ def _announce_checkin_plan(
         f"実POST試行 上限: {budget_label} / 連続失敗中断: "
         f"{settings.consecutive_failure_limit}件"
     )
-    print(f"開始スポット: {spots[0]['slug']} {spots[0]['name']}")
+    print(f"開始スポット: {spots[0].slug} {spots[0].name}")
 
 
 def _initial_virtual_now(
@@ -604,7 +632,7 @@ class _CheckinRunner:
 
     page: Page
     settings: CheckinSettings
-    spots: list[dict[str, Any]]
+    spots: list[Spot]
     virtual_now: datetime
     prev_lat: float | None = None
     prev_lng: float | None = None
@@ -643,22 +671,20 @@ class _CheckinRunner:
         counter = self.attempted if self.settings.execute else self.successful
         return counter >= self.settings.daily_budget
 
-    def _move_origin_to(self, spot: dict[str, Any]) -> None:
+    def _move_origin_to(self, spot: Spot) -> None:
         """次スポットの移動起点を spot の座標へ進める。"""
-        self.prev_lat = float(spot["location_latitude"])
-        self.prev_lng = float(spot["location_longitude"])
+        self.prev_lat = spot.lat
+        self.prev_lng = spot.lng
 
-    def _travel_to(self, spot: dict[str, Any]) -> None:
+    def _travel_to(self, spot: Spot) -> None:
         """前スポットからの移動待機を計算し、必要なら sleep して仮想時刻を進める。"""
         if self.prev_lat is None or self.prev_lng is None:
             return
-        s_lat = float(spot["location_latitude"])
-        s_lng = float(spot["location_longitude"])
         secs, mode = estimate_travel_seconds(
             self.prev_lat,
             self.prev_lng,
-            s_lat,
-            s_lng,
+            spot.lat,
+            spot.lng,
             departure_time=self.virtual_now,
         )
         if mode == "gmaps-transit":
@@ -671,7 +697,9 @@ class _CheckinRunner:
             # (driving の実測 duration に対しても意図的な自然化)。
             arrival = next_arrival_time(self.virtual_now, secs)
         wait_seconds = (arrival - self.virtual_now).total_seconds()
-        straight_km = _distance_m(self.prev_lat, self.prev_lng, s_lat, s_lng) / 1000
+        straight_km = (
+            _distance_m(self.prev_lat, self.prev_lng, spot.lat, spot.lng) / 1000
+        )
         deferred_seconds = wait_seconds - secs
         deferred_note = (
             f", 翌朝発に押戻し +{humanize_duration(deferred_seconds)}"
@@ -686,18 +714,18 @@ class _CheckinRunner:
             time.sleep(wait_seconds)
         self.virtual_now = arrival
 
-    def _within_deadline(self, spot: dict[str, Any]) -> bool:
+    def _within_deadline(self, spot: Spot) -> bool:
         """個別スポット期限内かを判定する。skip 時は移動起点だけ現地点へ進める。
 
         イベント全体期限とは別で、超過したものだけ skip して後続の有効スポットは
-        処理を続ける。パース不能は execute では fail closed に落として、サーバ形式
-        変更を早期検知する (個別 skip では気付きにくい)。
+        処理を続ける。パース不能 (deadline=None) は execute では fail closed に
+        落として、サーバ形式変更を早期検知する (個別 skip では気付きにくい)。
         """
-        slug = spot["slug"]
-        deadline = parse_checkin_deadline(spot)
+        slug = spot.slug
+        deadline = spot.deadline
         if deadline is None:
             msg = (
-                f"[{slug}] checkin_end_datetime = {spot.get('checkin_end_datetime')!r} "
+                f"[{slug}] checkin_end_datetime = {spot.deadline_raw!r} "
                 "がパースできません。サーバ側の日付形式が変わった可能性があります。"
             )
             if self.settings.execute:
@@ -725,17 +753,17 @@ class _CheckinRunner:
         counter = self.attempted if self.settings.execute else self.successful
         return counter < self.settings.daily_budget
 
-    def _attempt(self, spot: dict[str, Any], index: int) -> None:
+    def _attempt(self, spot: Spot, index: int) -> None:
         """1 スポット分のチェックインを dry-run または実 POST で処理する。"""
-        slug = spot["slug"]
-        s_lat = float(spot["location_latitude"])
-        s_lng = float(spot["location_longitude"])
+        slug = spot.slug
         coords = make_checkin_coords(spot)
-        distance_m = _distance_m(s_lat, s_lng, coords["latitude"], coords["longitude"])
+        distance_m = _distance_m(
+            spot.lat, spot.lng, coords["latitude"], coords["longitude"]
+        )
         body = encrypt_coords(coords)
 
         print(
-            f"[{index:3}/{len(self.spots)}] {slug} {spot['name']}"
+            f"[{index:3}/{len(self.spots)}] {slug} {spot.name}"
             f" (offset {distance_m:.1f}m, acc={coords['accuracy']}m,"
             f" alt={coords['altitude']})"
         )
@@ -764,9 +792,7 @@ class _CheckinRunner:
         else:
             self._on_unknown_ecode(spot, res)
 
-    def _simulate(
-        self, spot: dict[str, Any], body: str, stay_secs: float, index: int
-    ) -> None:
+    def _simulate(self, spot: Spot, body: str, stay_secs: float, index: int) -> None:
         """dry-run の 1 スポット分。state.json は書かない。
 
         実 POST 実行時の resume 起点をドライラン由来の値で汚染しないため。
@@ -782,7 +808,7 @@ class _CheckinRunner:
                 f" -> 出発 {self.virtual_now:%m/%d %H:%M}"
             )
 
-    def _on_success(self, spot: dict[str, Any], stay_secs: float, index: int) -> None:
+    def _on_success(self, spot: Spot, stay_secs: float, index: int) -> None:
         """実 POST 成功の後処理。state 保存と滞在 sleep を行う。"""
         print("       -> 成功")
         self.gained += 10
@@ -805,7 +831,7 @@ class _CheckinRunner:
             if self.settings.profile_dir is not None:
                 update_checkin_state(self.settings.profile_dir, spot, self.virtual_now)
 
-    def _on_out_of_range(self, spot: dict[str, Any], ecode: str) -> None:
+    def _on_out_of_range(self, spot: Spot, ecode: str) -> None:
         """E5005 (範囲外) の後処理。累積が閾値に達したら fail closed で停止する。"""
         self.out_of_range_count += 1
         limit = self.settings.out_of_range_limit
@@ -826,7 +852,7 @@ class _CheckinRunner:
             raise FailClosedError(msg, partial_gained=self.gained)
         self._move_origin_to(spot)
 
-    def _on_already_done(self, spot: dict[str, Any], ecode: str | None) -> None:
+    def _on_already_done(self, spot: Spot, ecode: str | None) -> None:
         """既達成 ecode の後処理。サーバ側成功済みなので完了扱いで state に反映する。
 
         ECODES_ALREADY_DONE が空 tuple の間は到達しない拡張点。実観測で意味が
@@ -841,7 +867,7 @@ class _CheckinRunner:
                 self.settings.profile_dir, spot, self.virtual_now, mark_completed=True
             )
 
-    def _on_unknown_ecode(self, spot: dict[str, Any], res: dict[str, Any]) -> None:
+    def _on_unknown_ecode(self, spot: Spot, res: dict[str, Any]) -> None:
         """未観測 ecode = unknown の後処理。閾値到達で fail closed に中断する。
 
         BAN シグナル・認証切れ・予期せぬ状態のいずれかとして扱う。意味が確定したら
@@ -1375,7 +1401,7 @@ def save_account_state(profile_dir: Path, state: dict[str, Any]) -> None:
 
 def update_checkin_state(
     profile_dir: Path,
-    spot: dict[str, Any],
+    spot: Spot,
     virtual_now: datetime,
     *,
     mark_completed: bool = True,
@@ -1388,16 +1414,16 @@ def update_checkin_state(
     state = load_account_state(profile_dir)
     state["last_checkin"] = {
         "schema_version": LAST_CHECKIN_SCHEMA_VERSION,
-        "spot_slug": spot["slug"],
-        "spot_name": spot["name"],
-        "location_latitude": float(spot["location_latitude"]),
-        "location_longitude": float(spot["location_longitude"]),
+        "spot_slug": spot.slug,
+        "spot_name": spot.name,
+        "location_latitude": spot.lat,
+        "location_longitude": spot.lng,
         "virtual_completed_at": virtual_now.isoformat(),
         "real_completed_at": datetime.now(UTC).isoformat(),
     }
     if mark_completed:
         completed = set(state.get("completed_spots") or [])
-        completed.add(spot["slug"])
+        completed.add(spot.slug)
         state["completed_spots"] = sorted(completed)
     save_account_state(profile_dir, state)
 
