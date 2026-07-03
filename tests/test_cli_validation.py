@@ -185,7 +185,7 @@ class TestProfilesDirIsGitignored:
         """check-ignore の実行自体が失敗しても例外にせず拒否側に倒す。"""
         monkeypatch.setattr(canvasser.shutil, "which", _which_git)
 
-        def raise_exc(cmd: list[str], **_kwargs: object) -> object:
+        def raise_exc(_cmd: list[str], **_kwargs: object) -> object:
             raise exc
 
         monkeypatch.setattr(canvasser.subprocess, "run", raise_exc)
