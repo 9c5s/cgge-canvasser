@@ -7,13 +7,14 @@ GMAPS_KEY は conftest の autouse fixture で除去されるため、estimate_t
 from __future__ import annotations
 
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
 
 import canvasser
 from canvasser import JST
+from tests._fakes import FakeGmapsClient
 
 
 class TestHumanizeDuration:
@@ -106,6 +107,203 @@ class TestEstimateTravelSeconds:
     def test_キー未設定ではクライアントはNone(self) -> None:
         """GMAPS_KEY が無い環境では _get_gmaps_client は None を返す。"""
         assert canvasser._get_gmaps_client() is None
+
+
+def _leg(seconds: float) -> list[dict[str, Any]]:
+    """duration.value だけ持つ directions 応答を組み立てる。"""
+    return [{"legs": [{"duration": {"value": seconds}}]}]
+
+
+class TestEstimateTravelSecondsGmaps:
+    """_estimate_travel_seconds_gmaps の transit 取得・キャッシュ・fallback。
+
+    GMAPS_KEY を設定して googlemaps.Client のコンストラクタだけを差し替える。
+    _get_gmaps_client 以降のロジック (バケット丸め・キャッシュ・fallback) は
+    実物を通す。
+    """
+
+    def _install(
+        self, monkeypatch: pytest.MonkeyPatch, client: FakeGmapsClient
+    ) -> None:
+        """GMAPS_KEY を設定し、Client 生成をフェイクへ差し替える。"""
+        monkeypatch.setenv("GMAPS_KEY", "test-key")
+
+        def fake_ctor(
+            key: str | None = None, timeout: int | None = None
+        ) -> FakeGmapsClient:
+            return client
+
+        monkeypatch.setattr(canvasser.googlemaps, "Client", fake_ctor)
+
+    def _future_at(self, hour: int, minute: int) -> datetime:
+        """翌日の指定時刻 (確実に未来の JST aware) を返す。"""
+        return (datetime.now(JST) + timedelta(days=1)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+
+    def test_transit経路の所要時間を返す(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """transit 応答の legs[0].duration.value が秒数として返る。"""
+        client = FakeGmapsClient([_leg(1234.0)])
+        self._install(monkeypatch, client)
+
+        got = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+        )
+
+        assert got == (1234.0, "gmaps-transit")
+        assert client.calls[0]["mode"] == "transit"
+
+    def test_同一30分バケットはキャッシュを返しAPIを再呼び出ししない(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """12:31 発と 12:47 発は同じ 12:30 バケットに丸められキャッシュヒットする。"""
+        client = FakeGmapsClient([_leg(1000.0)])
+        self._install(monkeypatch, client)
+
+        got1 = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 31)
+        )
+        got2 = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 47)
+        )
+
+        assert got1 == got2 == (1000.0, "gmaps-transit")
+        assert len(client.calls) == 1
+
+    def test_バケットが異なればAPIを再度呼ぶ(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """12:29 発と 12:31 発はバケットが違うためそれぞれ API を呼ぶ。"""
+        client = FakeGmapsClient([_leg(1000.0), _leg(2000.0)])
+        self._install(monkeypatch, client)
+
+        got1 = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 29)
+        )
+        got2 = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 31)
+        )
+
+        assert got1 == (1000.0, "gmaps-transit")
+        assert got2 == (2000.0, "gmaps-transit")
+        assert len(client.calls) == 2
+
+    def test_transitが空ならdrivingで再試行する(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """transit 経路なし (深夜帯等) は driving の所要時間へフォールバックする。"""
+        client = FakeGmapsClient([[], _leg(500.0)])
+        self._install(monkeypatch, client)
+
+        got = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+        )
+
+        assert got == (500.0, "gmaps-driving")
+        assert client.calls[0]["mode"] == "transit"
+        assert client.calls[1]["mode"] == "driving"
+
+    def test_drivingも空ならNone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """transit・driving とも経路なしは None (Haversine 合流) を返す。"""
+        client = FakeGmapsClient([[], []])
+        self._install(monkeypatch, client)
+
+        got = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+        )
+
+        assert got is None
+
+    def test_transitの例外はNoneに丸めて警告する(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """API 例外は伝播させず None を返し、stderr に失敗を出力する。"""
+        client = FakeGmapsClient([RuntimeError("api down")])
+        self._install(monkeypatch, client)
+
+        got = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+        )
+
+        assert got is None
+        assert "gmaps directions 失敗" in capsys.readouterr().err
+
+    def test_driving再試行の例外もNoneに丸めて警告する(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """driving 側の例外も伝播させず None を返し、stderr に失敗を出力する。"""
+        client = FakeGmapsClient([[], RuntimeError("api down")])
+        self._install(monkeypatch, client)
+
+        got = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+        )
+
+        assert got is None
+        assert "driving 再試行失敗" in capsys.readouterr().err
+
+    def test_過去のdeparture_timeはnowに丸めて渡す(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """過去時刻を渡すと 400 になるため、API へは文字列 "now" を渡す。"""
+        client = FakeGmapsClient([_leg(100.0)])
+        self._install(monkeypatch, client)
+
+        canvasser._estimate_travel_seconds_gmaps(
+            35.0,
+            135.0,
+            36.0,
+            136.0,
+            departure_time=datetime(2020, 1, 1, 12, 0, tzinfo=JST),
+        )
+
+        assert client.calls[0]["departure_time"] == "now"
+
+    def test_未来のdeparture_timeはそのまま渡す(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """未来時刻は始発待ち込み duration を得るためそのまま API へ渡す。"""
+        client = FakeGmapsClient([_leg(100.0)])
+        self._install(monkeypatch, client)
+        dep = self._future_at(12, 0)
+
+        canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=dep
+        )
+
+        assert client.calls[0]["departure_time"] == dep
+
+    def test_naiveなdeparture_timeはJSTとして扱う(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """tz なしの時刻は JST とみなして aware 化してから過去判定する。"""
+        client = FakeGmapsClient([_leg(100.0)])
+        self._install(monkeypatch, client)
+        naive_dep = (datetime.now() + timedelta(days=1)).replace(  # noqa: DTZ005
+            hour=12, minute=0, second=0, microsecond=0
+        )
+
+        got = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=naive_dep
+        )
+
+        assert got == (100.0, "gmaps-transit")
+        passed = client.calls[0]["departure_time"]
+        assert isinstance(passed, datetime)
+        assert passed.tzinfo is not None
+
+    def test_estimate_travel_secondsはgmaps結果を優先する(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """クライアントが結果を返す場合は Haversine ではなく gmaps 値を使う。"""
+        client = FakeGmapsClient([_leg(1234.0)])
+        self._install(monkeypatch, client)
+
+        got = canvasser.estimate_travel_seconds(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+        )
+
+        assert got == (1234.0, "gmaps-transit")
 
 
 class TestNextArrivalTime:
