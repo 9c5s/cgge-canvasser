@@ -527,7 +527,9 @@ class CheckinSettings:
     """collect_checkins の動作設定。
 
     `execute=False` (デフォルト) は完全ドライラン (POST を送らず、sleep もなく、
-    state も書き換えない)。`now_fn` はテスト時に差し替えるための現在時刻取得関数。
+    state も書き換えない)。`now_fn` と `sleep_fn` はテスト時に差し替えるための
+    現在時刻取得・実待機関数で、runner はモジュール global の time.sleep を
+    直接呼ばない。
     """
 
     execute: bool = False
@@ -536,6 +538,7 @@ class CheckinSettings:
     out_of_range_limit: int = 3
     profile_dir: Path | None = None
     now_fn: Callable[[], datetime] = _default_now
+    sleep_fn: Callable[[float], None] = time.sleep
 
 
 def _fetch_checkin_spots(page: Page) -> list[Spot]:
@@ -711,7 +714,7 @@ class _CheckinRunner:
             f" 直線 {straight_km:.1f}km{deferred_note}) -> 到着 {arrival:%m/%d %H:%M}"
         )
         if self.settings.execute:
-            time.sleep(wait_seconds)
+            self.settings.sleep_fn(wait_seconds)
         self.virtual_now = arrival
 
     def _within_deadline(self, spot: Spot) -> bool:
@@ -821,7 +824,7 @@ class _CheckinRunner:
         if self.settings.profile_dir is not None:
             update_checkin_state(self.settings.profile_dir, spot, self.virtual_now)
         if self._will_continue_after(index):
-            time.sleep(stay_secs)
+            self.settings.sleep_fn(stay_secs)
             self.virtual_now = self.virtual_now + timedelta(seconds=stay_secs)
             print(
                 f"       滞在 {humanize_duration(stay_secs)}"
