@@ -184,7 +184,10 @@ def check_login(page: Page) -> bool:
         """,
         [LOGIN_CHECK_URL, API_KEY],
     )
-    payload = cast("dict[str, Any]", result.get("payload") or {})
+    result_dict = _as_str_dict(result)
+    if result_dict is None:
+        return False
+    payload = _as_str_dict(result_dict.get("payload")) or {}
     return bool(payload.get("is_login", False))
 
 
@@ -677,6 +680,9 @@ class _CheckinRunner:
             # 押し戻しをかけると二重加算になる。
             arrival = self.virtual_now + timedelta(seconds=secs)
         else:
+            # haversine 系と gmaps-driving は運行時刻を含まない所要時間なので、
+            # 「人間は深夜に移動しない」想定へ寄せる押し戻しを適用する
+            # (driving の実測 duration に対しても意図的な自然化)。
             arrival = next_arrival_time(self.virtual_now, secs)
         wait_seconds = (arrival - self.virtual_now).total_seconds()
         straight_km = _distance_m(self.prev_lat, self.prev_lng, s_lat, s_lng) / 1000
@@ -720,19 +726,17 @@ class _CheckinRunner:
             return False
         return True
 
-    def _will_continue_after(
-        self, index: int, next_attempted: int, next_successful: int
-    ) -> bool:
+    def _will_continue_after(self, index: int) -> bool:
         """このスポットの後にループを継続するかを判定する。
 
-        execute の True と False で使うカウンタが違う点だけ注意する
-        (attempted と successful)。
+        呼び出し時点で attempted・successful は加算済みで、execute の True と
+        False で参照するカウンタが違う点だけ注意する。
         """
         if index >= len(self.spots):
             return False
         if self.settings.daily_budget <= 0:
             return True
-        counter = next_attempted if self.settings.execute else next_successful
+        counter = self.attempted if self.settings.execute else self.successful
         return counter < self.settings.daily_budget
 
     def _attempt(self, spot: dict[str, Any], index: int) -> None:
@@ -785,7 +789,7 @@ class _CheckinRunner:
         self.gained += 10
         self.successful += 1
         self._move_origin_to(spot)
-        if self._will_continue_after(index, self.attempted, self.successful):
+        if self._will_continue_after(index):
             self.virtual_now = self.virtual_now + timedelta(seconds=stay_secs)
             print(
                 f"       滞在 {humanize_duration(stay_secs)}"
@@ -806,7 +810,7 @@ class _CheckinRunner:
         # 一次 state を保存する。
         if self.settings.profile_dir is not None:
             update_checkin_state(self.settings.profile_dir, spot, self.virtual_now)
-        if self._will_continue_after(index, self.attempted, self.successful):
+        if self._will_continue_after(index):
             time.sleep(stay_secs)
             self.virtual_now = self.virtual_now + timedelta(seconds=stay_secs)
             print(
@@ -839,7 +843,11 @@ class _CheckinRunner:
         self._move_origin_to(spot)
 
     def _on_already_done(self, spot: dict[str, Any], ecode: str | None) -> None:
-        """既達成 ecode の後処理。サーバ側成功済みなので完了扱いで state に反映する。"""
+        """既達成 ecode の後処理。サーバ側成功済みなので完了扱いで state に反映する。
+
+        ECODES_ALREADY_DONE が空 tuple の間は到達しない拡張点。実観測で意味が
+        確定した ecode を追加した時点から有効になる。
+        """
         print(f"       -> 既達成 ({ecode})、スキップ")
         self.consecutive_failures = 0
         self._move_origin_to(spot)
@@ -997,7 +1005,8 @@ def _directions_driving_fallback(
             language="ja",
         )
     # API 失敗は呼び出し側の Haversine フォールバックへ丸めるため広く握る
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        print(f"  gmaps driving 再試行失敗: {e}", file=sys.stderr)
         return None
     if not result:
         return None
@@ -1167,7 +1176,9 @@ def next_arrival_time(now: datetime, travel_seconds: float) -> datetime:
             hour=TRAVEL_ACTIVE_START_HOUR, minute=0, second=0, microsecond=0
         )
 
-    max_daily_travel_seconds = (24 - TRAVEL_ACTIVE_START_HOUR) * 3600
+    max_daily_travel_seconds = (
+        TRAVEL_ACTIVE_END_HOUR - TRAVEL_ACTIVE_START_HOUR
+    ) * 3600
     if travel_seconds > max_daily_travel_seconds:
         return cursor + timedelta(seconds=travel_seconds)
 
@@ -1438,9 +1449,11 @@ def resume_context(
         except ValueError:
             resume_at = None
     completed = set(state.get("completed_spots") or [])
+    # 非 strict (dry-run) はスキーマ検証を通らないため、手改変で数値以外が
+    # 入っていても ValueError にせず None (resume 情報なし) に丸める。
     return (
-        float(lat) if lat is not None else None,
-        float(lng) if lng is not None else None,
+        float(lat) if isinstance(lat, int | float) else None,
+        float(lng) if isinstance(lng, int | float) else None,
         resume_at,
         completed,
     )
@@ -1465,6 +1478,11 @@ def mark_spots_completed(profile_dir: Path, slugs: list[str]) -> None:
     print(f"[{profile_dir.name}] completed_spots に追加: {sorted(slugs)}")
 
 
+def _install_chromium() -> None:
+    """`playwright install chromium` を現在の Python 環境で実行する。"""
+    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+
+
 def ensure_chromium_installed() -> None:
     """Chromium バイナリが未取得なら `playwright install chromium` を走らせる。
 
@@ -1476,7 +1494,7 @@ def ensure_chromium_installed() -> None:
             return
 
     print("Chromium バイナリを取得します (初回のみ)...", file=sys.stderr)
-    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+    _install_chromium()
 
 
 def run_login_flow(
@@ -1635,13 +1653,7 @@ def open_persistent_context(
         return p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
     except PlaywrightError as e:
         if "playwright install" in str(e).lower():
-            subprocess.check_call([
-                sys.executable,
-                "-m",
-                "playwright",
-                "install",
-                "chromium",
-            ])
+            _install_chromium()
             return p.chromium.launch_persistent_context(str(profile_dir), **kwargs)
         raise
 
