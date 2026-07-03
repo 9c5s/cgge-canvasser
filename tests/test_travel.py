@@ -140,6 +140,24 @@ class TestNextArrivalTime:
         got = canvasser.next_arrival_time(now, 7200)
         assert got == datetime(2026, 7, 4, 0, 0, tzinfo=JST)
 
+    def test_稼働枠18時間ちょうどの移動は稼働枠に収まる(self) -> None:
+        """06:00 発 18 時間移動はちょうど 24:00 着として当日中に収まる。"""
+        now = datetime(2026, 7, 3, 6, 0, tzinfo=JST)
+        got = canvasser.next_arrival_time(now, 18 * 3600)
+        assert got == datetime(2026, 7, 4, 0, 0, tzinfo=JST)
+
+    def test_稼働枠18時間を超える長旅は夜間も連続移動して加算する(self) -> None:
+        """10:00 発 25 時間移動は押し戻しなしの連続移動で翌日 11:00 着になる。"""
+        now = datetime(2026, 7, 3, 10, 0, tzinfo=JST)
+        got = canvasser.next_arrival_time(now, 25 * 3600)
+        assert got == datetime(2026, 7, 4, 11, 0, tzinfo=JST)
+
+    def test_深夜発の長旅は朝6時発扱いで連続移動する(self) -> None:
+        """03:00 発 20 時間移動は 06:00 発扱いになり翌日 02:00 着になる。"""
+        now = datetime(2026, 7, 3, 3, 0, tzinfo=JST)
+        got = canvasser.next_arrival_time(now, 20 * 3600)
+        assert got == datetime(2026, 7, 4, 2, 0, tzinfo=JST)
+
 
 class TestParseCheckinDeadline:
     """parse_checkin_deadline の形式別パース。"""

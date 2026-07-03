@@ -1155,7 +1155,8 @@ def next_arrival_time(now: datetime, travel_seconds: float) -> datetime:
 
     深夜帯 (24:00-06:00) は交通機関が動かず「駅で寝てから朝に再開」もできないため、
     今日中に到着できない旅は旅程ごと翌朝 06:00 発へ押し戻す。
-    24 時間超の旅はさらに翌日へ。
+    稼働枠 (06:00-24:00 の 18 時間) を超える長旅はどの日にも収まらないため、
+    夜行便等で夜間も移動が続く連続移動として押し戻しなしで加算する。
     """
     if travel_seconds <= 0:
         return now
@@ -1165,6 +1166,10 @@ def next_arrival_time(now: datetime, travel_seconds: float) -> datetime:
         cursor = cursor.replace(
             hour=TRAVEL_ACTIVE_START_HOUR, minute=0, second=0, microsecond=0
         )
+
+    max_daily_travel_seconds = (24 - TRAVEL_ACTIVE_START_HOUR) * 3600
+    if travel_seconds > max_daily_travel_seconds:
+        return cursor + timedelta(seconds=travel_seconds)
 
     while True:
         day_end = (cursor + timedelta(days=1)).replace(
