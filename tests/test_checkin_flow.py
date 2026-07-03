@@ -314,32 +314,26 @@ class TestBudgetReached:
         assert runner._budget_reached() is False
 
 
-class TestWithinDeadline:
-    """_CheckinRunner._within_deadline の期限判定。"""
+class TestDeadlineOkBeforeTravel:
+    """travel plan 前の deadline 判定: パース不能・現在時点期限切れをここで捌く。"""
 
-    def test_期限内はTrue(self) -> None:
+    def test_期限内はTrueを返す(self) -> None:
         """仮想時刻が期限より前なら処理を続行する。"""
         runner = _runner()
         spot = _typed(1, 35.0, 135.0, deadline="2026-12-31 23:59:59")
 
-        assert runner._within_deadline(spot) is True
+        assert runner._deadline_ok_before_travel(spot) is True
 
-    def test_期限切れskipではoriginを更新しない(self) -> None:
-        """skip 判定は移動 sleep 前に走るので、行っていない spot に origin を進めない。
-
-        origin を skip spot へ進めると次スポットの travel 計算が壊れる
-        (前回到達地点から見た距離ではなく、行っていない spot からの距離になる)。
-        """
+    def test_現在時点で期限切れはskipしoriginを更新しない(self) -> None:
+        """virtual_now > deadline は skip、行っていないので origin は維持する。"""
         runner = _runner()
         runner.prev_lat, runner.prev_lng = 34.99, 135.0
-
         spot = _typed(1, 35.0, 135.0, deadline="2026-01-01 00:00:00")
 
-        assert runner._within_deadline(spot) is False
-        # origin は skip spot に瞬間移動せず、前回到達地点を維持する
+        assert runner._deadline_ok_before_travel(spot) is False
         assert (runner.prev_lat, runner.prev_lng) == (34.99, 135.0)
 
-    def test_パース不能はdryrunでskipする(
+    def test_パース不能はdryrunで警告付きskip_originを維持(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """dry-run では期限パース失敗を警告付き skip に丸め、origin も維持する。"""
@@ -347,7 +341,7 @@ class TestWithinDeadline:
         runner.prev_lat, runner.prev_lng = 34.99, 135.0
         spot = _typed(1, 35.0, 135.0, deadline="31/07/2026")
 
-        assert runner._within_deadline(spot) is False
+        assert runner._deadline_ok_before_travel(spot) is False
         assert "パースできません" in capsys.readouterr().err
         assert (runner.prev_lat, runner.prev_lng) == (34.99, 135.0)
 
@@ -358,22 +352,25 @@ class TestWithinDeadline:
         spot = _typed(1, 35.0, 135.0, deadline="31/07/2026")
 
         with pytest.raises(FailClosedError, match="パースできません") as ei:
-            runner._within_deadline(spot)
+            runner._deadline_ok_before_travel(spot)
 
         assert ei.value.partial_gained == 30
 
-    def test_到着予定が期限超過なら移動前にskip(
+
+class TestDeadlineOkAfterTravel:
+    """travel plan 後の deadline 判定: 到着予定超過をここで捌く。"""
+
+    def test_到着予定が期限超過ならskipしoriginを更新しない(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """virtual_now が期限内でも、planned_arrival が期限超過なら skip する。"""
+        """planned_arrival が deadline より先なら skip、origin は維持する。"""
         runner = _runner()
         runner.prev_lat, runner.prev_lng = 34.99, 135.0
         # virtual_now=10:00 (fixture)、deadline=10:30、planned_arrival=12:00
         spot = _typed(1, 35.0, 135.0, deadline="2026-07-03 10:30:00")
         planned = datetime(2026, 7, 3, 12, 0, tzinfo=JST)
 
-        assert runner._within_deadline(spot, planned) is False
-        # 到着予定超過 skip でも origin は更新しない (実際には行っていない)
+        assert runner._deadline_ok_after_travel(spot, planned) is False
         assert (runner.prev_lat, runner.prev_lng) == (34.99, 135.0)
         assert "到着予定" in capsys.readouterr().out
 
@@ -383,15 +380,7 @@ class TestWithinDeadline:
         spot = _typed(1, 35.0, 135.0, deadline="2026-07-03 12:00:00")
         planned = datetime(2026, 7, 3, 11, 30, tzinfo=JST)
 
-        assert runner._within_deadline(spot, planned) is True
-
-    def test_planned_arrival省略時は従来のvirtual_now判定(self) -> None:
-        """planned_arrival=None なら virtual_now vs deadline の従来判定に戻る。"""
-        runner = _runner()
-        # virtual_now=10:00、deadline=10:30 -> planned 省略なら period 内で True
-        spot = _typed(1, 35.0, 135.0, deadline="2026-07-03 10:30:00")
-
-        assert runner._within_deadline(spot) is True
+        assert runner._deadline_ok_after_travel(spot, planned) is True
 
 
 class TestPlanTravelTo:
@@ -417,7 +406,63 @@ class TestPlanTravelTo:
 
 
 class TestSkipDoesNotAdvanceOrigin:
-    """skip 経路で origin が誤って skip spot に瞬間移動する regression 用テスト。"""
+    """skip 経路で origin が誤って skip spot に瞬間移動する regression 用テスト。
+
+    加えて、パース不能・現在時点期限切れの spot に対しては travel estimation
+    (Google Maps API 呼び出し含む) 自体を走らせない責務を spy で検証する。
+    """
+
+    @staticmethod
+    def _spy_travel(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, ...]]:
+        """`estimate_travel_seconds` を spy 化し、呼び出し引数のリストを返す。"""
+        calls: list[tuple[object, ...]] = []
+
+        def spy(*args: object, **_kwargs: object) -> tuple[float, str]:
+            calls.append(args)
+            return (0.0, "walk")
+
+        monkeypatch.setattr(canvasser, "estimate_travel_seconds", spy)
+        return calls
+
+    def test_パース不能スポットへtravel_estimationは呼ばれない(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """段 1 のパース不能判定で fail_closed に落ち、estimate を呼ばずに済む。"""
+        calls = self._spy_travel(monkeypatch)
+        spot1 = _typed(1, 35.00, 135.0)
+        spot2 = _typed(2, 40.00, 135.0, deadline="invalid-date")
+        runner = canvasser._CheckinRunner(
+            page=_as_page(FakePage([_POST_OK])),
+            settings=_settings(execute=True, sleep_fn=_no_sleep),
+            spots=[spot1, spot2],
+            virtual_now=_FIXED_NOW,
+        )
+
+        with pytest.raises(FailClosedError, match="パースできません"):
+            runner.run()
+
+        # spot1 は first で estimate 不要、spot2 は段 1 で fail_closed になる。
+        # よって estimate_travel_seconds は 1 度も呼ばれない。
+        assert calls == []
+
+    def test_現在時点期限切れスポットへtravel_estimationは呼ばれない(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """段 1 の現在時点期限切れ判定で skip に落ち、estimate を呼ばずに済む。"""
+        calls = self._spy_travel(monkeypatch)
+        spot1 = _typed(1, 35.00, 135.0)  # 期限内
+        spot2 = _typed(2, 40.00, 135.0, deadline="2026-01-01 00:00:00")
+        runner = canvasser._CheckinRunner(
+            page=_as_page(FakePage([_POST_OK])),
+            settings=_settings(execute=True, sleep_fn=_no_sleep),
+            spots=[spot1, spot2],
+            virtual_now=_FIXED_NOW,
+        )
+
+        runner.run()
+
+        # spot1 は first で estimate 不要、spot2 は段 1 で skip されるので不要。
+        assert calls == []
 
     def test_期限切れskip後の次spot移動は前回到達地点から計算する(self) -> None:
         """遠距離期限切れ spot が中間にあっても、次 spot への travel は前回位置基準。
