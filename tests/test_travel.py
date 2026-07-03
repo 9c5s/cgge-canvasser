@@ -4,8 +4,6 @@ GMAPS_KEY は conftest の autouse fixture で除去されるため、estimate_t
 は常に Haversine フォールバック経路を通る (外部通信なしの Small テスト)。
 """
 
-from __future__ import annotations
-
 import random
 from datetime import datetime, timedelta
 from typing import Any

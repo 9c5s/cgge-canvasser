@@ -1,7 +1,5 @@
 """テスト全体で共有する fixture 定義。"""
 
-from __future__ import annotations
-
 from collections.abc import Iterator
 
 import pytest

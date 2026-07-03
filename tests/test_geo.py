@@ -4,8 +4,6 @@
 検証する。encrypt_coords は逆演算 (復号) によるラウンドトリップで確認する。
 """
 
-from __future__ import annotations
-
 import base64
 import hashlib
 import json

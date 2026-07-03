@@ -28,8 +28,6 @@ mission と checkin は独立したサブコマンドで、同時実行はしな
 # 抑制する。
 # ruff: noqa: T201
 
-from __future__ import annotations
-
 import argparse
 import base64
 import contextlib
@@ -49,7 +47,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 from zoneinfo import ZoneInfo
 
 import googlemaps
@@ -462,7 +460,7 @@ class Spot:
     deadline_raw: object = None
 
     @classmethod
-    def from_api(cls, raw: dict[str, Any]) -> Spot:
+    def from_api(cls, raw: dict[str, Any]) -> Self:
         """API 応答の spot dict から正規化済みの Spot を構築する。
 
         checkin_radius の欠落は UI 既定と同じ 500m に丸める。座標が数値へ
@@ -1209,21 +1207,16 @@ def next_arrival_time(now: datetime, travel_seconds: float) -> datetime:
 def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
     """`spot["checkin_end_datetime"]` を JST の aware datetime にパースする。
 
-    失敗時は None。現行は `YYYY-MM-DD HH:MM:SS` (JST) 形式だが、ISO8601 `Z` 付きへ
-    切り替わっても扱えるように isoformat も試す。パース失敗は呼び出し側で
-    「fail closed = 期限判定できないなら実 POST を止める」扱いにする前提。
+    失敗時は None。現行の `YYYY-MM-DD HH:MM:SS` (JST) から
+    ISO8601 `Z`・offset 付きまで `datetime.fromisoformat` で一括受理する。
+    naive は JST として扱う。パース失敗は呼び出し側で「fail closed = 期限判定
+    できないなら実 POST を止める」扱いにする前提。
     """
     raw = spot.get("checkin_end_datetime")
-    if not raw:
+    if not isinstance(raw, str) or not raw:
         return None
-    if not isinstance(raw, str):
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        with contextlib.suppress(ValueError):
-            return datetime.strptime(raw, fmt).replace(tzinfo=JST)
-    iso = raw.replace("Z", "+00:00")
     try:
-        parsed = datetime.fromisoformat(iso)
+        parsed = datetime.fromisoformat(raw)
     except ValueError:
         return None
     return _as_jst_aware(parsed)

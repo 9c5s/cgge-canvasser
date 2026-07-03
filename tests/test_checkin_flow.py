@@ -4,8 +4,6 @@ FakePage と now_fn 注入で外部依存を断ち、dry-run 経路のフロー�
 安全装置 (fail closed・budget・期限 skip) を検証する。
 """
 
-from __future__ import annotations
-
 import random
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any

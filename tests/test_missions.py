@@ -4,8 +4,6 @@ FakePage で API 応答を差し替え、dry-run と execute の分岐・ecode �
 ハンドリング・獲得票数の集計を検証する。
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import pytest

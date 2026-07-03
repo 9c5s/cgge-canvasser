@@ -1,7 +1,5 @@
 """CLI 入力検証 (アカウント名・パス封じ込め・引数組み合わせ) のテスト。"""
 
-from __future__ import annotations
-
 import argparse
 import subprocess
 from typing import TYPE_CHECKING
