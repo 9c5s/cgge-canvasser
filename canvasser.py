@@ -94,38 +94,54 @@ def _default_now() -> datetime:
     return datetime.now(JST)
 
 
+def _as_jst_aware(dt: datetime) -> datetime:
+    """時刻を JST の aware に揃える (naive は JST とみなして付与する)。
+
+    サーバ応答も内部時刻も JST 前提のため、naive はすべて JST として扱う。
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=JST)
+    return dt.astimezone(JST)
+
+
+# call_api と call_checkin_api が共有する fetch ラッパー JS。
+# - 送信元と API は別ホストだが、サーバ側で CORS allow-credentials が有効なので
+#   credentials=include で通る。x-api-key はフロント公開の固定値。
+# - fetch reject (ネットワーク・CORS・DNS 失敗) や非 JSON 応答も
+#   {status, body, error} で構造化して返し、呼び出し側で status==0 や
+#   エラーコードで分岐できるようにする。
+# - body があれば application/x-www-form-urlencoded で送る (axios が data:string
+#   を送るときの既定 Content-Type を実 UI キャプチャで確定した)。
+_FETCH_JSON_JS = """
+async ([url, method, apiKey, body]) => {
+  try {
+    const res = await fetch(url, {
+      method,
+      credentials: 'include',
+      headers: {
+        'x-api-key': apiKey,
+        'accept': 'application/json, text/plain, */*',
+        ...(body ? {'content-type': 'application/x-www-form-urlencoded'} : {})
+      },
+      body: body ?? undefined,
+    });
+    const raw = await res.text();
+    try { return {status: res.status, body: JSON.parse(raw)}; }
+    catch { return {status: res.status, body: raw, error: 'non-json'}; }
+  } catch (e) {
+    return {status: 0, body: null, error: String(e)};
+  }
+}
+"""
+
+
 def call_api(page: Page, method: str, path: str) -> dict[str, Any]:
     """ページ内で fetch を実行し、Cookie 付きで API を叩く。
 
-    - 送信元と API は別ホストだが、サーバ側で CORS allow-credentials が有効なので
-      credentials=include で通る。x-api-key はフロント公開の固定値。
-    - fetch reject (ネットワーク・CORS・DNS 失敗) や非 JSON 応答も
-      {status, body, error} で構造化して返し、呼び出し側で status==0 や
-      エラーコードで分岐できるようにする。
+    応答は `_FETCH_JSON_JS` が {status, body, error} に構造化して返す。
     """
     url = f"{API_HOST}{API_BASE}{path}"
-    return page.evaluate(
-        """
-        async ([url, method, apiKey]) => {
-          try {
-            const res = await fetch(url, {
-              method,
-              credentials: 'include',
-              headers: {
-                'x-api-key': apiKey,
-                'accept': 'application/json, text/plain, */*'
-              }
-            });
-            const raw = await res.text();
-            try { return {status: res.status, body: JSON.parse(raw)}; }
-            catch { return {status: res.status, body: raw, error: 'non-json'}; }
-          } catch (e) {
-            return {status: 0, body: null, error: String(e)};
-          }
-        }
-        """,
-        [url, method, API_KEY],
-    )
+    return page.evaluate(_FETCH_JSON_JS, [url, method, API_KEY, None])
 
 
 def _as_str_dict(value: object) -> dict[str, Any] | None:
@@ -414,35 +430,11 @@ def call_checkin_api(
 ) -> dict[str, Any]:
     """API の checkins 系エンドポイントを叩く。
 
-    body があれば application/x-www-form-urlencoded で送る (axios が data:string を
-    送るときの既定 Content-Type を実 UI キャプチャで確定した)。body は
-    "salt_hex,iv_hex,ct_base64" の文字列をそのまま (URL エンコードせずに) 載せる。
+    body は "salt_hex,iv_hex,ct_base64" の文字列をそのまま (URL エンコード
+    せずに) 載せる。Content-Type の付与は `_FETCH_JSON_JS` 側で行う。
     """
     url = f"{API_V1}/checkins{path}"
-    return page.evaluate(
-        """
-        async ([url, method, apiKey, body]) => {
-          try {
-            const res = await fetch(url, {
-              method,
-              credentials: 'include',
-              headers: {
-                'x-api-key': apiKey,
-                'accept': 'application/json, text/plain, */*',
-                ...(body ? {'content-type': 'application/x-www-form-urlencoded'} : {})
-              },
-              body: body ?? undefined,
-            });
-            const raw = await res.text();
-            try { return {status: res.status, body: JSON.parse(raw)}; }
-            catch { return {status: res.status, body: raw, error: 'non-json'}; }
-          } catch (e) {
-            return {status: 0, body: null, error: String(e)};
-          }
-        }
-        """,
-        [url, method, API_KEY, body],
-    )
+    return page.evaluate(_FETCH_JSON_JS, [url, method, API_KEY, body])
 
 
 # チェックイン API の既知エラーコード。UI 側チャンクから "E5005" (範囲外) は把握済み。
@@ -469,20 +461,7 @@ def order_spots_by_proximity(
     unvisited = list(spots)
 
     if start_location is not None:
-        cur_lat, cur_lng = start_location
-        nearest_idx = 0
-        nearest_d = float("inf")
-        for i, s in enumerate(unvisited):
-            d = _distance_m(
-                cur_lat,
-                cur_lng,
-                float(s["location_latitude"]),
-                float(s["location_longitude"]),
-            )
-            if d < nearest_d:
-                nearest_d = d
-                nearest_idx = i
-        current = unvisited.pop(nearest_idx)
+        current = _pop_nearest(unvisited, *start_location)
     else:
         if start_index is None:
             # 開始スポットの乱択で暗号用途ではない
@@ -490,28 +469,33 @@ def order_spots_by_proximity(
         current = unvisited.pop(start_index)
 
     ordered = [current]
-    cur_lat = float(current["location_latitude"])
-    cur_lng = float(current["location_longitude"])
-
     while unvisited:
-        nearest_idx = 0
-        nearest_d = float("inf")
-        for i, s in enumerate(unvisited):
-            d = _distance_m(
-                cur_lat,
-                cur_lng,
-                float(s["location_latitude"]),
-                float(s["location_longitude"]),
-            )
-            if d < nearest_d:
-                nearest_d = d
-                nearest_idx = i
-        current = unvisited.pop(nearest_idx)
+        current = _pop_nearest(
+            unvisited,
+            float(current["location_latitude"]),
+            float(current["location_longitude"]),
+        )
         ordered.append(current)
-        cur_lat = float(current["location_latitude"])
-        cur_lng = float(current["location_longitude"])
-
     return ordered
+
+
+def _pop_nearest(
+    unvisited: list[dict[str, Any]], lat: float, lng: float
+) -> dict[str, Any]:
+    """未訪問リストから (lat, lng) に最も近いスポットを取り除いて返す。
+
+    同距離の場合はリスト前方を優先する (min の最初一致)。
+    """
+    nearest_idx = min(
+        range(len(unvisited)),
+        key=lambda i: _distance_m(
+            lat,
+            lng,
+            float(unvisited[i]["location_latitude"]),
+            float(unvisited[i]["location_longitude"]),
+        ),
+    )
+    return unvisited.pop(nearest_idx)
 
 
 @dataclass(kw_only=True)
@@ -603,9 +587,7 @@ def _initial_virtual_now(
     「前回 23:50 に終わって翌日 12:00 に再開」を自然な連続扱いにするため、
     resume_at が現在時刻より進んでいれば resume_at を採用する。
     """
-    virtual_now = settings.now_fn()
-    if virtual_now.tzinfo is None:
-        virtual_now = virtual_now.replace(tzinfo=JST)
+    virtual_now = _as_jst_aware(settings.now_fn())
     if resume_at is not None and resume_at > virtual_now:
         virtual_now = resume_at
     return virtual_now
@@ -807,9 +789,7 @@ class _CheckinRunner:
         self.successful += 1
         self.consecutive_failures = 0
         self._move_origin_to(spot)
-        self.virtual_now = self.settings.now_fn()
-        if self.virtual_now.tzinfo is None:
-            self.virtual_now = self.virtual_now.replace(tzinfo=JST)
+        self.virtual_now = _as_jst_aware(self.settings.now_fn())
         # sleep 中に中断されても completed_spots に slug が残るよう、成功直後に
         # 一次 state を保存する。
         if self.settings.profile_dir is not None:
@@ -969,6 +949,16 @@ def _distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 # 直線距離を実道路距離へ補正する係数
 ROAD_DISTANCE_FACTOR = 1.35
 
+# 距離レンジ別の移動手段テーブル。(道路距離の上限 [m], 平均速度 [m/h],
+# 乗換・搭乗などの固定オーバーヘッド [秒], 手段名) の順で、上から順に最初に
+# 該当したバンドを使う。最終バンドの上限は無限大で全距離を受ける。
+_TRAVEL_SPEED_BANDS: tuple[tuple[float, float, float, str], ...] = (
+    (500, 5_000, 0, "walk"),
+    (30_000, 40_000, 5 * 60, "car/local"),
+    (500_000, 200_000, 30 * 60, "shinkansen"),
+    (float("inf"), 500_000, 90 * 60, "flight"),
+)
+
 # gmaps キャッシュ。キーの departure_time は 30 分単位に丸めてヒット率を確保する。
 _GMAPS_CACHE: dict[tuple[float, float, float, float, str], tuple[float, str]] = {}
 _GMAPS_TIME_BUCKET_MINUTES = 30
@@ -1034,9 +1024,7 @@ def _estimate_travel_seconds_gmaps(
     client = _get_gmaps_client()
     if client is None:
         return None
-    if departure_time.tzinfo is None:
-        # naive は本スクリプトの他箇所と同じく JST とみなして aware に揃える
-        departure_time = departure_time.replace(tzinfo=JST)
+    departure_time = _as_jst_aware(departure_time)
     bucket_minute = (
         departure_time.minute // _GMAPS_TIME_BUCKET_MINUTES
     ) * _GMAPS_TIME_BUCKET_MINUTES
@@ -1092,22 +1080,15 @@ def _estimate_travel_seconds_haversine(
     """フォールバックの実装。Haversine と距離レンジ別平均速度で下限を推定する。
 
     Haversine 直線距離に `ROAD_DISTANCE_FACTOR` を掛けた値を実道路距離とみなし、
-    距離レンジで手段を自動選択して、手段固有の乗換・準備オーバーヘッドを加える。
+    `_TRAVEL_SPEED_BANDS` で手段を自動選択して、手段固有のオーバーヘッドを加える。
     """
     straight_m = _distance_m(lat1, lng1, lat2, lng2)
     road_m = straight_m * ROAD_DISTANCE_FACTOR
-
-    if road_m < 500:
-        seconds = road_m / (5000 / 3600)
-        return seconds, "walk"
-    if road_m < 30_000:
-        seconds = road_m / (40_000 / 3600) + 5 * 60
-        return seconds, "car/local"
-    if road_m < 500_000:
-        seconds = road_m / (200_000 / 3600) + 30 * 60
-        return seconds, "shinkansen"
-    seconds = road_m / (500_000 / 3600) + 90 * 60
-    return seconds, "flight"
+    for max_road_m, speed_m_per_h, overhead_sec, mode in _TRAVEL_SPEED_BANDS:
+        if road_m < max_road_m:
+            return road_m / (speed_m_per_h / 3600) + overhead_sec, mode
+    msg = f"道路距離 {road_m}m がどの速度バンドにも該当しない"
+    raise AssertionError(msg)
 
 
 def estimate_travel_seconds(
@@ -1216,9 +1197,7 @@ def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
         parsed = datetime.fromisoformat(iso)
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=JST)
-    return parsed.astimezone(JST)
+    return _as_jst_aware(parsed)
 
 
 # --- state 永続化 ---
@@ -1445,13 +1424,8 @@ def resume_context(
     raw = last.get("virtual_completed_at") if schema_ok else None
     resume_at: datetime | None = None
     if raw:
-        try:
-            parsed = datetime.fromisoformat(raw)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=JST)
-            resume_at = parsed.astimezone(JST)
-        except ValueError:
-            resume_at = None
+        with contextlib.suppress(ValueError):
+            resume_at = _as_jst_aware(datetime.fromisoformat(raw))
     completed = set(state.get("completed_spots") or [])
     # 非 strict (dry-run) はスキーマ検証を通らないため、手改変で数値以外が
     # 入っていても ValueError にせず None (resume 情報なし) に丸める。
