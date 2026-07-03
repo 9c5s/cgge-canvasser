@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 from typing import TYPE_CHECKING
 
 import pytest
@@ -107,6 +108,108 @@ class TestResolveProfiles:
         """--account の値も同じ命名規則で検証される。"""
         with pytest.raises(UserInputError):
             canvasser.resolve_profiles(tmp_path, "../escape")
+
+
+def _which_git(_cmd: str) -> str:
+    """shutil.which の差し替え。常に固定の git パスを返す。"""
+    return "/fake/git"
+
+
+def _which_none(_cmd: str) -> None:
+    """shutil.which の差し替え。git 不在を表す None を返す。"""
+    return
+
+
+class TestProfilesDirIsGitignored:
+    """_profiles_dir_is_gitignored の判定分岐。
+
+    Cookie 誤コミット防止の安全弁なので、git の exit code 解釈・git 不在時の
+    デフォルト拒否・パス正規化を subprocess をモックして固定する。
+    """
+
+    def _patch_git(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        returncode: int,
+        captured: dict[str, list[str]] | None = None,
+    ) -> None:
+        """git 実体の解決と check-ignore の exit code を差し替える。"""
+        monkeypatch.setattr(canvasser.shutil, "which", _which_git)
+
+        def fake_run(
+            cmd: list[str], **_kwargs: object
+        ) -> subprocess.CompletedProcess[bytes]:
+            if captured is not None:
+                captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, returncode)
+
+        monkeypatch.setattr(canvasser.subprocess, "run", fake_run)
+
+    def test_gitが見つからなければFalse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """git 不在では誤コミット経路を判定できないため拒否側に倒す。"""
+        monkeypatch.setattr(canvasser.shutil, "which", _which_none)
+
+        assert canvasser._profiles_dir_is_gitignored(tmp_path / "profiles") is False
+
+    @pytest.mark.parametrize(
+        "returncode, expected",
+        [
+            (0, True),
+            (1, False),
+            (128, False),
+        ],
+    )
+    def test_check_ignoreのexit_codeを解釈する(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        returncode: int,
+        expected: bool,
+    ) -> None:
+        """0=ignored のみ True、1=not ignored と 128=repo 外は False になる。"""
+        self._patch_git(monkeypatch, returncode)
+
+        assert canvasser._profiles_dir_is_gitignored(tmp_path / "profiles") is expected
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            FileNotFoundError("git 消失"),
+            subprocess.TimeoutExpired(cmd="git", timeout=10),
+            OSError("実行不能"),
+        ],
+    )
+    def test_subprocess例外はFalseに丸める(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception
+    ) -> None:
+        """check-ignore の実行自体が失敗しても例外にせず拒否側に倒す。"""
+        monkeypatch.setattr(canvasser.shutil, "which", _which_git)
+
+        def raise_exc(cmd: list[str], **_kwargs: object) -> object:
+            raise exc
+
+        monkeypatch.setattr(canvasser.subprocess, "run", raise_exc)
+
+        assert canvasser._profiles_dir_is_gitignored(tmp_path / "profiles") is False
+
+    def test_パス引数はスラッシュ区切りの末尾スラッシュ付きになる(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows パス区切りを正規化し、ディレクトリ限定パターンに合う形で渡す。"""
+        captured: dict[str, list[str]] = {}
+        self._patch_git(monkeypatch, 0, captured)
+
+        canvasser._profiles_dir_is_gitignored(tmp_path / "profiles")
+
+        cmd = captured["cmd"]
+        path_arg = cmd[-1]
+        assert cmd[1:3] == ["check-ignore", "--quiet"]
+        assert "--" in cmd
+        assert path_arg.endswith("/")
+        assert not path_arg.endswith("//")
+        assert "\\" not in path_arg
 
 
 def _thresholds(
