@@ -441,7 +441,46 @@ ECODE_OUT_OF_RANGE = "E5005"
 ECODES_ALREADY_DONE: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True, kw_only=True)
+# 座標の有効範囲。Spot / state のいずれの経路でも境界で範囲外を弾く。
+_LAT_MIN, _LAT_MAX = -90.0, 90.0
+_LNG_MIN, _LNG_MAX = -180.0, 180.0
+
+
+def _coerce_finite_float(v: object, *, name: str) -> float:
+    """渡された値を有限な float に強制する。
+
+    - `bool` は `int` の subclass だが数値扱いしない → `TypeError`
+    - `int` / `float` / 数値文字列は `float` に変換 (不能なら `TypeError`)
+    - `NaN` / `Infinity` は非有限値として `ValueError`
+
+    Python の `json` は既定で `NaN` / `Infinity` を float として読み書きする
+    (https://docs.python.org/3.14/library/json.html) ため、境界で潰さないと
+    座標の距離計算や JSON 書き出しが黙って壊れる。
+    """
+    if isinstance(v, bool):
+        msg = f"{name} が bool ({v}) で数値ではない"
+        raise TypeError(msg)
+    try:
+        f = float(cast("Any", v))
+    except (TypeError, ValueError) as e:
+        msg = f"{name} を float に変換できない: {v!r}"
+        raise TypeError(msg) from e
+    if not math.isfinite(f):
+        msg = f"{name} が非有限値: {f}"
+        raise ValueError(msg)
+    return f
+
+
+def _finite_float_or_none(v: object) -> float | None:
+    """有限な数値なら float に変換する。それ以外 (bool 含む) は None。"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int | float) and math.isfinite(v):
+        return float(v)
+    return None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Spot:
     """チェックインスポットの型付き値オブジェクト。
 
@@ -463,15 +502,33 @@ class Spot:
     def from_api(cls, raw: dict[str, Any]) -> Self:
         """API 応答の spot dict から正規化済みの Spot を構築する。
 
-        checkin_radius の欠落は UI 既定と同じ 500m に丸める。座標が数値へ
-        変換できない場合は ValueError が送出され、境界で早期に検知される。
+        checkin_radius の欠落は UI 既定と同じ 500m に丸める。座標や半径が
+        有限な数値でない・座標が地球の緯度経度範囲外・半径が非正の場合は
+        `ValueError` で境界検知する (走行ロジックが黙って壊れないため)。
         """
+        lat = _coerce_finite_float(raw["location_latitude"], name="location_latitude")
+        lng = _coerce_finite_float(raw["location_longitude"], name="location_longitude")
+        if not (_LAT_MIN <= lat <= _LAT_MAX):
+            msg = f"location_latitude が緯度の範囲外: {lat}"
+            raise ValueError(msg)
+        if not (_LNG_MIN <= lng <= _LNG_MAX):
+            msg = f"location_longitude が経度の範囲外: {lng}"
+            raise ValueError(msg)
+        raw_radius = raw.get("checkin_radius")
+        radius = (
+            _coerce_finite_float(raw_radius, name="checkin_radius")
+            if raw_radius
+            else 500.0
+        )
+        if radius <= 0:
+            msg = f"checkin_radius が正の値でない: {radius}"
+            raise ValueError(msg)
         return cls(
             slug=str(raw["slug"]),
             name=str(raw.get("name") or ""),
-            lat=float(raw["location_latitude"]),
-            lng=float(raw["location_longitude"]),
-            radius=float(raw.get("checkin_radius") or 500),
+            lat=lat,
+            lng=lng,
+            radius=radius,
             deadline=parse_checkin_deadline(raw),
             deadline_raw=raw.get("checkin_end_datetime"),
         )
@@ -622,6 +679,21 @@ def _initial_virtual_now(
     return virtual_now
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _TravelPlan:
+    """1 スポット分の移動計画。
+
+    実 sleep 前に deadline 判定へ渡せるよう、計算結果だけを保持する不変値。
+    `_apply_travel_plan` で消化するまで `virtual_now` は進めない。
+    """
+
+    wait_seconds: float
+    arrival: datetime
+    mode: str
+    straight_km: float
+    deferred_seconds: float
+
+
 @dataclass(kw_only=True)
 class _CheckinRunner:
     """チェックイン走行の可変状態と 1 スポットずつの手続きを束ねる。
@@ -653,9 +725,15 @@ class _CheckinRunner:
                     f"残り {remaining}件は次回以降。"
                 )
                 break
-            self._travel_to(spot)
-            if not self._within_deadline(spot):
+            # 移動 sleep を発生させる前に deadline を確定させる。期限切れや
+            # パース不能スポットへ何時間も実待機してから skip / fail-closed
+            # する事故を防ぐため、travel は「計画」と「消化」に分ける。
+            plan = self._plan_travel_to(spot)
+            planned_arrival = plan.arrival if plan is not None else self.virtual_now
+            if not self._within_deadline(spot, planned_arrival):
                 continue
+            if plan is not None:
+                self._apply_travel_plan(plan)
             self._attempt(spot, index)
         self._print_footer()
         return self.gained
@@ -677,10 +755,15 @@ class _CheckinRunner:
         self.prev_lat = spot.lat
         self.prev_lng = spot.lng
 
-    def _travel_to(self, spot: Spot) -> None:
-        """前スポットからの移動待機を計算し、必要なら sleep して仮想時刻を進める。"""
+    def _plan_travel_to(self, spot: Spot) -> _TravelPlan | None:
+        """前スポットからの移動計画を組み立てる。
+
+        sleep はせず `virtual_now` も進めない。first spot (prev がまだ無い)
+        なら None を返し、呼び出し側で「移動なし = 到着予定は現在時刻」として
+        deadline 判定へ渡す。
+        """
         if self.prev_lat is None or self.prev_lng is None:
-            return
+            return None
         secs, mode = estimate_travel_seconds(
             self.prev_lat,
             self.prev_lng,
@@ -701,22 +784,42 @@ class _CheckinRunner:
         straight_km = (
             _distance_m(self.prev_lat, self.prev_lng, spot.lat, spot.lng) / 1000
         )
-        deferred_seconds = wait_seconds - secs
+        return _TravelPlan(
+            wait_seconds=wait_seconds,
+            arrival=arrival,
+            mode=mode,
+            straight_km=straight_km,
+            deferred_seconds=wait_seconds - secs,
+        )
+
+    def _apply_travel_plan(self, plan: _TravelPlan) -> None:
+        """移動計画に沿って実 sleep して仮想時刻を進める。
+
+        deadline OK 判定を経て「この spot へ実際に行く」と決めてから呼ぶ。
+        execute=False (dry-run) では実 sleep せず、仮想時刻だけ進める。
+        """
         deferred_note = (
-            f", 翌朝発に押戻し +{humanize_duration(deferred_seconds)}"
-            if deferred_seconds > 60
+            f", 翌朝発に押戻し +{humanize_duration(plan.deferred_seconds)}"
+            if plan.deferred_seconds > 60
             else ""
         )
         print(
-            f"  移動待機: {humanize_duration(wait_seconds)} ({mode},"
-            f" 直線 {straight_km:.1f}km{deferred_note}) -> 到着 {arrival:%m/%d %H:%M}"
+            f"  移動待機: {humanize_duration(plan.wait_seconds)} ({plan.mode},"
+            f" 直線 {plan.straight_km:.1f}km{deferred_note})"
+            f" -> 到着 {plan.arrival:%m/%d %H:%M}"
         )
         if self.settings.execute:
-            self.settings.sleep_fn(wait_seconds)
-        self.virtual_now = arrival
+            self.settings.sleep_fn(plan.wait_seconds)
+        self.virtual_now = plan.arrival
 
-    def _within_deadline(self, spot: Spot) -> bool:
+    def _within_deadline(
+        self, spot: Spot, planned_arrival: datetime | None = None
+    ) -> bool:
         """個別スポット期限内かを判定する。skip 時は移動起点だけ現地点へ進める。
+
+        planned_arrival が渡されたら「到着予定時刻が期限を超えるか」も見る。
+        これで移動 sleep 前に skip / fail-closed を確定でき、期限切れスポットへ
+        長時間実待機してから skip する事故を避けられる。
 
         イベント全体期限とは別で、超過したものだけ skip して後続の有効スポットは
         処理を続ける。パース不能 (deadline=None) は execute では fail closed に
@@ -735,8 +838,19 @@ class _CheckinRunner:
             # skip でも到着はしたので、次スポットの travel 起点を現地点に更新する
             self._move_origin_to(spot)
             return False
-        if self.virtual_now > deadline:
-            print(f"  [{slug}] スポット期限 ({deadline:%m/%d %H:%M %Z}) 経過、skip。")
+        check_time = (
+            planned_arrival if planned_arrival is not None else self.virtual_now
+        )
+        if check_time > deadline:
+            if planned_arrival is not None and self.virtual_now <= deadline:
+                print(
+                    f"  [{slug}] 到着予定 {planned_arrival:%m/%d %H:%M}"
+                    f" が期限 ({deadline:%m/%d %H:%M %Z}) 超過、skip。"
+                )
+            else:
+                print(
+                    f"  [{slug}] スポット期限 ({deadline:%m/%d %H:%M %Z}) 経過、skip。"
+                )
             self._move_origin_to(spot)
             return False
         return True
@@ -1032,7 +1146,11 @@ def _directions_driving_fallback(
     if not result:
         return None
     leg = result[0]["legs"][0]
-    return float(leg["duration"]["value"]), "gmaps-driving"
+    # driving + 未来 departure_time + 経由地なしの前提を満たしているので、
+    # 提供されれば traffic 反映値の duration_in_traffic を優先する。
+    # https://developers.google.com/maps/documentation/directions/get-directions
+    duration_field = leg.get("duration_in_traffic") or leg["duration"]
+    return float(duration_field["value"]), "gmaps-driving"
 
 
 def _estimate_travel_seconds_gmaps(
@@ -1293,8 +1411,25 @@ def _validate_completed_spots(state: dict[str, Any], source: Path) -> None:
             raise StateFileCorruptedError(msg)
 
 
+def _matches_last_checkin_kind(v: object, kind: str) -> bool:
+    """last_checkin フィールドの期待型に v が合致するかを返す。
+
+    bool は int の subclass のため素の `isinstance(v, int)` を通ってしまう。
+    座標は `NaN` / `Infinity` を境界で潰したいので `math.isfinite` まで見る。
+    """
+    if kind == "int":
+        return not isinstance(v, bool) and isinstance(v, int)
+    if kind == "str":
+        return isinstance(v, str)
+    if kind == "finite_number":
+        return (
+            not isinstance(v, bool) and isinstance(v, int | float) and math.isfinite(v)
+        )
+    return False
+
+
 def _validate_last_checkin(state: dict[str, Any], source: Path) -> None:
-    """last_checkin の型・slug・時刻形式を検証する。"""
+    """last_checkin の型・slug・時刻形式・座標の有限性を検証する。"""
     last = state.get("last_checkin")
     if last is None:
         return
@@ -1302,19 +1437,19 @@ def _validate_last_checkin(state: dict[str, Any], source: Path) -> None:
         msg = f"{source}: last_checkin が dict でない"
         raise StateFileCorruptedError(msg)
     last_dict = cast("dict[str, Any]", last)
-    for k, typ in (
-        ("schema_version", int),
-        ("spot_slug", str),
-        ("spot_name", str),
-        ("location_latitude", (int, float)),
-        ("location_longitude", (int, float)),
-        ("virtual_completed_at", str),
+    for k, kind in (
+        ("schema_version", "int"),
+        ("spot_slug", "str"),
+        ("spot_name", "str"),
+        ("location_latitude", "finite_number"),
+        ("location_longitude", "finite_number"),
+        ("virtual_completed_at", "str"),
     ):
         v = last_dict.get(k)
         if v is None:
             continue  # 旧 schema 互換のため部分 dict は許容する
-        if not isinstance(v, typ):
-            msg = f"{source}: last_checkin.{k} の型が不正 (期待 {typ})"
+        if not _matches_last_checkin_kind(v, kind):
+            msg = f"{source}: last_checkin.{k} の型が不正 ({kind} 期待): {v!r}"
             raise StateFileCorruptedError(msg)
     slug = last_dict.get("spot_slug")
     if isinstance(slug, str) and not _SPOT_SLUG_RE.fullmatch(slug):
@@ -1343,6 +1478,17 @@ def _validate_state_schema(state: dict[str, Any], source: Path) -> None:
     _validate_last_checkin(state, source)
 
 
+def _reject_json_constant(name: str) -> float:
+    """JSON の `-Infinity` / `Infinity` / `NaN` を拒否する `parse_constant`。
+
+    Python の `json` は既定でこの 3 定数を float に変換する
+    (https://docs.python.org/3.14/library/json.html) が、座標として意味を
+    成さないため境界で `ValueError` に落として保存側と併せて閉じる。
+    """
+    msg = f"JSON に非有限値 {name} が含まれる"
+    raise ValueError(msg)
+
+
 def load_account_state(profile_dir: Path, *, strict: bool = False) -> dict[str, Any]:
     """`profile_dir/canvasser_state.json` を読み込む。
 
@@ -1354,8 +1500,11 @@ def load_account_state(profile_dir: Path, *, strict: bool = False) -> dict[str, 
     if not state_file.exists():
         return {}
     try:
-        data = json.loads(state_file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
+        data = json.loads(
+            state_file.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, OSError, ValueError) as e:
         if strict:
             msg = f"{state_file}: {e}"
             raise StateFileCorruptedError(msg) from e
@@ -1384,7 +1533,9 @@ def save_account_state(profile_dir: Path, state: dict[str, Any]) -> None:
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+            # allow_nan=False で NaN/Infinity の書き出しを ValueError にする
+            # (JSON 標準外の拡張出力を state に載せない)
+            json.dump(state, f, ensure_ascii=False, indent=2, allow_nan=False)
             f.flush()
             os.fsync(f.fileno())
         Path(tmp_path).replace(state_file)
@@ -1405,9 +1556,10 @@ def update_checkin_state(
     """1 件チェックイン成功時に state を更新する。
 
     `mark_completed=True` の場合、`spot.slug` を `completed_spots` へ追加して
-    次回起動時の事前 skip 対象にする。
+    次回起動時の事前 skip 対象にする。実行中の破損 state を空 dict で上書き
+    してしまわないよう、読み込みは strict にする (execute 経路からのみ呼ばれる)。
     """
-    state = load_account_state(profile_dir)
+    state = load_account_state(profile_dir, strict=True)
     state["last_checkin"] = {
         "schema_version": LAST_CHECKIN_SCHEMA_VERSION,
         "spot_slug": spot.slug,
@@ -1449,11 +1601,11 @@ def resume_context(
         with contextlib.suppress(ValueError):
             resume_at = _as_jst_aware(datetime.fromisoformat(raw))
     completed = set(state.get("completed_spots") or [])
-    # 非 strict (dry-run) はスキーマ検証を通らないため、手改変で数値以外が
-    # 入っていても ValueError にせず None (resume 情報なし) に丸める。
+    # 非 strict (dry-run) はスキーマ検証を通らないため、手改変で数値以外や
+    # NaN/Infinity が入っていても ValueError にせず None (resume 情報なし) に丸める。
     return (
-        float(lat) if isinstance(lat, int | float) else None,
-        float(lng) if isinstance(lng, int | float) else None,
+        _finite_float_or_none(lat),
+        _finite_float_or_none(lng),
         resume_at,
         completed,
     )

@@ -134,6 +134,48 @@ class TestSpotFromApi:
         assert spot.deadline is None
         assert spot.deadline_raw == "31/07/2026"
 
+    def test_NaNの緯度は境界で拒否する(self) -> None:
+        """JSON 由来の NaN 座標は距離計算を壊すため境界で ValueError。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["location_latitude"] = float("nan")
+
+        with pytest.raises(ValueError, match="非有限値"):
+            canvasser.Spot.from_api(raw)
+
+    def test_Infinityの経度は境界で拒否する(self) -> None:
+        """Infinity 座標も距離計算を壊すため境界で ValueError。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["location_longitude"] = float("inf")
+
+        with pytest.raises(ValueError, match="非有限値"):
+            canvasser.Spot.from_api(raw)
+
+    def test_bool座標は数値扱いしない(self) -> None:
+        """bool は int の subclass だが座標としては通さない (TypeError)。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["location_latitude"] = True
+
+        with pytest.raises(TypeError, match="数値ではない"):
+            canvasser.Spot.from_api(raw)
+
+    def test_緯度の範囲外は拒否する(self) -> None:
+        """地球の緯度範囲 [-90, 90] を超える値は境界で ValueError。"""
+        with pytest.raises(ValueError, match="緯度の範囲外"):
+            canvasser.Spot.from_api(_spot(1, 91.0, 135.0))
+
+    def test_経度の範囲外は拒否する(self) -> None:
+        """地球の経度範囲 [-180, 180] を超える値は境界で ValueError。"""
+        with pytest.raises(ValueError, match="経度の範囲外"):
+            canvasser.Spot.from_api(_spot(1, 35.0, 181.0))
+
+    def test_非正のradiusは拒否する(self) -> None:
+        """radius が 0 以下は「巡回範囲なし」となり spot として不整合。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_radius"] = -1
+
+        with pytest.raises(ValueError, match="正の値でない"):
+            canvasser.Spot.from_api(raw)
+
 
 class TestFetchCheckinSpots:
     """_fetch_checkin_spots の応答ハンドリング。"""
@@ -271,6 +313,57 @@ class TestWithinDeadline:
             runner._within_deadline(spot)
 
         assert ei.value.partial_gained == 30
+
+    def test_到着予定が期限超過なら移動前にskip(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """virtual_now が期限内でも、planned_arrival が期限超過なら skip する。"""
+        runner = _runner()
+        # virtual_now=10:00 (fixture)、deadline=10:30、planned_arrival=12:00
+        spot = _typed(1, 35.0, 135.0, deadline="2026-07-03 10:30:00")
+        planned = datetime(2026, 7, 3, 12, 0, tzinfo=JST)
+
+        assert runner._within_deadline(spot, planned) is False
+        assert (runner.prev_lat, runner.prev_lng) == (35.0, 135.0)
+        assert "到着予定" in capsys.readouterr().out
+
+    def test_到着予定が期限内なら継続(self) -> None:
+        """planned_arrival が期限内なら継続 (skip しない)。"""
+        runner = _runner()
+        spot = _typed(1, 35.0, 135.0, deadline="2026-07-03 12:00:00")
+        planned = datetime(2026, 7, 3, 11, 30, tzinfo=JST)
+
+        assert runner._within_deadline(spot, planned) is True
+
+    def test_planned_arrival省略時は従来のvirtual_now判定(self) -> None:
+        """planned_arrival=None なら virtual_now vs deadline の従来判定に戻る。"""
+        runner = _runner()
+        # virtual_now=10:00、deadline=10:30 -> planned 省略なら period 内で True
+        spot = _typed(1, 35.0, 135.0, deadline="2026-07-03 10:30:00")
+
+        assert runner._within_deadline(spot) is True
+
+
+class TestPlanTravelTo:
+    """_plan_travel_to の計算専用性: sleep も virtual_now 進行も起こさない。"""
+
+    def test_first_spotではNoneを返す(self) -> None:
+        """prev がまだ無い最初のスポットへは移動計画が立たない。"""
+        runner = _runner()
+
+        assert runner._plan_travel_to(_typed(1, 35.0, 135.0)) is None
+
+    def test_planは仮想時刻を進めない(self) -> None:
+        """計画時点では sleep も virtual_now 進行も起こさない (実行は apply 側)。"""
+        runner = _runner()
+        runner.prev_lat, runner.prev_lng = 35.0, 135.0
+        before = runner.virtual_now
+
+        plan = runner._plan_travel_to(_typed(2, 35.01, 135.0))
+
+        assert plan is not None
+        assert plan.arrival > before  # 到着時刻は先だが
+        assert runner.virtual_now == before  # 実際の時刻は進んでいない
 
 
 class TestOutOfRangeHandling:
@@ -494,3 +587,82 @@ class TestCollectCheckinsExecute:
         # 成功済み 1 件分の state は中断後も残っている
         state = canvasser.load_account_state(tmp_path)
         assert len(state["completed_spots"]) == 1
+
+    def _prime_resume_at(self, profile_dir: Path, lat: float) -> None:
+        """既知位置 (lat, 135.0) を起点にする state を書き込む。
+
+        collect_checkins は state が無ければ開始スポットを乱択するため、
+        起点固定のテストでは前回位置を state に流し込んでおく。
+        """
+        canvasser.save_account_state(
+            profile_dir,
+            {
+                "last_checkin": {
+                    "schema_version": 2,
+                    "spot_slug": "cg_vote2026_0",
+                    "spot_name": "prev",
+                    "location_latitude": lat,
+                    "location_longitude": 135.0,
+                    "virtual_completed_at": "2026-07-03T09:59:00+09:00",
+                },
+            },
+        )
+
+    def test_期限切れスポットへの移動sleepは発生しない(self, tmp_path: Path) -> None:
+        """期限切れスポットは移動 sleep 前に skip する (実待機を無駄にしない)。
+
+        起点 (34.99) → 1件目 (35.00, 期限内) → 2件目 (35.01, 期限切れ)
+        → 3件目 (35.02, 期限内)。修正前は 1→2 の移動 sleep が発生してから
+        skip していた。修正後は 1→2 の deadline check が sleep より先に走る
+        ため、この移動 sleep は発生しない。
+        """
+        self._prime_resume_at(tmp_path, 34.99)
+        random.seed(0)
+        sleeps: list[float] = []
+        spots = [
+            _spot(1, 35.00, 135.0, deadline="2026-12-31 23:59:59"),
+            _spot(2, 35.01, 135.0, deadline="2026-01-01 00:00:00"),
+            _spot(3, 35.02, 135.0, deadline="2026-12-31 23:59:59"),
+        ]
+        fake = FakePage([_listing(spots), _POST_OK, _POST_OK])
+
+        gained = canvasser.collect_checkins(
+            _as_page(fake),
+            _settings(execute=True, profile_dir=tmp_path, sleep_fn=sleeps.append),
+        )
+
+        # 期限切れ 1 件を skip、2 件成功で 20 票
+        assert gained == 20
+        # sleeps 構成: 起点→1 移動 / 1 滞在 / 2 (skip)→3 移動 の 3 件。
+        # 修正前は 1→2 の移動 sleep も入り 4 件になっていた。
+        assert len(sleeps) == 3
+        assert all(s > 0 for s in sleeps)
+
+    def test_deadlineパース不能はexecuteで移動sleep前にfail_closed(
+        self, tmp_path: Path
+    ) -> None:
+        """deadline パース不能は fail_closed の前に移動 sleep を走らせない。
+
+        起点 (34.99) → 1件目 (35.00, 成功) → 2件目 (35.01, パース不能) で
+        fail_closed。修正前は 1→2 の移動 sleep が発生してから fail_closed
+        だった。修正後は deadline check が sleep より先で、この移動は起きない。
+        """
+        self._prime_resume_at(tmp_path, 34.99)
+        random.seed(0)
+        sleeps: list[float] = []
+        spots = [
+            _spot(1, 35.00, 135.0, deadline="2026-12-31 23:59:59"),
+            _spot(2, 35.01, 135.0, deadline="invalid-date"),
+        ]
+        fake = FakePage([_listing(spots), _POST_OK])
+
+        with pytest.raises(FailClosedError, match="パースできません") as ei:
+            canvasser.collect_checkins(
+                _as_page(fake),
+                _settings(execute=True, profile_dir=tmp_path, sleep_fn=sleeps.append),
+            )
+
+        assert ei.value.partial_gained == 10
+        # sleeps: 起点→1 移動 / 1 滞在 の 2 件。1→2 の移動 sleep は発生しない
+        # (もし発生していれば 3 件目のエントリになる)。
+        assert len(sleeps) == 2
