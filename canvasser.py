@@ -14,15 +14,14 @@ Playwright の persistent context でブラウザセッションを保持し、�
 内部 API をそのまま呼び出してミッション回収とチェックインを自動化する。
 複数アカウントは ./profiles/{account}/ 配下に分けて運用する。
 
-  uv run canvasser.py login --account main                   # 初回ログイン
-  uv run canvasser.py run                                    # ミッションのみドライラン
-  uv run canvasser.py run --execute                          # ミッションのみ本番
-  uv run canvasser.py run --tasks mission,checkin            # 両方ドライラン
-  uv run canvasser.py run --tasks mission,checkin --execute  # 両方本番
+  uv run canvasser.py login --account main         # 初回ログイン
+  uv run canvasser.py mission                      # ミッション ドライラン
+  uv run canvasser.py mission --execute            # ミッション本番
+  uv run canvasser.py checkin --execute            # チェックイン本番
   uv run canvasser.py mark-completed --account main cg_vote2026_17  # 手動完了登録
 
-`--execute` は `--tasks` で選択したタスクにのみ適用される。未指定なら GET のみの
-ドライランとなり、POST/PUT は一切送らない。
+mission と checkin は独立したサブコマンドで、同時実行はしない。`--execute`
+未指定なら GET のみのドライランとなり、POST/PUT は一切送らない。
 """
 
 # print はこの CLI の仕様そのもの (標準出力が UI) のため、T201 はファイル全体で
@@ -1529,7 +1528,8 @@ def run_login_flow(
         with contextlib.suppress(PlaywrightError):
             if check_login(page):
                 print(
-                    "ログイン状態を確認しました。次回から run で実行できます。",
+                    "ログイン状態を確認しました。次回から mission / checkin を"
+                    "実行できます。",
                     file=sys.stderr,
                 )
                 return 0
@@ -1670,15 +1670,15 @@ def open_persistent_context(
 class RunOptions:
     """CLI 引数から組み立てる 1 実行分の動作設定。
 
-    デフォルトは「何も実行しない完全ドライラン」で、login サブコマンドは
-    `login_mode=True` のみを立てて使う。
+    mission と checkin は排他のサブコマンドなので、`run_mission` と `run_checkin`
+    が同時に True になることはない。デフォルトは「何も実行しない完全ドライラン」で、
+    login サブコマンドは `login_mode=True` のみを立てて使う。
     """
 
     login_mode: bool = False
     run_mission: bool = False
     run_checkin: bool = False
-    execute_mission: bool = False
-    execute_checkin: bool = False
+    execute: bool = False
     daily_budget: int = 0
     consecutive_failure_limit: int = 1
     out_of_range_limit: int = 3
@@ -1692,8 +1692,8 @@ def process_account(
 ) -> tuple[int, int]:
     """1 アカウント分の処理を行う。戻り値は `(獲得票数, exit_code)`。
 
-    `execute_mission` と `execute_checkin` はそれぞれ独立した実 POST ゲートで、
-    両方 False なら完全ドライラン (GET のみで POST/PUT は送らない)。
+    `execute` は実 POST ゲートで、False なら完全ドライラン (GET のみで
+    POST/PUT は送らない)。
     未ログイン検知時は exit_code=1 を返し、呼び出し側で他アカウントへ進む。
     """
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -1717,14 +1717,14 @@ def process_account(
         exit_code = 0
         if options.run_mission:
             # dry-run の見込み枚数は集計に混ぜず、アカウント総計を汚さない
-            mission_gain = collect_missions(page, execute=options.execute_mission)
-            if options.execute_mission:
+            mission_gain = collect_missions(page, execute=options.execute)
+            if options.execute:
                 gained += mission_gain
         if options.run_checkin:
             # Referer を合わせるためチェックインページに一度 navigate しておく
             page.goto(CHECKIN_PAGE_URL, wait_until="domcontentloaded")
             settings = CheckinSettings(
-                execute=options.execute_checkin,
+                execute=options.execute,
                 daily_budget=options.daily_budget,
                 consecutive_failure_limit=options.consecutive_failure_limit,
                 out_of_range_limit=options.out_of_range_limit,
@@ -1732,13 +1732,13 @@ def process_account(
             )
             try:
                 checkin_gain = collect_checkins(page, settings)
-                if options.execute_checkin:
+                if options.execute:
                     gained += checkin_gain
             except FailClosedError as e:
                 # fail-closed 前に成功していた POST の reward は
                 # e.partial_gained に入っているので、集計から落とさないよう合流させる。
                 print(f"[{name}] fail closed: {e}", file=sys.stderr)
-                if options.execute_checkin:
+                if options.execute:
                     gained += e.partial_gained
                 exit_code = 1
         return gained, exit_code
@@ -1760,26 +1760,12 @@ def main() -> int:
         return 1
 
 
-_TASK_CHOICES = ("mission", "checkin")
-
-
-def _parse_tasks(value: str) -> tuple[str, ...]:
-    """--tasks のカンマ区切り値を検証し、初出順の重複なし tuple へ正規化する。"""
-    items = [t.strip() for t in value.split(",") if t.strip()]
-    if not items:
-        msg = f"タスクを 1 つ以上指定してください ({' / '.join(_TASK_CHOICES)})"
-        raise argparse.ArgumentTypeError(msg)
-    invalid = [t for t in items if t not in _TASK_CHOICES]
-    if invalid:
-        msg = f"不明なタスク: {', '.join(invalid)} ({' / '.join(_TASK_CHOICES)} のみ)"
-        raise argparse.ArgumentTypeError(msg)
-    return tuple(dict.fromkeys(items))
-
-
 def _build_parser() -> argparse.ArgumentParser:
-    """CLI 引数パーサを構築する。login / run / mark-completed の 3 サブコマンド。
+    """CLI 引数パーサを構築する。
 
-    サブコマンドで必須引数を構造的に表現し、フラグの組み合わせ検証を不要にする。
+    login / mission / checkin / mark-completed の 4 サブコマンド。サブコマンドで
+    必須引数と排他 (mission と checkin は同時実行しない) を構造的に表現し、
+    フラグの組み合わせ検証を不要にする。
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -1796,7 +1782,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="複数アカウントの親ディレクトリ (デフォルト: ./profiles)",
     )
 
-    # ブラウザを起動するサブコマンド (login / run) 共通の親パーサ
+    # ブラウザを起動するサブコマンド (login / mission / checkin) 共通の親パーサ
     browser = argparse.ArgumentParser(add_help=False)
     browser.add_argument(
         "--allow-unignored-profiles-dir",
@@ -1804,6 +1790,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="--profiles-dir が git ignore 対象でない場合の警告を無視する。"
         "デフォルトはモードに関係なく未 ignore の profiles-dir を拒否する "
         "(Cookie 誤コミット防止)。",
+    )
+
+    # ミッション・チェックイン実行系サブコマンド共通の親パーサ
+    collect = argparse.ArgumentParser(add_help=False)
+    collect.add_argument(
+        "--account",
+        help="対象アカウント名。未指定なら profiles-dir 内のすべてのアカウントを"
+        "順次処理する",
+    )
+    collect.add_argument(
+        "--execute",
+        action="store_true",
+        help="実 POST/PUT を送る。未指定は GET のみのドライラン (state 更新や "
+        "checkin の滞在 sleep も行わない)。",
     )
 
     login = subparsers.add_parser(
@@ -1817,41 +1817,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="対象アカウント名。profiles-dir 配下のサブディレクトリ名として扱う",
     )
 
-    run = subparsers.add_parser(
-        "run",
-        parents=[common, browser],
-        help="ミッション・チェックインを処理する (デフォルトはドライラン)",
+    subparsers.add_parser(
+        "mission",
+        parents=[common, browser, collect],
+        help="ミッションを回収する (デフォルトはドライラン)",
     )
-    run.add_argument(
-        "--account",
-        help="対象アカウント名。未指定なら profiles-dir 内のすべてのアカウントを"
-        "順次処理する",
+
+    checkin = subparsers.add_parser(
+        "checkin",
+        parents=[common, browser, collect],
+        help="チェックインを処理する (デフォルトはドライラン)",
     )
-    run.add_argument(
-        "--tasks",
-        type=_parse_tasks,
-        default=("mission",),
-        metavar="TASK1,TASK2",
-        help=f"処理するタスクのカンマ区切り ({' / '.join(_TASK_CHOICES)}。"
-        "デフォルト: mission)",
-    )
-    run.add_argument(
-        "--execute",
-        action="store_true",
-        help="選択したタスクを実 POST/PUT する。未指定は GET のみのドライラン "
-        "(チェックインの sleep も skip)。",
-    )
-    run.add_argument(
+    checkin.add_argument(
         "--daily-budget",
         type=int,
         default=0,
-        help="1 回の実行あたりのチェックイン実 POST 試行回数の上限 "
+        help="1 回の実行あたりの実 POST 試行回数の上限 "
         "(デフォルト: 0 = 無制限)。未観測 ecode・失敗・成功のいずれも"
         " 1 リクエスト = 1 消費。"
         "時間帯制約 (深夜移動不可) で自然に上限がかかるため、通常は指定不要。"
         "緊急停止したいときにだけ小さな値を指定する。",
     )
-    run.add_argument(
+    checkin.add_argument(
         "--consecutive-failure-limit",
         type=int,
         default=1,
@@ -1860,7 +1847,7 @@ def _build_parser() -> argparse.ArgumentParser:
             " (デフォルト: 1 = 1 件目で即停止)。"
         ),
     )
-    run.add_argument(
+    checkin.add_argument(
         "--out-of-range-limit",
         type=int,
         default=3,
@@ -1910,18 +1897,16 @@ def _validate_thresholds(args: argparse.Namespace) -> None:
 def _build_run_options(args: argparse.Namespace) -> RunOptions:
     """パース済み引数から RunOptions を組み立てる。
 
-    `--execute` は `--tasks` で選択したタスクにのみ適用し、選択外タスクの
-    実行ゲートは開かない。
+    サブコマンドがそのまま動作モードになる。チェックイン用の安全弁は
+    checkin サブコマンドにしか存在しないため、mission では既定値のままにする。
     """
     if args.command == "login":
         return RunOptions(login_mode=True)
-    run_mission = "mission" in args.tasks
-    run_checkin = "checkin" in args.tasks
+    if args.command == "mission":
+        return RunOptions(run_mission=True, execute=args.execute)
     return RunOptions(
-        run_mission=run_mission,
-        run_checkin=run_checkin,
-        execute_mission=args.execute and run_mission,
-        execute_checkin=args.execute and run_checkin,
+        run_checkin=True,
+        execute=args.execute,
         daily_budget=args.daily_budget,
         consecutive_failure_limit=args.consecutive_failure_limit,
         out_of_range_limit=args.out_of_range_limit,
@@ -1985,7 +1970,7 @@ def _main_impl() -> int:
         return _run_mark_completed(args, profiles_dir)
 
     login_mode = args.command == "login"
-    if not login_mode:
+    if args.command == "checkin":
         _validate_thresholds(args)
 
     profiles = resolve_profiles(profiles_dir, args.account)
