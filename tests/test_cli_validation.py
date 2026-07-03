@@ -215,13 +215,13 @@ class TestProfilesDirIsGitignored:
 def _thresholds(
     daily_budget: int = 0,
     consecutive_failure_limit: int = 1,
-    max_out_of_range: int = 3,
+    out_of_range_limit: int = 3,
 ) -> argparse.Namespace:
     """_validate_thresholds 用の Namespace を組み立てる。"""
     return argparse.Namespace(
         daily_budget=daily_budget,
         consecutive_failure_limit=consecutive_failure_limit,
-        max_out_of_range=max_out_of_range,
+        out_of_range_limit=out_of_range_limit,
     )
 
 
@@ -237,7 +237,7 @@ class TestValidateThresholds:
         [
             ({"daily_budget": -1}, "--daily-budget"),
             ({"consecutive_failure_limit": 0}, "--consecutive-failure-limit"),
-            ({"max_out_of_range": 0}, "--max-out-of-range"),
+            ({"out_of_range_limit": 0}, "--out-of-range-limit"),
         ],
     )
     def test_下限未満はUserInputError(
@@ -248,71 +248,175 @@ class TestValidateThresholds:
             canvasser._validate_thresholds(_thresholds(**kwargs))
 
 
-def _mode_flags(
-    *,
-    login: bool = False,
-    account: str | None = None,
-    no_mission: bool = False,
-    checkin: bool = False,
-    execute_mission: bool = False,
-    execute_checkin: bool = False,
-) -> argparse.Namespace:
-    """_validate_mode_flags 用の Namespace を組み立てる。"""
-    return argparse.Namespace(
-        login=login,
-        account=account,
-        no_mission=no_mission,
-        checkin=checkin,
-        execute_mission=execute_mission,
-        execute_checkin=execute_checkin,
-    )
+class TestParseTasks:
+    """_parse_tasks の値検証と正規化。"""
 
+    def test_単一タスクはそのまま通る(self) -> None:
+        """mission 単独指定は 1 要素 tuple になる。"""
+        assert canvasser._parse_tasks("mission") == ("mission",)
 
-class TestValidateModeFlags:
-    """_validate_mode_flags の組み合わせチェック。"""
+    def test_空白と重複を正規化する(self) -> None:
+        """前後空白は除去し、重複は初出順で 1 つに畳む。"""
+        got = canvasser._parse_tasks(" mission , checkin ,mission")
 
-    def test_既定の組み合わせは通る(self) -> None:
-        """フラグ未指定 (完全ドライラン) は検証を通過する。"""
-        canvasser._validate_mode_flags(_mode_flags())
+        assert got == ("mission", "checkin")
 
-    def test_本番フルセットも通る(self) -> None:
-        """--checkin --execute-mission --execute-checkin は妥当な組み合わせ。"""
-        canvasser._validate_mode_flags(
-            _mode_flags(checkin=True, execute_mission=True, execute_checkin=True)
-        )
-
-    @pytest.mark.parametrize(
-        "flags, message",
-        [
-            (_mode_flags(login=True), "--login"),
-            (_mode_flags(no_mission=True), "--no-mission"),
-            (
-                _mode_flags(no_mission=True, checkin=True, execute_mission=True),
-                "--execute-mission",
-            ),
-            (_mode_flags(execute_checkin=True), "--execute-checkin"),
-        ],
-    )
-    def test_不整合な組み合わせはUserInputError(
-        self, flags: argparse.Namespace, message: str
-    ) -> None:
-        """単独指定できないゲート系フラグは対象フラグ名入りで拒否する。"""
-        with pytest.raises(UserInputError, match=message):
-            canvasser._validate_mode_flags(flags)
+    @pytest.mark.parametrize("value", ["", " , ", "misson", "mission,unknown"])
+    def test_不正値はArgumentTypeError(self, value: str) -> None:
+        """空指定と未知タスク名は argparse のエラーとして拒否する。"""
+        with pytest.raises(argparse.ArgumentTypeError):
+            canvasser._parse_tasks(value)
 
 
 class TestBuildParser:
-    """_build_parser の既定値。"""
+    """_build_parser のサブコマンド構成。"""
 
-    def test_引数なしの既定値は完全ドライラン(self) -> None:
-        """フラグ未指定では実 POST ゲートがすべて閉じている。"""
-        args = canvasser._build_parser().parse_args([])
+    def test_runの既定値は完全ドライラン(self) -> None:
+        """run 単独では mission のみ選択され、実 POST ゲートが閉じている。"""
+        args = canvasser._build_parser().parse_args(["run"])
 
-        assert args.login is False
-        assert args.checkin is False
-        assert args.execute_mission is False
-        assert args.execute_checkin is False
+        assert args.command == "run"
+        assert args.account is None
+        assert args.tasks == ("mission",)
+        assert args.execute is False
         assert args.daily_budget == 0
         assert args.consecutive_failure_limit == 1
-        assert args.max_out_of_range == 3
+        assert args.out_of_range_limit == 3
         assert args.profiles_dir == "./profiles"
+
+    def test_runのtasksとexecuteを指定できる(self) -> None:
+        """--tasks のカンマ区切りと --execute が反映される。"""
+        args = canvasser._build_parser().parse_args([
+            "run",
+            "--tasks",
+            "mission,checkin",
+            "--execute",
+        ])
+
+        assert args.tasks == ("mission", "checkin")
+        assert args.execute is True
+
+    def test_不正なtasksはSystemExit(self) -> None:
+        """未知タスク名は argparse が usage エラーで終了する。"""
+        with pytest.raises(SystemExit):
+            canvasser._build_parser().parse_args(["run", "--tasks", "unknown"])
+
+    def test_loginはaccount必須(self) -> None:
+        """login サブコマンドは --account なしでは通らない。"""
+        with pytest.raises(SystemExit):
+            canvasser._build_parser().parse_args(["login"])
+
+    def test_loginコマンドを解釈する(self) -> None:
+        """login --account NAME で command と account が入る。"""
+        args = canvasser._build_parser().parse_args(["login", "--account", "main"])
+
+        assert args.command == "login"
+        assert args.account == "main"
+
+    def test_mark_completedはslug位置引数を受け取る(self) -> None:
+        """slug は複数の位置引数として受け取る (カンマ区切りではない)。"""
+        args = canvasser._build_parser().parse_args([
+            "mark-completed",
+            "--account",
+            "syota",
+            "cg_vote2026_17",
+            "cg_vote2026_19",
+        ])
+
+        assert args.command == "mark-completed"
+        assert args.slugs == ["cg_vote2026_17", "cg_vote2026_19"]
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["mark-completed", "cg_vote2026_17"],
+            ["mark-completed", "--account", "syota"],
+        ],
+    )
+    def test_mark_completedはaccountとslugが必須(self, argv: list[str]) -> None:
+        """--account と slug のどちらが欠けても usage エラーになる。"""
+        with pytest.raises(SystemExit):
+            canvasser._build_parser().parse_args(argv)
+
+    def test_サブコマンド無しはSystemExit(self) -> None:
+        """サブコマンド必須のため引数なしは usage エラーになる。"""
+        with pytest.raises(SystemExit):
+            canvasser._build_parser().parse_args([])
+
+
+class TestBuildRunOptions:
+    """_build_run_options の RunOptions への写像。"""
+
+    def test_loginコマンドはlogin_modeのみ有効(self) -> None:
+        """login ではタスクと実行ゲートがすべて閉じる。"""
+        args = canvasser._build_parser().parse_args(["login", "--account", "main"])
+
+        options = canvasser._build_run_options(args)
+
+        assert options.login_mode is True
+        assert options.run_mission is False
+        assert options.run_checkin is False
+        assert options.execute_mission is False
+        assert options.execute_checkin is False
+
+    def test_run既定はmissionのみドライラン(self) -> None:
+        """run 単独では mission のみ選択され、ゲートは閉じたまま。"""
+        args = canvasser._build_parser().parse_args(["run"])
+
+        options = canvasser._build_run_options(args)
+
+        assert options.login_mode is False
+        assert options.run_mission is True
+        assert options.run_checkin is False
+        assert options.execute_mission is False
+        assert options.execute_checkin is False
+
+    def test_executeは選択タスクのゲートだけ開く(self) -> None:
+        """--tasks checkin --execute では mission 側のゲートは閉じたまま。"""
+        args = canvasser._build_parser().parse_args([
+            "run",
+            "--tasks",
+            "checkin",
+            "--execute",
+        ])
+
+        options = canvasser._build_run_options(args)
+
+        assert options.run_mission is False
+        assert options.run_checkin is True
+        assert options.execute_mission is False
+        assert options.execute_checkin is True
+
+    def test_全タスクexecuteで両ゲートが開く(self) -> None:
+        """--tasks mission,checkin --execute は両方本番になる。"""
+        args = canvasser._build_parser().parse_args([
+            "run",
+            "--tasks",
+            "mission,checkin",
+            "--execute",
+        ])
+
+        options = canvasser._build_run_options(args)
+
+        assert options.run_mission is True
+        assert options.run_checkin is True
+        assert options.execute_mission is True
+        assert options.execute_checkin is True
+
+    def test_閾値が引き継がれる(self) -> None:
+        """run の安全弁引数が RunOptions へそのまま渡る。"""
+        args = canvasser._build_parser().parse_args([
+            "run",
+            "--daily-budget",
+            "3",
+            "--consecutive-failure-limit",
+            "2",
+            "--out-of-range-limit",
+            "5",
+        ])
+
+        options = canvasser._build_run_options(args)
+
+        assert options.daily_budget == 3
+        assert options.consecutive_failure_limit == 2
+        assert options.out_of_range_limit == 5
