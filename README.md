@@ -39,7 +39,7 @@ uv run canvasser.py login --account sub
 ### 日次実行 (ミッション回収、全アカウント)
 
 ```powershell
-uv run canvasser.py run --execute
+uv run canvasser.py mission --execute
 ```
 
 `./profiles/` 配下の全アカウントを順次処理する。ミッション回収 (ログインボーナス、動画視聴、公式 X フォロー、達成回数など) を実行する。
@@ -49,33 +49,27 @@ uv run canvasser.py run --execute
 ### 特定アカウントのみ実行
 
 ```powershell
-uv run canvasser.py run --account main
+uv run canvasser.py mission --account main
 ```
 
-### ドライランで動作確認 (POST/PUT は一切送らない)
+### チェックイン
+
+mission と checkin は独立したサブコマンドで、同時実行はしない。
 
 ```powershell
-uv run canvasser.py run --tasks mission,checkin
+uv run canvasser.py checkin            # ドライラン (POST は送らない)
+uv run canvasser.py checkin --execute  # 本番
 ```
 
-`--execute` を付けなかった場合は完全ドライランとして扱う (GET のみ、POST/PUT は送らず、sleep も skip)。ペイロード生成、経路シミュレーション、state を触らないダミーループだけを回す。
-
-### 処理タスクの選択
-
-- `--tasks mission,checkin`：処理するタスクをカンマ区切りで選択する (デフォルト: `mission`)。
-- `--execute`：選択したタスクを実 POST/PUT する。`--tasks` で選択していないタスクには適用されない。
-
-```powershell
-uv run canvasser.py run --execute                          # ミッションのみ本番
-uv run canvasser.py run --tasks mission,checkin --execute  # 両方本番
-uv run canvasser.py run --tasks checkin --execute          # チェックインのみ本番
-```
+`--execute` を付けなかった場合は完全ドライランとして扱う (GET のみ、POST は送らず、sleep も skip)。ペイロード生成、経路シミュレーション、state を触らないダミーループだけを回す。
 
 ### 慎重に少数件から試す
 
 ```powershell
-uv run canvasser.py run --account main --tasks checkin --execute --daily-budget 3
+uv run canvasser.py checkin --account main --execute --daily-budget 3
 ```
+
+チェックイン専用の安全弁 (checkin サブコマンドのみ):
 
 - `--daily-budget N`：1 回の実行あたり N 件の実 POST 試行で終了する (未指定なら無制限)。成功件数ではなく試行回数を数えるので、既達成・範囲外・未観測 ecode も 1 件消費する。
 - `--consecutive-failure-limit N`：未観測 ecode が連続 N 件で全体を中断する (デフォルト 1 = 1 件目で即停止 / fail closed)。
@@ -92,12 +86,12 @@ uv run canvasser.py mark-completed --account syota cg_vote2026_17 cg_vote2026_19
 
 ## Windows タスクスケジューラ登録例
 
-毎日 12:05 に全アカウントを実行:
+毎日 12:05 に全アカウントのミッションを回収する:
 
 ```powershell
 $dir = "D:\projects\cgge-canvasser"
 $action  = New-ScheduledTaskAction -Execute "uv" `
-             -Argument "run canvasser.py run --tasks mission,checkin --execute --profiles-dir $dir\profiles" `
+             -Argument "run canvasser.py mission --execute --profiles-dir $dir\profiles" `
              -WorkingDirectory $dir
 $trigger = New-ScheduledTaskTrigger -Daily -At 12:05
 Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trigger `
@@ -160,7 +154,7 @@ FailClosedError は `process_account` で捕捉され、`exit_code=1` として�
 
 - `completed_spots` は次回起動時の事前フィルタに使う。既に成功したスポットへは実 POST を送らない。
 - `spot_slug` は正規表現 `^cg_vote2026_[0-9]{1,6}$` にマッチする形式が必須 (schema 検証で strict チェック)。手動編集する場合は `cg_vote2026_19` のような実 slug 形式を守る。
-- state.json の JSON パース失敗や schema 不整合は、チェックイン実 POST (`--tasks checkin --execute`) 時に fail closed として即停止する。手動で確認・修復してから再実行する。
+- state.json の JSON パース失敗や schema 不整合は、チェックイン実 POST (`checkin --execute`) 時に fail closed として即停止する。手動で確認・修復してから再実行する。
 - ドライランでは破損した state を空 dict として扱い、そのまま続行する。
 
 ## API 仕様 (参考)
