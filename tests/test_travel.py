@@ -107,9 +107,12 @@ class TestEstimateTravelSeconds:
         assert canvasser._get_gmaps_client() is None
 
 
-def _leg(seconds: float) -> list[dict[str, Any]]:
-    """duration.value だけ持つ directions 応答を組み立てる。"""
-    return [{"legs": [{"duration": {"value": seconds}}]}]
+def _leg(seconds: float, traffic_seconds: float | None = None) -> list[dict[str, Any]]:
+    """duration.value と (任意で) duration_in_traffic.value を持つ応答を組み立てる。"""
+    leg: dict[str, Any] = {"duration": {"value": seconds}}
+    if traffic_seconds is not None:
+        leg["duration_in_traffic"] = {"value": traffic_seconds}
+    return [{"legs": [leg]}]
 
 
 class TestEstimateTravelSecondsGmaps:
@@ -200,6 +203,38 @@ class TestEstimateTravelSecondsGmaps:
         assert got == (500.0, "gmaps-driving")
         assert client.calls[0]["mode"] == "transit"
         assert client.calls[1]["mode"] == "driving"
+
+    def test_driving_fallbackはduration_in_trafficを優先する(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """driving は traffic 反映値の duration_in_traffic があればそちらを返す。
+
+        Directions API は mode=driving + 未来 departure_time + 経由地なしの条件下で
+        duration_in_traffic を返す仕様
+        (https://developers.google.com/maps/documentation/directions/get-directions)。
+        この呼び出しは全条件を満たしているので、実運行に近い所要時間として優先する。
+        """
+        client = FakeGmapsClient([[], _leg(500.0, traffic_seconds=800.0)])
+        self._install(monkeypatch, client)
+
+        got = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+        )
+
+        assert got == (800.0, "gmaps-driving")
+
+    def test_driving_fallbackはduration_in_traffic欠落時はdurationに落ちる(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """duration_in_traffic 欠落時は既存の duration にフォールバックする。"""
+        client = FakeGmapsClient([[], _leg(500.0)])  # duration のみ
+        self._install(monkeypatch, client)
+
+        got = canvasser._estimate_travel_seconds_gmaps(
+            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+        )
+
+        assert got == (500.0, "gmaps-driving")
 
     def test_drivingも空ならNone(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """transit・driving とも経路なしは None (Haversine 合流) を返す。"""

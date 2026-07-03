@@ -480,6 +480,14 @@ def _finite_float_or_none(v: object) -> float | None:
     return None
 
 
+def _finite_float_in_range_or_none(v: object, lo: float, hi: float) -> float | None:
+    """有限かつ [lo, hi] 内なら float、それ以外は None。resume 用の緩い経路。"""
+    f = _finite_float_or_none(v)
+    if f is None or not (lo <= f <= hi):
+        return None
+    return f
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Spot:
     """チェックインスポットの型付き値オブジェクト。
@@ -514,11 +522,15 @@ class Spot:
         if not (_LNG_MIN <= lng <= _LNG_MAX):
             msg = f"location_longitude が経度の範囲外: {lng}"
             raise ValueError(msg)
+        # 既定 500m は `checkin_radius` キー欠落 / null のときだけ適用する。
+        # `0` / `False` / `""` などの falsy 値は「値はあるが不正」なので
+        # _coerce_finite_float に通して境界検知に流す (bool → TypeError、
+        # 変換不能 → TypeError、非有限 → ValueError、以下で 0 以下 → ValueError)。
         raw_radius = raw.get("checkin_radius")
         radius = (
-            _coerce_finite_float(raw_radius, name="checkin_radius")
-            if raw_radius
-            else 500.0
+            500.0
+            if raw_radius is None
+            else _coerce_finite_float(raw_radius, name="checkin_radius")
         )
         if radius <= 0:
             msg = f"checkin_radius が正の値でない: {radius}"
@@ -815,11 +827,16 @@ class _CheckinRunner:
     def _within_deadline(
         self, spot: Spot, planned_arrival: datetime | None = None
     ) -> bool:
-        """個別スポット期限内かを判定する。skip 時は移動起点だけ現地点へ進める。
+        """個別スポット期限内かを判定する純粋関数。副作用を持たない。
 
         planned_arrival が渡されたら「到着予定時刻が期限を超えるか」も見る。
         これで移動 sleep 前に skip / fail-closed を確定でき、期限切れスポットへ
         長時間実待機してから skip する事故を避けられる。
+
+        skip 時に prev_lat/lng は更新しない: この設計では skip 判定は移動 sleep
+        前に走るため、「行っていない spot」へ origin を進めると次スポットの移動
+        計算が壊れる (次スポットへの travel wait を過小評価する)。origin は
+        `_on_success` など「実際に到達したうえで結果として skip」の経路でのみ更新する。
 
         イベント全体期限とは別で、超過したものだけ skip して後続の有効スポットは
         処理を続ける。パース不能 (deadline=None) は execute では fail closed に
@@ -835,8 +852,6 @@ class _CheckinRunner:
             if self.settings.execute:
                 raise FailClosedError(msg, partial_gained=self.gained)
             print(f"  {msg} (dry-run: skip)", file=sys.stderr)
-            # skip でも到着はしたので、次スポットの travel 起点を現地点に更新する
-            self._move_origin_to(spot)
             return False
         check_time = (
             planned_arrival if planned_arrival is not None else self.virtual_now
@@ -851,7 +866,6 @@ class _CheckinRunner:
                 print(
                     f"  [{slug}] スポット期限 ({deadline:%m/%d %H:%M %Z}) 経過、skip。"
                 )
-            self._move_origin_to(spot)
             return False
         return True
 
@@ -1416,20 +1430,24 @@ def _matches_last_checkin_kind(v: object, kind: str) -> bool:
 
     bool は int の subclass のため素の `isinstance(v, int)` を通ってしまう。
     座標は `NaN` / `Infinity` を境界で潰したいので `math.isfinite` まで見る。
+    `latitude` / `longitude` は加えて地球の緯度経度範囲まで検証する
+    (`Spot.from_api` と同じ境界を state にも適用する)。
     """
-    if kind == "int":
-        return not isinstance(v, bool) and isinstance(v, int)
-    if kind == "str":
-        return isinstance(v, str)
-    if kind == "finite_number":
-        return (
-            not isinstance(v, bool) and isinstance(v, int | float) and math.isfinite(v)
-        )
-    return False
+    is_finite_num = (
+        not isinstance(v, bool) and isinstance(v, int | float) and math.isfinite(v)
+    )
+    matches_by_kind: dict[str, bool] = {
+        "int": not isinstance(v, bool) and isinstance(v, int),
+        "str": isinstance(v, str),
+        "finite_number": is_finite_num,
+        "latitude": is_finite_num and _LAT_MIN <= cast("float", v) <= _LAT_MAX,
+        "longitude": is_finite_num and _LNG_MIN <= cast("float", v) <= _LNG_MAX,
+    }
+    return matches_by_kind.get(kind, False)
 
 
 def _validate_last_checkin(state: dict[str, Any], source: Path) -> None:
-    """last_checkin の型・slug・時刻形式・座標の有限性を検証する。"""
+    """last_checkin の型・slug・時刻形式・座標の有限性と範囲を検証する。"""
     last = state.get("last_checkin")
     if last is None:
         return
@@ -1441,8 +1459,8 @@ def _validate_last_checkin(state: dict[str, Any], source: Path) -> None:
         ("schema_version", "int"),
         ("spot_slug", "str"),
         ("spot_name", "str"),
-        ("location_latitude", "finite_number"),
-        ("location_longitude", "finite_number"),
+        ("location_latitude", "latitude"),
+        ("location_longitude", "longitude"),
         ("virtual_completed_at", "str"),
     ):
         v = last_dict.get(k)
@@ -1602,10 +1620,12 @@ def resume_context(
             resume_at = _as_jst_aware(datetime.fromisoformat(raw))
     completed = set(state.get("completed_spots") or [])
     # 非 strict (dry-run) はスキーマ検証を通らないため、手改変で数値以外や
-    # NaN/Infinity が入っていても ValueError にせず None (resume 情報なし) に丸める。
+    # NaN/Infinity/範囲外の座標が入っていても ValueError にせず None
+    # (resume 情報なし) に丸める。strict 経路とは違い、破損 dry-run 起動を
+    # 単に「resume 位置なしの初回相当」として続行させる。
     return (
-        _finite_float_or_none(lat),
-        _finite_float_or_none(lng),
+        _finite_float_in_range_or_none(lat, _LAT_MIN, _LAT_MAX),
+        _finite_float_in_range_or_none(lng, _LNG_MIN, _LNG_MAX),
         resume_at,
         completed,
     )
