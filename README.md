@@ -74,7 +74,10 @@ uv run canvasser.py checkin --account main --execute --daily-budget 3
 - `--daily-budget N`：1 回の実行あたり N 件の実 POST 試行で終了する (未指定なら無制限)。成功件数ではなく試行回数を数えるので、既達成・範囲外・未観測 ecode も 1 件消費する。
 - `--consecutive-failure-limit N`：未観測 ecode が連続 N 件で全体を中断する (デフォルト 1 = 1 件目で即停止 / fail closed)。
 - `--out-of-range-limit N`：E5005 (範囲外) の累積が N 件で停止する (デフォルト 3)。crypto と座標の実装不一致で 51 件を撃ち切らないための安全弁。
-- `--allow-unignored-profiles-dir`：`--profiles-dir` が `.gitignore` 対象でない場合の警告を無視する。デフォルトでは login / mission / checkin のいずれの実行モード (ドライラン含む) でも拒否する (Cookie 誤コミット防止)。実質的に共通フラグだが、実 POST を伴う checkin 側で最も影響が大きいため本節に併記する。
+
+共通の安全策 (login / mission / checkin すべてに適用):
+
+- `--allow-unignored-profiles-dir`：`--profiles-dir` が `.gitignore` 対象でない場合の警告を無視する。デフォルトでは login / mission / checkin のいずれの実行モード (ドライラン含む) でも拒否する (Cookie 誤コミット防止)。
 
 ### 既に消化済みスポットを state に手動登録
 
