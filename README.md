@@ -111,7 +111,7 @@ Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trig
 1. **前回位置から再開**：`state.json` に保存された位置に最も近い未達成スポットを起点にする。state がなければランダム。
 2. **最近傍法で巡回順を決定**：現在地から Haversine 距離が最小の未達成スポットへ順次移動する (greedy TSP 近似)。
 3. **移動時間を反映**：
-   - `GMAPS_KEY` があれば Google Maps Directions API の `mode=transit` (フォールバック `driving`) を呼び、`departure_time` に仮想現在時刻を渡す。実運行時刻を含んだ duration が返る。
+   - `GMAPS_KEY` があれば Google Maps Directions API を呼び、`departure_time` に仮想現在時刻を渡す。`mode=transit` は始発待ちを含む実運行時刻ベースの duration が返る。経路が無い場合 (深夜帯や公共交通が届かない場所) は `mode=driving` にフォールバックし、`duration_in_traffic` が取れれば交通量反映の所要時間、無ければ `duration` の距離ベース所要時間を採用する。
    - なければ Haversine と距離レンジ別平均速度で下限を推定する。
 4. **深夜帯 (24:00-06:00) は移動不可**：`next_arrival_time` で「今日中に到着できない旅は翌朝 06:00 発へ押し戻す」を強制する。ただし `gmaps-transit` の結果には運行時刻が含まれているので押し戻しは行わない。稼働枠 (06:00-24:00 の 18 時間) を超える長旅も夜行便等の連続移動として押し戻さずそのまま加算する。
 5. **スポットで滞在**：10〜30 分をランダムに滞在してから次スポットへ移る (最終スポットや `daily-budget` 到達時は滞在を省く)。
