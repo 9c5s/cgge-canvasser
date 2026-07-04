@@ -32,6 +32,7 @@ import argparse
 import base64
 import contextlib
 import functools
+import getpass
 import hashlib
 import json
 import math
@@ -44,7 +45,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
@@ -1441,6 +1442,13 @@ def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
 # lat/lng/resume_at を無視する。
 LAST_CHECKIN_SCHEMA_VERSION = 2
 _STATE_FILENAME = "canvasser_state.json"
+_CREDENTIALS_FILENAME = "credentials.json"
+
+# BNID の連続ログイン失敗をこの回数まで許容し、超えたら disabled_until を書き込んで
+# 一時停止する。BNID 側のアカウントロック閾値を刺激しないための緩めの上限。
+CREDENTIALS_MAX_FAILURES = 3
+# disabled_until が有効になる時間 (秒)。デフォルト 6 時間。
+CREDENTIALS_DISABLE_WINDOW_SEC = 6 * 60 * 60
 
 
 class StateFileCorruptedError(Exception):
@@ -1631,6 +1639,154 @@ def save_account_state(profile_dir: Path, state: dict[str, Any]) -> None:
         raise
 
 
+@dataclass(kw_only=True)
+class Credentials:
+    """BNID の自動再ログインで使う資格情報。
+
+    平文 JSON (`profiles/<account>/credentials.json`) に保存する。ファイル権限は
+    POSIX で 0o600、Windows は icacls でカレントユーザー限定に絞る (best-effort)。
+
+    - `saved_at`: 対話入力で保存した時刻 (JST ISO8601)。デバッグ・監査用で、
+      自動再ログイン成否の書き戻しでは更新しない (資格情報が変わった時のみ更新)。
+    - `failure_count`: 連続失敗回数。成功で 0 にリセットする。
+    - `disabled_until`: `CREDENTIALS_MAX_FAILURES` に達した時に設定する JST
+      ISO8601。この時刻までは自動再ログインをスキップし、BNID アカウントロックを
+      刺激しない。
+    """
+
+    bnid_email: str
+    bnid_password: str
+    saved_at: str
+    failure_count: int = 0
+    disabled_until: str | None = None
+
+
+def _credentials_file(profile_dir: Path) -> Path:
+    """profile_dir 配下の credentials.json パスを返す。"""
+    return profile_dir / _CREDENTIALS_FILENAME
+
+
+def _apply_credentials_permissions(path: Path) -> None:
+    """credentials.json のファイル権限を最小限に絞る (best-effort)。
+
+    POSIX は `os.chmod(path, 0o600)`。Windows は `icacls` で継承削除 +
+    カレントユーザー限定に絞る。どちらも失敗しても致命的にはしない
+    (資格情報の平文保存自体が第一の防壁ではないため)。
+    """
+    with contextlib.suppress(OSError):
+        path.chmod(0o600)
+    if os.name != "nt":
+        return
+    icacls = shutil.which("icacls")
+    username = os.environ.get("USERNAME")
+    if icacls is None or not username:
+        return
+    # icacls の失敗は非致命。git check-ignore と同じ例外集合で握り潰す。
+    with contextlib.suppress(*_GIT_CHECK_IGNORE_EXCEPTIONS):
+        subprocess.run(  # noqa: S603
+            [
+                icacls,
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"{username}:F",
+            ],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+
+def load_credentials(profile_dir: Path) -> Credentials | None:
+    """`profile_dir/credentials.json` を読み込む。
+
+    ファイル非存在は「機能無効」として `None` を返す (自動再ログイン無効化と同義)。
+    JSON パース失敗・型不一致は認証情報を無視するために `None` に丸め、stderr に
+    警告を出す。認証情報そのもの (メアド/パスワード) はログに出さない。
+    """
+    cred_file = _credentials_file(profile_dir)
+    if not cred_file.exists():
+        return None
+    try:
+        raw = json.loads(cred_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(
+            f"[warn] {cred_file} を読めません: {e}。認証情報を無視します。",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(raw, dict):
+        print(
+            f"[warn] {cred_file} のトップレベルが dict でありません。"
+            "認証情報を無視します。",
+            file=sys.stderr,
+        )
+        return None
+    data = cast("dict[str, Any]", raw)
+    email = data.get("bnid_email")
+    password = data.get("bnid_password")
+    if (
+        not isinstance(email, str)
+        or not isinstance(password, str)
+        or not email
+        or not password
+    ):
+        print(
+            f"[warn] {cred_file} に bnid_email / bnid_password が"
+            "正しく入っていません。認証情報を無視します。",
+            file=sys.stderr,
+        )
+        return None
+    saved_at_raw = data.get("saved_at", "")
+    saved_at = saved_at_raw if isinstance(saved_at_raw, str) else ""
+    failure_count_raw = data.get("failure_count", 0)
+    # bool は int の subclass なので明示的に排除する
+    is_valid_int = isinstance(failure_count_raw, int) and not isinstance(
+        failure_count_raw, bool
+    )
+    failure_count = failure_count_raw if is_valid_int else 0
+    disabled_until_raw = data.get("disabled_until")
+    disabled_until = disabled_until_raw if isinstance(disabled_until_raw, str) else None
+    return Credentials(
+        bnid_email=email,
+        bnid_password=password,
+        saved_at=saved_at,
+        failure_count=failure_count,
+        disabled_until=disabled_until,
+    )
+
+
+def save_credentials(profile_dir: Path, credentials: Credentials) -> None:
+    """`profile_dir/credentials.json` に atomic に書き出す。
+
+    `save_account_state` と同じ「tempfile → fsync → replace」パターンで、
+    書き込み中クラッシュしても既存ファイルは壊れない。書き込み後にファイル権限を
+    最小限に絞る。
+    """
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    cred_file = _credentials_file(profile_dir)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".credentials-", suffix=".tmp", dir=str(profile_dir)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(
+                asdict(credentials),
+                f,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+            f.flush()
+            os.fsync(f.fileno())
+        Path(tmp_path).replace(cred_file)
+    except Exception:
+        with contextlib.suppress(OSError):
+            Path(tmp_path).unlink()
+        raise
+    _apply_credentials_permissions(cred_file)
+
+
 def update_checkin_state(
     profile_dir: Path,
     spot: Spot,
@@ -1734,6 +1890,46 @@ def ensure_chromium_installed() -> None:
 
     print("Chromium バイナリを取得します (初回のみ)...", file=sys.stderr)
     _install_chromium()
+
+
+def _prompt_credentials() -> tuple[str, str]:
+    """対話で BNID メールアドレス・パスワードを取得する。
+
+    パスワードは `getpass.getpass()` で echo 無効化する。空文字は
+    `UserInputError` で拒否し、認証情報として使えない状態で保存へ進ませない。
+    """
+    print("BNID の認証情報を入力してください。", file=sys.stderr)
+    email = input("メールアドレス: ").strip()
+    if not email:
+        msg = "メールアドレスが空です。login-init を中止します。"
+        raise UserInputError(msg)
+    password = getpass.getpass("パスワード: ")
+    if not password:
+        msg = "パスワードが空です。login-init を中止します。"
+        raise UserInputError(msg)
+    return email, password
+
+
+def persist_login_init_credentials(profile_dir: Path) -> None:
+    """login-init サブコマンド用: 対話入力 → credentials.json に保存する。
+
+    profile_dir は事前に mkdir 済みを前提とする。resume 状態や連続失敗ガードは
+    login-init で「認証情報を入れ直した」ことになるため 0 / None にリセットする。
+    """
+    email, password = _prompt_credentials()
+    save_credentials(
+        profile_dir,
+        Credentials(
+            bnid_email=email,
+            bnid_password=password,
+            saved_at=datetime.now(JST).isoformat(),
+        ),
+    )
+    print(
+        f"認証情報を {_credentials_file(profile_dir)} に保存しました。"
+        "続けてブラウザでログインを検証します。",
+        file=sys.stderr,
+    )
 
 
 def run_login_flow(
@@ -1914,10 +2110,12 @@ class RunOptions:
 
     mission と checkin は排他のサブコマンドなので、`run_mission` と `run_checkin`
     が同時に True になることはない。デフォルトは「何も実行しない完全ドライラン」で、
-    login サブコマンドは `login_mode=True` のみを立てて使う。
+    login / login-init サブコマンドはそれぞれ `login_mode` / `login_init_mode`
+    のみを立てて使う。
     """
 
     login_mode: bool = False
+    login_init_mode: bool = False
     run_mission: bool = False
     run_checkin: bool = False
     execute: bool = False
@@ -1939,12 +2137,16 @@ def process_account(
     未ログイン検知時は exit_code=1 を返し、呼び出し側で他アカウントへ進む。
     """
     profile_dir.mkdir(parents=True, exist_ok=True)
-    ctx = open_persistent_context(p, profile_dir, headless=not options.login_mode)
+    headed = options.login_mode or options.login_init_mode
+    ctx = open_persistent_context(p, profile_dir, headless=not headed)
     try:
         page = ctx.new_page()
         page.goto(MISSION_PAGE_URL, wait_until="domcontentloaded")
 
-        if options.login_mode:
+        # login / login-init はどちらも headed ブラウザ + is_login ポーリングで
+        # ログイン成功を検知する。login-init は事前 (_main_impl) で credentials を
+        # 保存済みなので、ここでは検証だけ行う。
+        if options.login_mode or options.login_init_mode:
             return 0, run_login_flow(page)
 
         if not check_login(page):
@@ -2005,9 +2207,9 @@ def main() -> int:
 def _build_parser() -> argparse.ArgumentParser:
     """CLI 引数パーサを構築する。
 
-    login / mission / checkin / mark-completed の 4 サブコマンド。サブコマンドで
-    必須引数と排他 (mission と checkin は同時実行しない) を構造的に表現し、
-    フラグの組み合わせ検証を不要にする。
+    login / login-init / mission / checkin / mark-completed の 5 サブコマンド。
+    サブコマンドで必須引数と排他 (mission と checkin は同時実行しない) を
+    構造的に表現し、フラグの組み合わせ検証を不要にする。
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -2054,6 +2256,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="初回ログイン。Chromium を可視状態で起動する",
     )
     login.add_argument(
+        "--account",
+        required=True,
+        help="対象アカウント名。profiles-dir 配下のサブディレクトリ名として扱う",
+    )
+
+    login_init = subparsers.add_parser(
+        "login-init",
+        parents=[common, browser],
+        help=(
+            "BNID メール/パスワードを対話入力し credentials.json に保存後、"
+            "既存の対話ログインフローで実ログインを検証する"
+        ),
+    )
+    login_init.add_argument(
         "--account",
         required=True,
         help="対象アカウント名。profiles-dir 配下のサブディレクトリ名として扱う",
@@ -2144,6 +2360,8 @@ def _build_run_options(args: argparse.Namespace) -> RunOptions:
     """
     if args.command == "login":
         return RunOptions(login_mode=True)
+    if args.command == "login-init":
+        return RunOptions(login_init_mode=True)
     if args.command == "mission":
         return RunOptions(run_mission=True, execute=args.execute)
     return RunOptions(
@@ -2212,6 +2430,7 @@ def _main_impl() -> int:
         return _run_mark_completed(args, profiles_dir)
 
     login_mode = args.command == "login"
+    login_init_mode = args.command == "login-init"
     if args.command == "checkin":
         _validate_thresholds(args)
 
@@ -2225,6 +2444,13 @@ def _main_impl() -> int:
         raise UserInputError(msg)
 
     _ensure_profiles_dir_ignored(args, profiles_dir)
+
+    # login-init はブラウザ起動前に対話入力 → credentials.json 保存を行う。
+    # Chromium 取得待ちや playwright 起動より先に対話が済む方がユーザ体験が良い。
+    if login_init_mode:
+        _, target_profile = profiles[0]
+        target_profile.mkdir(parents=True, exist_ok=True)
+        persist_login_init_credentials(target_profile)
 
     options = _build_run_options(args)
 
@@ -2246,8 +2472,8 @@ def _main_impl() -> int:
             results.append((name, gained))
             if code != 0:
                 exit_code = code
-            if login_mode:
-                # login は 1 アカウント (--account 必須) のみ処理して抜ける
+            if login_mode or login_init_mode:
+                # login / login-init は 1 アカウント (--account 必須) のみ処理して抜ける
                 return code
 
     if len(profiles) > 1:
