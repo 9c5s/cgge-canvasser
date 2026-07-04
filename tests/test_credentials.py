@@ -193,25 +193,57 @@ class TestCredentialsPermissions:
 class TestPersistLoginInitCredentials:
     """persist_login_init_credentials の対話フローを stdin モックで検証する。"""
 
-    def test_対話入力を受けてcredentialsを保存する(
+    def test_対話入力を受けてpending_credentialsを保存する(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """input と getpass の戻り値がそのまま credentials.json に入る。"""
+        """input と getpass の戻り値が credentials.json.pending に一時保存される。
+
+        active credentials.json は上書きされず、pending として保存される。実ログイン
+        検証成功時に `run_login_init_flow` が active に昇格させる。
+        """
         monkeypatch.setattr("builtins.input", lambda _prompt="": "user@example.com")
         monkeypatch.setattr(canvasser.getpass, "getpass", lambda _prompt="": "hunter2")
 
         canvasser.persist_login_init_credentials(tmp_path)
 
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
-        assert got.bnid_email == "user@example.com"
-        assert got.bnid_password == "hunter2"
-        assert got.failure_count == 0
-        assert got.disabled_until is None
+        # active は作られていない (pending のみ)
+        assert canvasser.load_credentials(tmp_path) is None
+        pending = canvasser.load_pending_credentials(tmp_path)
+        assert pending is not None
+        assert pending.bnid_email == "user@example.com"
+        assert pending.bnid_password == "hunter2"
+        assert pending.failure_count == 0
+        assert pending.disabled_until is None
         assert "認証情報を" in capsys.readouterr().err
+
+    def test_既存activeは_persist_login_init_で温存される(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """login-init の対話保存では既存 active は書き換わらない (pending のみ)。"""
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "new@example.com")
+        monkeypatch.setattr(canvasser.getpass, "getpass", lambda _prompt="": "new-pw")
+        canvasser.save_credentials(
+            tmp_path,
+            Credentials(
+                bnid_email="old@example.com",
+                bnid_password="old-pw",
+                saved_at="2026-07-04T00:00:00+09:00",
+            ),
+        )
+
+        canvasser.persist_login_init_credentials(tmp_path)
+
+        active = canvasser.load_credentials(tmp_path)
+        assert active is not None
+        assert active.bnid_email == "old@example.com"  # 既存 active 温存
+        pending = canvasser.load_pending_credentials(tmp_path)
+        assert pending is not None
+        assert pending.bnid_email == "new@example.com"
 
     def test_メール空文字はUserInputError(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -224,6 +256,7 @@ class TestPersistLoginInitCredentials:
             canvasser.persist_login_init_credentials(tmp_path)
 
         assert not _cred_file(tmp_path).exists()
+        assert not (tmp_path / "credentials.json.pending").exists()
 
     def test_パスワード空文字はUserInputError(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -236,3 +269,4 @@ class TestPersistLoginInitCredentials:
             canvasser.persist_login_init_credentials(tmp_path)
 
         assert not _cred_file(tmp_path).exists()
+        assert not (tmp_path / "credentials.json.pending").exists()
