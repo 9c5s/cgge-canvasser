@@ -89,7 +89,15 @@ class FakeLocator:
         return self._page.visibility.get(self._selector, False)
 
     def count(self) -> int:
-        """selector の要素数を FakePage.counts から取得する (既定 0)。"""
+        """selector の要素数を返す。
+
+        counts_sequence[selector] があれば呼び出し順に先頭を pop して返す (最後の
+        値は保持し続ける)。動的な CAPTCHA 挿入 (pre-submit=0 → post-submit=1) を
+        再現する用途。設定がなければ counts[selector] を返す (既定 0)。
+        """
+        seq = self._page.counts_sequence.get(self._selector)
+        if seq:
+            return seq.pop(0) if len(seq) > 1 else seq[0]
         return self._page.counts.get(self._selector, 0)
 
 
@@ -128,6 +136,7 @@ class FakePage:
         *,
         visibility: dict[str, bool] | None = None,
         counts: dict[str, int] | None = None,
+        counts_sequence: dict[str, list[int]] | None = None,
         wait_for_errors: dict[str, list[Exception | None]] | None = None,
         click_errors: dict[str, list[Exception | None]] | None = None,
         goto_errors: Sequence[Exception | None] | None = None,
@@ -137,6 +146,10 @@ class FakePage:
         self.calls: list[tuple[str, object]] = []
         self.visibility: dict[str, bool] = dict(visibility or {})
         self.counts: dict[str, int] = dict(counts or {})
+        # count() の値を呼び出し順に切り替える (動的挿入シナリオ用)。
+        self.counts_sequence: dict[str, list[int]] = {
+            k: list(v) for k, v in (counts_sequence or {}).items()
+        }
         self.wait_for_errors: dict[str, list[Exception | None]] = {
             k: list(v) for k, v in (wait_for_errors or {}).items()
         }
