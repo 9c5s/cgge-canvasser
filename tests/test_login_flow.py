@@ -170,28 +170,27 @@ class TestAutoLogin:
     ) -> None:
         """submit 後 (ポーリング中) に CAPTCHA が動的挿入されたら CAPTCHA_DETECTED。
 
-        FakePage の counts は selector マッチで返るため、初回検査はすり抜けさせて
-        いる (submit 前の pre-check の場合は別 iframe セレクタを空、post-submit で
-        recaptcha selector にヒットさせる) — このテストではポーリング途中で
-        検知するパスを FakeLocator の count 経由で再現する。
+        BNID が連続失敗で CAPTCHA を動的に差し込むケースの検証。
+        `counts_sequence` で「pre-submit 時=0 → poll 中=1」と切り替え、
+        pre-check ではすり抜け、_poll_login_outcome の CAPTCHA 分岐で検知する
+        パスを踏む。submit は既に発生しているので `submitted=1`。
         """
         _install_fake_time(monkeypatch)
-        # submit 前の pre-check で hcaptcha=0/recaptcha=0/turnstile=0 だが、
-        # ポーリング中に recaptcha=1 になった、という再現は難しいので、
-        # 常に captcha selector の 1 つが hit する状態にする。ただし
-        # 現実装では submit 前の pre-check で先に検知される。
         fake = FakePage(
             responses=[_is_login_response(is_login=False)],
-            counts={'iframe[src*="turnstile"]': 1},
+            # 1 回目 (pre-submit pre-check): 0、2 回目以降 (poll 中): 1
+            counts_sequence={'iframe[src*="turnstile"]': [0, 1]},
         )
 
         result, submitted = canvasser.auto_login(
             as_page(fake), _sample_creds(), timeout_sec=1
         )
 
-        # 現実装では pre-submit check で先に検知されるので submit=0
         assert result is AutoLoginOutcome.CAPTCHA_DETECTED
-        assert submitted == 0
+        # 動的挿入なので click 済み → submit=1
+        assert submitted == 1
+        # フォーム入力・click が実行されている (pre-submit 分岐と区別)
+        assert any(c[0] == "press_sequentially" for c in fake.calls)
         err = capsys.readouterr().err
         assert "CAPTCHA/2FA" in err
 
