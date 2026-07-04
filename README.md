@@ -24,6 +24,22 @@ GMAPS_KEY=AIzaSy...
 
 初回起動時に依存関係 (playwright, pycryptodome, googlemaps, python-dotenv) と Chromium バイナリを自動取得する。
 
+自動再ログインを使う場合、`./profiles/{account}/credentials.json` に BNID の資格情報が保存される (`login-init` サブコマンドが対話入力で作成する)。ファイル権限は POSIX で `0o600`、Windows は `icacls` でカレントユーザー限定に絞る。 gitignore は `profiles/` 全体に効いているため誤コミットは防げるが、平文保存である以上 PC 盗難時のリスクは残る。
+
+```json
+{
+  "bnid_email": "user@example.com",
+  "bnid_password": "PASSWORD",
+  "saved_at": "2026-07-05T12:34:56+09:00",
+  "failure_count": 0,
+  "disabled_until": null
+}
+```
+
+- `saved_at`: 対話入力で保存した時刻 (JST ISO8601)。デバッグ・監査用。
+- `failure_count`: 自動再ログイン連続失敗数。成功で 0 にリセットする。
+- `disabled_until`: `failure_count` が上限 (3) に達したときに設定する JST ISO8601。この時刻までは自動再ログインをスキップし、BNID 側のアカウントロックを刺激しない。
+
 ## 使い方
 
 ### 初回ログイン (アカウントごとに1回)
@@ -35,6 +51,19 @@ uv run canvasser.py login --account sub
 
 - `--account NAME` は必須。`./profiles/NAME/` にプロファイルが作られる。
 - Chromium が可視状態で立ち上がる。BNID でログインしてミッションページが表示されると、自動でログインを検知して終了する。
+
+### 自動再ログイン用の資格情報登録 (`login-init`)
+
+BNID の Cookie 有効期限が切れた際に、手動介入なしで再ログインさせたい場合は `login-init` サブコマンドを使う。
+
+```powershell
+uv run canvasser.py login-init --account main
+```
+
+- 対話プロンプトでメールアドレス (`input`) とパスワード (`getpass`) を入力する。パスワードは echo されない。
+- 入力を `./profiles/main/credentials.json` に保存し、その後 headed Chromium で実ログインを検証する (`login` と同じフロー)。
+- 以降 `mission` / `checkin` 実行時に Cookie 期限切れを検出したら、この資格情報で `#mail` → `#pass` → ログインボタン click を自動再生し、成功したら本処理を続行する。
+- パスワードを変更した場合は再度 `login-init` を実行して上書きする (`failure_count` と `disabled_until` もリセットされる)。
 
 ### 日次実行 (ミッション回収、全アカウント)
 
@@ -78,6 +107,10 @@ uv run canvasser.py checkin --account main --execute --daily-budget 3
 共通の安全策 (login / mission / checkin すべてに適用):
 
 - `--allow-unignored-profiles-dir`：`--profiles-dir` が `.gitignore` 対象でない場合の警告を無視する。デフォルトでは login / mission / checkin のいずれの実行モード (ドライラン含む) でも拒否する (Cookie 誤コミット防止)。
+
+mission と checkin にのみ効く自動再ログイン制御:
+
+- `--no-auto-relogin`：`credentials.json` が保存されていても自動再ログインを行わない。手動運用に戻したいときや、疑わしいログイン失敗を追跡したいときにだけ使う。
 
 ### 既に消化済みスポットを state に手動登録
 
@@ -203,5 +236,7 @@ Next.js チャンク解析で判明した仕様。
 - `.env` も Git 管理外に置く (`.gitignore` 設定済み)。
 - `login` / `mission` / `checkin` 実行時に `--profiles-dir` が `.gitignore` 対象になっているかを `git check-ignore` で自動検証する。未 ignore の場合は実行を拒否する (Cookie 誤コミット防止)。回避したい場合は `--allow-unignored-profiles-dir` を明示する。
 - キャンペーン規約に自動化禁止条項がある場合は、自己責任で判断する。
-- Cookie の有効期限が切れた場合は `login --account NAME` で再ログインする。
+- Cookie の有効期限が切れた場合は `login --account NAME` で再ログインする (`login-init` を使っていれば自動再ログインが試みられる)。
 - 未観測 ecode が 1 件出たら fail closed で即停止する (デフォルト)。BAN シグナル・認証切れ・予期せぬ状態のいずれかとして扱う。
+- `credentials.json` は平文保存 (POSIX で `0o600`、Windows は `icacls` でカレントユーザー限定)。PC 盗難時のリスクは残るため、共有 PC への配置は避ける。パスワードを変更した場合は `login-init --account NAME` で再登録する。
+- BNID 側が CAPTCHA / 2FA / パスキー強制を導入すると、自動再ログインは失敗するようになり手動 `login` に退化する。`auto_login` は CAPTCHA / 2FA を検知すると即 abort する (詳細は `canvasser.py` の `_LOGIN_CAPTCHA_SELECTORS` を参照)。

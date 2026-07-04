@@ -47,6 +47,7 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
 from zoneinfo import ZoneInfo
@@ -81,6 +82,11 @@ MISSION_PAGE_URL = (
 )
 CHECKIN_PAGE_URL = f"https://idolmaster-official.jp/mydesk/spot/{CHECKIN_EVENT_SLUG}"
 LOGIN_CHECK_URL = f"{API_HOST}/api/v1_1_0/auths/login/check"
+# BNID ログイン画面への遷移入口。ここから OAuth リダイレクトチェーンで
+# `account.bandainamcoid.com/login.html` に着地する (Phase 1 で確認)。
+LOGIN_ENTRY_URL = (
+    f"{API_HOST}/api/v1_1_0/auths/login?backurl=/cinderellagirls/vote2026/vote/mission"
+)
 
 # 地球の 1 度緯度に対応する距離 [m]。WGS84 近似。
 METERS_PER_DEG_LAT = 111_320.0
@@ -1979,14 +1985,29 @@ def _detect_login_captcha(page: Page) -> bool:
     return False
 
 
+class AutoLoginOutcome(Enum):
+    """auto_login の結果種別。
+
+    タイムアウトのみリトライ対象になるため、呼び出し側で失敗理由を区別する。
+    パスワード誤り / CAPTCHA は連続失敗ガードで failure_count には加算するが、
+    再試行しても無駄なため即 abort する。
+    """
+
+    SUCCESS = "success"
+    PASSWORD_ERROR = "password_error"  # noqa: S105 (state label, not credential)
+    CAPTCHA_DETECTED = "captcha_detected"
+    TIMEOUT = "timeout"
+    FORM_ERROR = "form_error"
+
+
 def auto_login(
     page: Page,
     credentials: Credentials,
     *,
     timeout_sec: int = 60,
     interval_sec: float = 1.0,
-) -> bool:
-    """BNID ログイン画面でメール/パスワードを自動入力し、成功したら True を返す。
+) -> AutoLoginOutcome:
+    """BNID ログイン画面でメール/パスワードを自動入力し、結果種別を返す。
 
     Phase 1 で判明した DOM 制約に準拠する:
     - `fill()` は disabled を外せないため `press_sequentially()` で実キー入力を装う。
@@ -1995,15 +2016,17 @@ def auto_login(
     - HTTP ステータスは常に 200 なので、成功/失敗は「is_login フラグ vs エラー DOM」の
       race で判定する。
 
-    失敗パス:
-    - パスワード誤り: `#error-input-area .c-message--warning` の可視化を検知して False。
+    失敗パス (呼び出し側でリトライ可否を判定するため区別する):
+    - PASSWORD_ERROR: `#error-input-area .c-message--warning` の可視化を検知。
       Username enumeration 対策のためメアド違いと PW 違いは区別できず、両方まとめて
       「認証情報のいずれかが不正」で abort する。
-    - CAPTCHA / 2FA: 監視 selector にマッチしたら False。手動 `login` サブコマンドへ
-      誘導する。
-    - タイムアウト: `timeout_sec` を超えても is_login にならなければ False。
+    - CAPTCHA_DETECTED: 監視 selector にマッチしたら手動 `login` へ誘導する。
+    - TIMEOUT: `timeout_sec` を超えても is_login にならなければ TIMEOUT。呼び出し側で
+      1 回だけリトライしてよい (一時的なネットワーク遅延の可能性がある)。
+    - FORM_ERROR: フォーム操作中の PlaywrightError。DOM 変更やページ未ロードの可能性が
+      あるためリトライしない。
     """
-    # フォーム入力・送信。ここで失敗したら本処理に入れないため即 False。
+    # フォーム入力・送信。ここで失敗したら本処理に入れないため即 FORM_ERROR。
     try:
         page.locator(_LOGIN_MAIL_SEL).press_sequentially(credentials.bnid_email)
         page.locator(_LOGIN_PASS_SEL).press_sequentially(credentials.bnid_password)
@@ -2012,7 +2035,7 @@ def auto_login(
         page.locator(_LOGIN_BTN_SEL).click()
     except PlaywrightError as e:
         print(f"[auto_login] フォーム操作でエラー: {e}", file=sys.stderr)
-        return False
+        return AutoLoginOutcome.FORM_ERROR
 
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
@@ -2020,14 +2043,14 @@ def auto_login(
         with contextlib.suppress(PlaywrightError):
             if check_login(page):
                 print("[auto_login] ログイン成功を検知しました。", file=sys.stderr)
-                return True
+                return AutoLoginOutcome.SUCCESS
             if _login_error_visible(page):
                 print(
                     "[auto_login] BNID から認証エラーが返されました。"
                     "メールアドレスかパスワードが誤っている可能性があります。",
                     file=sys.stderr,
                 )
-                return False
+                return AutoLoginOutcome.PASSWORD_ERROR
             if _detect_login_captcha(page):
                 print(
                     "[auto_login] CAPTCHA/2FA を検知しました。"
@@ -2035,11 +2058,136 @@ def auto_login(
                     "手動ログインしてください。",
                     file=sys.stderr,
                 )
-                return False
+                return AutoLoginOutcome.CAPTCHA_DETECTED
         time.sleep(interval_sec)
 
     print(
         "[auto_login] タイムアウト。ログイン結果を検知できませんでした。",
+        file=sys.stderr,
+    )
+    return AutoLoginOutcome.TIMEOUT
+
+
+def _credentials_disabled(credentials: Credentials, name: str) -> bool:
+    """`disabled_until` が未来なら True (自動再ログインをスキップすべき)。
+
+    非パース文字列や過去時刻は False (=有効) として扱い、fail-safe に倒す。
+    未来ならユーザ向けに残時間を stderr に案内する。
+    """
+    if credentials.disabled_until is None:
+        return False
+    try:
+        deadline = datetime.fromisoformat(credentials.disabled_until)
+    except ValueError:
+        return False
+    deadline = _as_jst_aware(deadline)
+    if datetime.now(JST) >= deadline:
+        return False
+    print(
+        f"[{name}] 自動再ログインは {credentials.disabled_until} まで"
+        "一時停止中です (連続失敗ガード)。",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _reset_credentials_failure(profile_dir: Path, credentials: Credentials) -> None:
+    """成功時の failure_count / disabled_until クリア。
+
+    変更が無ければ書き込みしない (無駄な I/O と saved_at 保護)。
+    """
+    if credentials.failure_count == 0 and credentials.disabled_until is None:
+        return
+    save_credentials(
+        profile_dir,
+        Credentials(
+            bnid_email=credentials.bnid_email,
+            bnid_password=credentials.bnid_password,
+            saved_at=credentials.saved_at,
+            failure_count=0,
+            disabled_until=None,
+        ),
+    )
+
+
+def _record_credentials_failure(profile_dir: Path, credentials: Credentials) -> None:
+    """失敗時に failure_count を +1、必要なら disabled_until を設定する。
+
+    `CREDENTIALS_MAX_FAILURES` に達したら BNID アカウントロックを避けるため
+    `CREDENTIALS_DISABLE_WINDOW_SEC` 秒後まで自動再ログインを停止する。
+    """
+    new_count = credentials.failure_count + 1
+    new_disabled = credentials.disabled_until
+    if new_count >= CREDENTIALS_MAX_FAILURES:
+        window = timedelta(seconds=CREDENTIALS_DISABLE_WINDOW_SEC)
+        new_disabled = (datetime.now(JST) + window).isoformat()
+    save_credentials(
+        profile_dir,
+        Credentials(
+            bnid_email=credentials.bnid_email,
+            bnid_password=credentials.bnid_password,
+            saved_at=credentials.saved_at,
+            failure_count=new_count,
+            disabled_until=new_disabled,
+        ),
+    )
+
+
+def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
+    """process_account の未ログインルートで呼ぶ自動再ログインゲート。
+
+    credentials.json 非存在・disabled_until 有効・BNID ログイン画面遷移失敗などは
+    すべて False にまとめて丸め、呼び出し側では従来の未ログイン扱いに合流させる。
+
+    タイムアウト時のみ 1 回リトライする (一時的なネットワーク遅延の可能性)。
+    その他の失敗 (パスワード誤り・CAPTCHA・フォーム操作エラー) は即 False にして
+    failure_count を +1 する。
+    """
+    credentials = load_credentials(profile_dir)
+    if credentials is None:
+        return False
+    if _credentials_disabled(credentials, name):
+        return False
+
+    # BNID ログイン画面へ遷移 (OAuth リダイレクトチェーンは Chromium が追従する)。
+    try:
+        page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
+    except PlaywrightError as e:
+        print(
+            f"[{name}] BNID ログイン画面への遷移で失敗: {e}",
+            file=sys.stderr,
+        )
+        _record_credentials_failure(profile_dir, credentials)
+        return False
+
+    outcome = auto_login(page, credentials)
+    if outcome is AutoLoginOutcome.TIMEOUT:
+        print(f"[{name}] タイムアウトのため 1 回リトライします。", file=sys.stderr)
+        outcome = auto_login(page, credentials)
+
+    if outcome is AutoLoginOutcome.SUCCESS:
+        _reset_credentials_failure(profile_dir, credentials)
+        return True
+
+    _record_credentials_failure(profile_dir, credentials)
+    return False
+
+
+def _ensure_authenticated(
+    page: Page, name: str, profile_dir: Path, options: RunOptions
+) -> bool:
+    """check_login → auto-relogin ゲートで最終的にログイン済みかを返す。
+
+    False のときは呼び出し側で従来と同じ未ログイン扱い (exit_code=1) にする。
+    ここでユーザ向けの案内メッセージも 1 か所に集約する。
+    """
+    if check_login(page):
+        return True
+    if options.auto_relogin and attempt_auto_relogin(page, profile_dir, name):
+        return True
+    print(
+        f"[{name}] 未ログイン。"
+        f"`uv run canvasser.py login --account {name}` を実行してください。",
         file=sys.stderr,
     )
     return False
@@ -2235,6 +2383,9 @@ class RunOptions:
     daily_budget: int = 0
     consecutive_failure_limit: int = 1
     out_of_range_limit: int = 3
+    # credentials.json が保存されていれば `check_login()` false 時に auto_login を試す。
+    # `--no-auto-relogin` で明示的に無効化 (手動運用に戻すとき) できる。
+    auto_relogin: bool = True
 
 
 def process_account(
@@ -2262,12 +2413,7 @@ def process_account(
         if options.login_mode or options.login_init_mode:
             return 0, run_login_flow(page)
 
-        if not check_login(page):
-            print(
-                f"[{name}] 未ログイン。"
-                f"`uv run canvasser.py login --account {name}` を実行してください。",
-                file=sys.stderr,
-            )
+        if not _ensure_authenticated(page, name, profile_dir, options):
             return 0, 1
 
         gained = 0
@@ -2361,6 +2507,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="実 POST/PUT を送る。未指定は GET のみのドライラン (state 更新や "
         "checkin の滞在 sleep も行わない)。",
+    )
+    collect.add_argument(
+        "--no-auto-relogin",
+        action="store_true",
+        help=(
+            "credentials.json が保存されていても自動再ログインを行わない。"
+            "手動運用に戻したいときや、資格情報を一時的に無効化したいときに使う。"
+        ),
     )
 
     login = subparsers.add_parser(
@@ -2476,13 +2630,18 @@ def _build_run_options(args: argparse.Namespace) -> RunOptions:
     if args.command == "login-init":
         return RunOptions(login_init_mode=True)
     if args.command == "mission":
-        return RunOptions(run_mission=True, execute=args.execute)
+        return RunOptions(
+            run_mission=True,
+            execute=args.execute,
+            auto_relogin=not args.no_auto_relogin,
+        )
     return RunOptions(
         run_checkin=True,
         execute=args.execute,
         daily_budget=args.daily_budget,
         consecutive_failure_limit=args.consecutive_failure_limit,
         out_of_range_limit=args.out_of_range_limit,
+        auto_relogin=not args.no_auto_relogin,
     )
 
 
