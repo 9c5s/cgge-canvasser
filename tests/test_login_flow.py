@@ -14,7 +14,7 @@ from playwright.sync_api import Error as PlaywrightError
 
 import canvasser
 from canvasser import JST, AutoLoginOutcome, Credentials
-from tests._fakes import FakePage, as_page
+from tests._fakes import FakeBrowserContext, FakePage, as_context, as_page
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -84,19 +84,30 @@ class TestAutoLogin:
     def test_成功パスでSUCCESSを返す(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """フォーム操作後の 1 回目の check_login が is_login=True なら SUCCESS。"""
+        """フォーム操作後の 1 回目の check_login が is_login=True なら SUCCESS。
+
+        入力欄には fill("") で既存テキストをクリアしてから press_sequentially で
+        実キー入力を装う (press_sequentially が append 挙動なため二重入力を防止)。
+        """
         _install_fake_time(monkeypatch)
         fake = FakePage(responses=[_is_login_response(is_login=True)])
 
         result = canvasser.auto_login(as_page(fake), _sample_creds(), timeout_sec=1)
 
         assert result is AutoLoginOutcome.SUCCESS
-        # フォーム入力シーケンスの検証 (press_sequentially → click)
-        interactions = {"press_sequentially", "click"}
+        # フォーム入力シーケンスの検証 (fill("") → press_sequentially → click)
+        interactions = {"fill", "press_sequentially", "click"}
         locator_calls = [c for c in fake.calls if c[0] in interactions]
+        assert ("fill", ("#mail", "")) in locator_calls
+        assert ("fill", ("#pass", "")) in locator_calls
         assert ("press_sequentially", ("#mail", "user@example.com")) in locator_calls
         assert ("press_sequentially", ("#pass", "hunter2")) in locator_calls
         assert ("click", "#btn-idpw-login") in locator_calls
+        # fill は press_sequentially より前に来る
+        assert locator_calls.index(("fill", ("#mail", ""))) < locator_calls.index((
+            "press_sequentially",
+            ("#mail", "user@example.com"),
+        ))
         assert "ログイン成功を検知" in capsys.readouterr().err
 
     def test_エラーDOM可視化でPASSWORD_ERROR(
@@ -354,6 +365,7 @@ class TestAttemptAutoRelogin:
 
         step=10.0 で auto_login 1 回あたり ~5 回ポーリングされるため、6 個目に
         SUCCESS 応答を置くと 2 回目 auto_login の 1 iter 目で成功する。
+        リトライ時はフォームリセットのため LOGIN_ENTRY_URL に再遷移する。
         """
         _install_creds(tmp_path)
         _install_fake_time(monkeypatch, step=10.0)
@@ -367,6 +379,9 @@ class TestAttemptAutoRelogin:
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is True
+        # 初回 + リトライで goto は 2 回呼ばれる
+        goto_calls = [c for c in fake.calls if c[0] == "goto"]
+        assert len(goto_calls) == 2
 
     def test_リトライしても失敗すればFalseと失敗カウント加算(
         self,
@@ -374,7 +389,7 @@ class TestAttemptAutoRelogin:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """TIMEOUT → TIMEOUT で False かつ failure_count = 1。"""
+        """TIMEOUT → TIMEOUT で False かつ failure_count = 1、goto 2 回。"""
         _install_creds(tmp_path)
         _install_fake_time(monkeypatch, step=10.0)
         # 2 回の auto_login 分のポーリング応答をたっぷり用意する
@@ -387,11 +402,12 @@ class TestAttemptAutoRelogin:
         assert got is not None
         assert got.failure_count == 1
         assert "リトライします" in capsys.readouterr().err
+        assert len([c for c in fake.calls if c[0] == "goto"]) == 2
 
     def test_パスワード誤りは即Falseでリトライしない(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """PASSWORD_ERROR は即 False + failure_count 加算、evaluate は 1 回だけ。"""
+        """PASSWORD_ERROR は即 False + failure_count 加算、goto は 1 回のみ。"""
         _install_creds(tmp_path)
         _install_fake_time(monkeypatch)
         fake = FakePage(
@@ -405,15 +421,21 @@ class TestAttemptAutoRelogin:
         # evaluate は 1 回のみ (リトライしていない)
         evaluate_calls = [c for c in fake.calls if "async" in c[0]]
         assert len(evaluate_calls) == 1
+        # goto も 1 回のみ (リトライしていない)
+        assert len([c for c in fake.calls if c[0] == "goto"]) == 1
         got = canvasser.load_credentials(tmp_path)
         assert got is not None
         assert got.failure_count == 1
 
-    def test_goto失敗はFalseと失敗カウント加算(
+    def test_初回goto失敗はFalseだがfailure_countは加算しない(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """BNID login への遷移で PlaywrightError なら False + failure_count 加算。"""
-        _install_creds(tmp_path)
+        """認証情報を BNID に送る前の一時的なネットワーク不調は据え置く。
+
+        BNID にパスワードを送っていないので BNID ロックの原因にならず、
+        failure_count は加算せず disabled_until への進行も止める。
+        """
+        _install_creds(tmp_path, failure_count=2)
         fake = FakePage(goto_errors=[PlaywrightError("navigation failed")])
 
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
@@ -422,4 +444,181 @@ class TestAttemptAutoRelogin:
         assert "BNID ログイン画面への遷移で失敗" in capsys.readouterr().err
         got = canvasser.load_credentials(tmp_path)
         assert got is not None
+        # 初期値 2 のまま + disabled_until も未設定 (自動再ログインは次回も試せる)
+        assert got.failure_count == 2
+        assert got.disabled_until is None
+
+    def test_リトライgoto失敗は認証試行済みなのでfailure_countを加算(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """1 回目 auto_login TIMEOUT の後にリトライ用 goto が失敗するケース。
+
+        1 回目の auto_login は既に BNID に入力を送信しているため、リトライ用
+        goto が失敗しても認証試行 1 回分は計上する (BNID 側から見て入力送信済)。
+        """
+        _install_creds(tmp_path)
+        _install_fake_time(monkeypatch, step=10.0)
+        fake = FakePage(
+            responses=[_is_login_response(is_login=False)] * 6,
+            # 1 回目 goto 成功、2 回目 goto (リトライ) 失敗
+            goto_errors=[None, PlaywrightError("retry navigation failed")],
+        )
+
+        result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
+
+        assert result is False
+        got = canvasser.load_credentials(tmp_path)
+        assert got is not None
         assert got.failure_count == 1
+
+
+def _run_options(*, execute: bool, auto_relogin: bool = True) -> canvasser.RunOptions:
+    """_ensure_authenticated テスト用の RunOptions を組み立てる。"""
+    return canvasser.RunOptions(
+        run_mission=True, execute=execute, auto_relogin=auto_relogin
+    )
+
+
+class TestEnsureAuthenticated:
+    """_ensure_authenticated のログイン判定・dry-run ゲート。"""
+
+    def test_ログイン済みならTrue(self) -> None:
+        """check_login が true なら auto_relogin を試さずに True。"""
+        fake = FakePage(responses=[_is_login_response(is_login=True)])
+        opts = _run_options(execute=True)
+
+        assert (
+            canvasser._ensure_authenticated(
+                as_page(fake), "haruo", canvasser.Path("."), opts
+            )
+            is True
+        )
+
+    def test_dry_runでは自動再ログインを走らせない(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """execute=False では credentials が保存されていても auto_login を送らない。"""
+        _install_creds(tmp_path)
+        _install_fake_time(monkeypatch)
+        # check_login: 未ログイン、以降 auto_login への呼び出しは想定しない
+        fake = FakePage(responses=[_is_login_response(is_login=False)])
+        opts = _run_options(execute=False)
+
+        result = canvasser._ensure_authenticated(as_page(fake), "haruo", tmp_path, opts)
+
+        assert result is False
+        # dry-run では auto_login のフォーム操作 (fill/press_sequentially) が起きない
+        assert not any(c[0] == "fill" for c in fake.calls)
+        assert not any(c[0] == "press_sequentially" for c in fake.calls)
+        # 未ログインメッセージだけ出る
+        assert "未ログイン" in capsys.readouterr().err
+
+    def test_execute_かつauto_relogin無効なら自動再ログインを走らせない(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--no-auto-relogin は execute でも auto_login を封じる (opt-out 尊重)。"""
+        _install_creds(tmp_path)
+        _install_fake_time(monkeypatch)
+        fake = FakePage(responses=[_is_login_response(is_login=False)])
+        opts = _run_options(execute=True, auto_relogin=False)
+
+        result = canvasser._ensure_authenticated(as_page(fake), "haruo", tmp_path, opts)
+
+        assert result is False
+        assert not any(c[0] == "press_sequentially" for c in fake.calls)
+
+    def test_execute_かつauto_relogin有効なら自動再ログインを試す(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """execute + auto_relogin 有効かつ credentials 保存で auto_login が走る。"""
+        _install_creds(tmp_path)
+        _install_fake_time(monkeypatch)
+        # 1 回目 check_login=false → auto_login 走行 → is_login=true で SUCCESS
+        fake = FakePage(
+            responses=[
+                _is_login_response(is_login=False),
+                _is_login_response(is_login=True),
+            ]
+        )
+        opts = _run_options(execute=True)
+
+        assert (
+            canvasser._ensure_authenticated(as_page(fake), "haruo", tmp_path, opts)
+            is True
+        )
+        # auto_login のフォーム操作が実際に呼ばれた
+        assert any(c[0] == "press_sequentially" for c in fake.calls)
+
+
+class TestRunLoginInitFlow:
+    """run_login_init_flow の Cookie クリア + auto_login 検証フロー。"""
+
+    def test_成功時は0を返しCookieを破棄する(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """auto_login SUCCESS で終了コード 0、context.clear_cookies が 1 回。"""
+        _install_creds(tmp_path)
+        _install_fake_time(monkeypatch)
+        fake_page = FakePage(responses=[_is_login_response(is_login=True)])
+        fake_ctx = FakeBrowserContext()
+
+        code = canvasser.run_login_init_flow(
+            as_context(fake_ctx), as_page(fake_page), tmp_path
+        )
+
+        assert code == 0
+        assert fake_ctx.calls == ["clear_cookies"]
+        assert any(c[0] == "goto" for c in fake_page.calls)
+        # auto_login の入力操作が実行された
+        assert any(c[0] == "press_sequentially" for c in fake_page.calls)
+
+    def test_credentials無しでは手動フローにフォールバック(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """credentials.json が読めない場合は run_login_flow に委譲する。"""
+        _install_fake_time(monkeypatch)
+        # run_login_flow は check_login を is_login=true で 1 回返せば即 return 0
+        fake_page = FakePage(responses=[_is_login_response(is_login=True)])
+        fake_ctx = FakeBrowserContext()
+
+        code = canvasser.run_login_init_flow(
+            as_context(fake_ctx), as_page(fake_page), tmp_path
+        )
+
+        assert code == 0
+        # Cookie 破棄は creds が無いのでスキップされる
+        assert fake_ctx.calls == []
+        assert "credentials.json を読めません" in capsys.readouterr().err
+
+    def test_auto_login失敗時は手動フローにフォールバック(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """PASSWORD_ERROR 検知後は run_login_flow に落ちる。手動操作を委ねる形。"""
+        _install_creds(tmp_path)
+        _install_fake_time(monkeypatch)
+        fake_page = FakePage(
+            # auto_login 用: is_login=false + エラー DOM 可視化 → PASSWORD_ERROR
+            # run_login_flow フォールバック: is_login=true で即成功
+            responses=[
+                _is_login_response(is_login=False),
+                _is_login_response(is_login=True),
+            ],
+            visibility={"#error-input-area .c-message--warning": True},
+        )
+        fake_ctx = FakeBrowserContext()
+
+        code = canvasser.run_login_init_flow(
+            as_context(fake_ctx), as_page(fake_page), tmp_path
+        )
+
+        assert code == 0
+        assert "自動検証に失敗" in capsys.readouterr().err
