@@ -2149,6 +2149,11 @@ def _auto_login_with_retry(
     auto_login を再実行する。リトライ用の goto が失敗した場合は FORM_ERROR に
     落として呼び出し側で failure_count に計上させる (1 回目 TIMEOUT はすでに認証を
     試行済み)。
+
+    リトライ用 goto 後には `check_login()` で「遅延成功」を確認する。1 回目 submit が
+    タイムアウト後に成功して session が有効化したケースを FORM_ERROR に誤判定
+    しないためのガード (2 回目 goto は valid cookie で mission page へ戻され
+    #mail が見つからないため FORM_ERROR に落ちる)。
     """
     outcome = auto_login(page, credentials)
     if outcome is not AutoLoginOutcome.TIMEOUT:
@@ -2162,6 +2167,12 @@ def _auto_login_with_retry(
             file=sys.stderr,
         )
         return AutoLoginOutcome.FORM_ERROR
+    if check_login(page):
+        print(
+            f"[{name}] タイムアウト後に遅延成功を検知しました。",
+            file=sys.stderr,
+        )
+        return AutoLoginOutcome.SUCCESS
     return auto_login(page, credentials)
 
 
@@ -2172,6 +2183,11 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
     への初回遷移で失敗した場合は「認証情報を BNID に送っていない」ため
     failure_count には計上せず False を返す (ネットワーク不調で BNID 側のロックを
     刺激するのを避ける)。
+
+    goto 直後には `check_login()` で「初回 check_login の false negative」を
+    確認する。cookie が実は有効で mission page へリダイレクトされている場合、
+    LOGIN_ENTRY_URL 遷移後も #mail が無く FORM_ERROR に落ちてしまうため、
+    ここで検知して短絡する。
 
     タイムアウトのみ `_auto_login_with_retry` が 1 回リトライする。それ以外の
     失敗 (パスワード誤り・CAPTCHA・フォーム操作エラー・リトライ後失敗) は
@@ -2192,6 +2208,17 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
             file=sys.stderr,
         )
         return False
+
+    # 初回 check_login が false negative だった場合の救済。cookie が実は有効なら
+    # LOGIN_ENTRY_URL は mission page へ戻され、そのまま auto_login すると
+    # #mail が無く FORM_ERROR に落ちて有効 session を潰す。ここで検知して短絡する。
+    if check_login(page):
+        print(
+            f"[{name}] BNID ログイン画面遷移後にセッション有効を確認しました。",
+            file=sys.stderr,
+        )
+        _reset_credentials_failure(profile_dir, credentials)
+        return True
 
     outcome = _auto_login_with_retry(page, name, credentials)
     if outcome is AutoLoginOutcome.SUCCESS:
@@ -2277,9 +2304,14 @@ def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> i
     フローなので、`context.clear_cookies()` で強制ログアウトしてから
     LOGIN_ENTRY_URL に遷移し、保存 creds で `auto_login` を回して実ログインを検証する。
 
-    `auto_login` が成功しなかった場合は手動 `run_login_flow` にフォールバックする
-    (CAPTCHA / 2FA が予期せず出た場合や、DOM が変わって auto_login が働かない
-    ケースを吸収する)。
+    - SUCCESS: そのまま成功として exit 0。
+    - PASSWORD_ERROR: 保存 creds が明らかに間違っているため `credentials.json` を
+      削除して exit 1。手動 `run_login_flow` にフォールバックすると、ユーザが
+      別の (正しい) 資格情報でブラウザから手動ログインした場合に「Cookie が
+      有効なので成功」となり、間違った creds が残ったまま login-init が exit 0
+      で抜ける事故が起きる。それを防ぐため。
+    - TIMEOUT / CAPTCHA_DETECTED / FORM_ERROR: creds は正しい可能性があるので
+      削除せず、`run_login_flow` にフォールバックしてユーザに手動ログインを委ねる。
     """
     creds = load_credentials(profile_dir)
     if creds is None:
@@ -2307,9 +2339,27 @@ def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> i
         )
         return 0
 
+    if outcome is AutoLoginOutcome.PASSWORD_ERROR:
+        # 保存 creds が定義的に不正。credentials.json を削除して次回 login-init に
+        # 委ねる。ここで手動フォールバックすると、ユーザが正しい別 creds でブラウザ
+        # からログインしても「Cookie 成立で成功」と誤検証され、不正 creds が
+        # 残ったまま exit 0 で抜けてしまう。
+        cred_file = _credentials_file(profile_dir)
+        with contextlib.suppress(OSError):
+            cred_file.unlink()
+        print(
+            f"[login-init] 保存した認証情報での実ログインに失敗しました "
+            f"(BNID から認証エラー)。{cred_file} を削除しました。"
+            "正しい認証情報で `login-init` を再実行してください。",
+            file=sys.stderr,
+        )
+        return 1
+
+    # CAPTCHA / TIMEOUT / FORM_ERROR: creds は正しい可能性があるので保持し、
+    # ブラウザで手動ログインしてもらう (auto_login が届かないケースの受け皿)。
     print(
         f"[login-init] 自動検証に失敗しました (outcome={outcome.value})。"
-        "ブラウザで手動ログインしてください。",
+        "credentials.json は保持したまま、ブラウザで手動ログインしてください。",
         file=sys.stderr,
     )
     return run_login_flow(page)
