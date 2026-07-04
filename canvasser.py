@@ -2116,13 +2116,19 @@ def _reset_credentials_failure(profile_dir: Path, credentials: Credentials) -> N
     )
 
 
-def _record_credentials_failure(profile_dir: Path, credentials: Credentials) -> None:
-    """失敗時に failure_count を +1、必要なら disabled_until を設定する。
+def _record_credentials_failure(
+    profile_dir: Path, credentials: Credentials, *, submissions: int = 1
+) -> None:
+    """失敗時に failure_count へ submissions を加算し、必要なら disabled_until を設定。
 
     `CREDENTIALS_MAX_FAILURES` に達したら BNID アカウントロックを避けるため
     `CREDENTIALS_DISABLE_WINDOW_SEC` 秒後まで自動再ログインを停止する。
+
+    submissions は「実際に BNID にパスワードを送信した回数」。TIMEOUT リトライで
+    2 回連続 submit が起きたケースでは 2 を渡し、pre-submit の FORM_ERROR (送信なし)
+    ではそもそもこの関数を呼ばない (呼び出し側で判断する)。
     """
-    new_count = credentials.failure_count + 1
+    new_count = credentials.failure_count + submissions
     new_disabled = credentials.disabled_until
     if new_count >= CREDENTIALS_MAX_FAILURES:
         window = timedelta(seconds=CREDENTIALS_DISABLE_WINDOW_SEC)
@@ -2139,25 +2145,15 @@ def _record_credentials_failure(profile_dir: Path, credentials: Credentials) -> 
     )
 
 
-def _auto_login_with_retry(
+def _retry_after_timeout(
     page: Page, name: str, credentials: Credentials
-) -> AutoLoginOutcome:
-    """auto_login を回し、TIMEOUT のときだけ 1 回リトライして最終 outcome を返す。
+) -> tuple[AutoLoginOutcome, int]:
+    """1 回目 TIMEOUT を受けてリトライを実行し、(outcome, 追加 submit 回数) を返す。
 
-    同じページ状態でリトライすると `press_sequentially` が既存値に追記されて
-    二重入力になるため、`LOGIN_ENTRY_URL` に再遷移してフォームをリセットしてから
-    auto_login を再実行する。リトライ用の goto が失敗した場合は FORM_ERROR に
-    落として呼び出し側で failure_count に計上させる (1 回目 TIMEOUT はすでに認証を
-    試行済み)。
-
-    リトライ用 goto 後には `check_login()` で「遅延成功」を確認する。1 回目 submit が
-    タイムアウト後に成功して session が有効化したケースを FORM_ERROR に誤判定
-    しないためのガード (2 回目 goto は valid cookie で mission page へ戻され
-    #mail が見つからないため FORM_ERROR に落ちる)。
+    リトライ用 goto の失敗、post-retry check_login の遅延成功、2 回目 auto_login
+    の FORM_ERROR/TIMEOUT-late-success を扱う。呼び出し側で 1 回目 submit の 1
+    を足して最終的な submit 回数にする。
     """
-    outcome = auto_login(page, credentials)
-    if outcome is not AutoLoginOutcome.TIMEOUT:
-        return outcome
     print(f"[{name}] タイムアウトのため 1 回リトライします。", file=sys.stderr)
     try:
         page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
@@ -2166,14 +2162,45 @@ def _auto_login_with_retry(
             f"[{name}] リトライ時の BNID ログイン画面への遷移で失敗: {e}",
             file=sys.stderr,
         )
-        return AutoLoginOutcome.FORM_ERROR
+        return AutoLoginOutcome.TIMEOUT, 0
     if check_login(page):
-        print(
-            f"[{name}] タイムアウト後に遅延成功を検知しました。",
-            file=sys.stderr,
-        )
-        return AutoLoginOutcome.SUCCESS
-    return auto_login(page, credentials)
+        print(f"[{name}] タイムアウト後に遅延成功を検知しました。", file=sys.stderr)
+        return AutoLoginOutcome.SUCCESS, 0
+
+    second = auto_login(page, credentials)
+    if second is AutoLoginOutcome.FORM_ERROR:
+        # 2 回目は pre-submit で失敗 → 追加 submit は 0、1 回目 TIMEOUT だけ計上
+        return AutoLoginOutcome.TIMEOUT, 0
+    if second is AutoLoginOutcome.TIMEOUT and check_login(page):
+        print(f"[{name}] リトライ後にも遅延成功を検知しました。", file=sys.stderr)
+        return AutoLoginOutcome.SUCCESS, 1
+    return second, 1
+
+
+def _run_auto_login_sequence(
+    page: Page, name: str, credentials: Credentials
+) -> tuple[AutoLoginOutcome, int]:
+    """auto_login を最大 2 回試して (最終 outcome, 実 submit 回数) を返す。
+
+    TIMEOUT は 1 回だけリトライする (仕様。一時的なネットワーク遅延に備えて)。
+    リトライは `LOGIN_ENTRY_URL` に再遷移してフォームをリセットしてから行う
+    (`press_sequentially` が既存値に追記されるため)。
+
+    submit 回数 (BNID にパスワードを送った回数) は、呼び出し側で failure_count
+    に加算する量を決めるのに使う。BNID 側のアカウントロック閾値を刺激しないよう
+    submit 回数を正確に計上する:
+
+    - `FORM_ERROR` (pre-submit フォーム操作失敗): submit=0。BNID に届いていない。
+    - `SUCCESS`/`PASSWORD_ERROR`/`CAPTCHA_DETECTED`/`TIMEOUT`: submit=1 以上。
+    - リトライ経路の詳細は `_retry_after_timeout` を参照。
+    """
+    first = auto_login(page, credentials)
+    if first is AutoLoginOutcome.FORM_ERROR:
+        return first, 0
+    if first is not AutoLoginOutcome.TIMEOUT:
+        return first, 1
+    outcome, extra_submissions = _retry_after_timeout(page, name, credentials)
+    return outcome, 1 + extra_submissions
 
 
 def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
@@ -2189,9 +2216,9 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
     LOGIN_ENTRY_URL 遷移後も #mail が無く FORM_ERROR に落ちてしまうため、
     ここで検知して短絡する。
 
-    タイムアウトのみ `_auto_login_with_retry` が 1 回リトライする。それ以外の
-    失敗 (パスワード誤り・CAPTCHA・フォーム操作エラー・リトライ後失敗) は
-    failure_count を +1 する。
+    auto_login の呼び出しは `_run_auto_login_sequence` に委譲し、実 submit 回数
+    ぶんだけ failure_count を加算する。pre-submit の FORM_ERROR (BNID に届いて
+    いない) はそもそも加算しない。
     """
     credentials = load_credentials(profile_dir)
     if credentials is None or _credentials_disabled(credentials, name):
@@ -2220,11 +2247,12 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
         _reset_credentials_failure(profile_dir, credentials)
         return True
 
-    outcome = _auto_login_with_retry(page, name, credentials)
+    outcome, submissions = _run_auto_login_sequence(page, name, credentials)
     if outcome is AutoLoginOutcome.SUCCESS:
         _reset_credentials_failure(profile_dir, credentials)
         return True
-    _record_credentials_failure(profile_dir, credentials)
+    if submissions > 0:
+        _record_credentials_failure(profile_dir, credentials, submissions=submissions)
     return False
 
 
@@ -2306,17 +2334,20 @@ def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> i
 
     - SUCCESS: そのまま成功として exit 0。
     - PASSWORD_ERROR: 保存 creds が明らかに間違っているため `credentials.json` を
-      削除して exit 1。手動 `run_login_flow` にフォールバックすると、ユーザが
-      別の (正しい) 資格情報でブラウザから手動ログインした場合に「Cookie が
-      有効なので成功」となり、間違った creds が残ったまま login-init が exit 0
-      で抜ける事故が起きる。それを防ぐため。
-    - TIMEOUT / CAPTCHA_DETECTED / FORM_ERROR: creds は正しい可能性があるので
-      削除せず、`run_login_flow` にフォールバックしてユーザに手動ログインを委ねる。
+      削除して exit 1。
+    - CAPTCHA_DETECTED / TIMEOUT / FORM_ERROR: 保存 creds が正しいという証拠が
+      得られていないため exit 1。credentials.json は保持し (creds が正しい
+      可能性は残る)、ユーザに `login-init` 再実行または手動 `login` を促す。
+      run_login_flow へのフォールバックは **意図的に行わない**: フォールバック
+      すると、ユーザが正しい別 creds でブラウザからログインした場合に「Cookie
+      成立で成功」と誤検証され、保存されている未検証 creds が exit 0 で
+      抜けてしまう事故が起きるため。
     """
     creds = load_credentials(profile_dir)
     if creds is None:
         # persist_login_init_credentials 直後なので通常は入っているはずだが、
-        # 手改変等で読めない場合はフォールバックで手動ログインへ回す。
+        # 手改変等で読めない場合はフォールバックで手動ログインへ回す
+        # (検証すべき creds が無いので誤検証リスクもない)。
         print("[login-init] credentials.json を読めません。", file=sys.stderr)
         return run_login_flow(page)
 
@@ -2328,8 +2359,13 @@ def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> i
     try:
         page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
     except PlaywrightError as e:
-        print(f"[login-init] BNID ログイン画面への遷移で失敗: {e}", file=sys.stderr)
-        return run_login_flow(page)
+        print(
+            f"[login-init] BNID ログイン画面への遷移で失敗: {e}"
+            "。credentials.json は保持しました。もう一度 login-init を"
+            "実行してください。",
+            file=sys.stderr,
+        )
+        return 1
 
     outcome = auto_login(page, creds)
     if outcome is AutoLoginOutcome.SUCCESS:
@@ -2340,10 +2376,6 @@ def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> i
         return 0
 
     if outcome is AutoLoginOutcome.PASSWORD_ERROR:
-        # 保存 creds が定義的に不正。credentials.json を削除して次回 login-init に
-        # 委ねる。ここで手動フォールバックすると、ユーザが正しい別 creds でブラウザ
-        # からログインしても「Cookie 成立で成功」と誤検証され、不正 creds が
-        # 残ったまま exit 0 で抜けてしまう。
         cred_file = _credentials_file(profile_dir)
         with contextlib.suppress(OSError):
             cred_file.unlink()
@@ -2355,14 +2387,17 @@ def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> i
         )
         return 1
 
-    # CAPTCHA / TIMEOUT / FORM_ERROR: creds は正しい可能性があるので保持し、
-    # ブラウザで手動ログインしてもらう (auto_login が届かないケースの受け皿)。
+    # CAPTCHA_DETECTED / TIMEOUT / FORM_ERROR: 検証未達。credentials.json は
+    # 保持するが exit 1 で抜け、ユーザに次のアクションを促す。フォールバックの
+    # `run_login_flow` は誤検証リスクがあるため使わない。
     print(
         f"[login-init] 自動検証に失敗しました (outcome={outcome.value})。"
-        "credentials.json は保持したまま、ブラウザで手動ログインしてください。",
+        "credentials.json は保持しています。手動ログインで検証したい場合は "
+        "`uv run canvasser.py login --account NAME` を、"
+        "認証情報を再入力する場合は `login-init` を再実行してください。",
         file=sys.stderr,
     )
-    return run_login_flow(page)
+    return 1
 
 
 # パストラバーサル (../) や絶対パス指定を排除するため、basename として安全な
