@@ -188,6 +188,29 @@ def _success_payload_or_raise(res: dict[str, Any], err_prefix: str) -> dict[str,
     return cast("dict[str, Any]", body.get("payload") or {})
 
 
+# BNID ログイン画面 (Phase 1 で id ベースの安定 selector を確認済み) の DOM 契約。
+# `#mail` / `#pass` は input、`#btn-idpw-login` は submit ボタン
+# (初期 disabled、両方入力で enable)。エラー表示は `#error-input-area
+# .c-message--warning`。
+# 制約: BNID はキー入力イベントで disabled を外すため、`fill()` ではなく
+# `press_sequentially()` を必ず使う (Phase 1 で判明)。
+_LOGIN_MAIL_SEL = "#mail"
+_LOGIN_PASS_SEL = "#pass"  # noqa: S105 (CSS selector, not a credential)
+_LOGIN_BTN_SEL = "#btn-idpw-login"
+_LOGIN_BTN_ENABLED_SEL = "#btn-idpw-login:not([disabled])"
+_LOGIN_ERROR_SEL = "#error-input-area .c-message--warning"
+
+# CAPTCHA / 2FA が (将来的に) 混入した時に検知するための selector。
+# Phase 1 時点では BNID は初期表示・1回失敗のいずれでも痕跡なしだが、動的挿入に
+# 備えて防御的に見張る。
+_LOGIN_CAPTCHA_SELECTORS: tuple[str, ...] = (
+    'iframe[src*="captcha"]',
+    'iframe[src*="recaptcha"]',
+    'iframe[src*="hcaptcha"]',
+    'iframe[src*="turnstile"]',
+)
+
+
 def check_login(page: Page) -> bool:
     """auths/login/check を叩いて認証状態を確認する。
 
@@ -1930,6 +1953,96 @@ def persist_login_init_credentials(profile_dir: Path) -> None:
         "続けてブラウザでログインを検証します。",
         file=sys.stderr,
     )
+
+
+def _login_error_visible(page: Page) -> bool:
+    """パスワード誤り等のエラー DOM が可視化されているか。
+
+    Playwright の一時失敗は捕捉して False に丸める (未マウント要素の可視性判定は
+    エラーになりうる)。
+    """
+    with contextlib.suppress(PlaywrightError):
+        return page.locator(_LOGIN_ERROR_SEL).is_visible()
+    return False
+
+
+def _detect_login_captcha(page: Page) -> bool:
+    """CAPTCHA / 2FA を示唆する iframe が挿入されているか。
+
+    Phase 1 時点では検知なしだが、将来的な動的挿入に備えて監視する。
+    どのセレクタでも 1 個以上マッチしたら True。
+    """
+    for sel in _LOGIN_CAPTCHA_SELECTORS:
+        with contextlib.suppress(PlaywrightError):
+            if page.locator(sel).count() > 0:
+                return True
+    return False
+
+
+def auto_login(
+    page: Page,
+    credentials: Credentials,
+    *,
+    timeout_sec: int = 60,
+    interval_sec: float = 1.0,
+) -> bool:
+    """BNID ログイン画面でメール/パスワードを自動入力し、成功したら True を返す。
+
+    Phase 1 で判明した DOM 制約に準拠する:
+    - `fill()` は disabled を外せないため `press_sequentially()` で実キー入力を装う。
+    - `<form>` submit ではなく `#btn-idpw-login` の click で発火する
+      (SPA 独自スクリプト側で送信するため Enter 送信は動作保証なし)。
+    - HTTP ステータスは常に 200 なので、成功/失敗は「is_login フラグ vs エラー DOM」の
+      race で判定する。
+
+    失敗パス:
+    - パスワード誤り: `#error-input-area .c-message--warning` の可視化を検知して False。
+      Username enumeration 対策のためメアド違いと PW 違いは区別できず、両方まとめて
+      「認証情報のいずれかが不正」で abort する。
+    - CAPTCHA / 2FA: 監視 selector にマッチしたら False。手動 `login` サブコマンドへ
+      誘導する。
+    - タイムアウト: `timeout_sec` を超えても is_login にならなければ False。
+    """
+    # フォーム入力・送信。ここで失敗したら本処理に入れないため即 False。
+    try:
+        page.locator(_LOGIN_MAIL_SEL).press_sequentially(credentials.bnid_email)
+        page.locator(_LOGIN_PASS_SEL).press_sequentially(credentials.bnid_password)
+        # disabled が外れるまで待ってからクリックする (Phase 1 の必須手順)
+        page.locator(_LOGIN_BTN_ENABLED_SEL).wait_for(timeout=5000)
+        page.locator(_LOGIN_BTN_SEL).click()
+    except PlaywrightError as e:
+        print(f"[auto_login] フォーム操作でエラー: {e}", file=sys.stderr)
+        return False
+
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        # ログイン画面リダイレクト中の fetch は失敗する。次のポーリングに委ねる。
+        with contextlib.suppress(PlaywrightError):
+            if check_login(page):
+                print("[auto_login] ログイン成功を検知しました。", file=sys.stderr)
+                return True
+            if _login_error_visible(page):
+                print(
+                    "[auto_login] BNID から認証エラーが返されました。"
+                    "メールアドレスかパスワードが誤っている可能性があります。",
+                    file=sys.stderr,
+                )
+                return False
+            if _detect_login_captcha(page):
+                print(
+                    "[auto_login] CAPTCHA/2FA を検知しました。"
+                    "`uv run canvasser.py login --account NAME` で"
+                    "手動ログインしてください。",
+                    file=sys.stderr,
+                )
+                return False
+        time.sleep(interval_sec)
+
+    print(
+        "[auto_login] タイムアウト。ログイン結果を検知できませんでした。",
+        file=sys.stderr,
+    )
+    return False
 
 
 def run_login_flow(
