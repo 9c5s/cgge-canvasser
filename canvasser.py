@@ -1472,6 +1472,10 @@ def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
 LAST_CHECKIN_SCHEMA_VERSION = 2
 _STATE_FILENAME = "canvasser_state.json"
 _CREDENTIALS_FILENAME = "credentials.json"
+# login-init で「対話入力を保存 → 実ログインで検証」する間、既存の active
+# credentials.json を上書きせずに退避する pending ファイル。SUCCESS を確認できた
+# ときだけ active に昇格させる。
+_CREDENTIALS_PENDING_FILENAME = "credentials.json.pending"
 
 # BNID の連続ログイン失敗をこの回数まで許容し、超えたら disabled_until を書き込んで
 # 一時停止する。BNID 側のアカウントロック閾値を刺激しないための緩めの上限。
@@ -1691,8 +1695,13 @@ class Credentials:
 
 
 def _credentials_file(profile_dir: Path) -> Path:
-    """profile_dir 配下の credentials.json パスを返す。"""
+    """profile_dir 配下の active credentials.json パスを返す。"""
     return profile_dir / _CREDENTIALS_FILENAME
+
+
+def _pending_credentials_file(profile_dir: Path) -> Path:
+    """profile_dir 配下の pending (未検証) credentials.json.pending パスを返す。"""
+    return profile_dir / _CREDENTIALS_PENDING_FILENAME
 
 
 def _apply_credentials_permissions(path: Path) -> None:
@@ -1726,28 +1735,25 @@ def _apply_credentials_permissions(path: Path) -> None:
         )
 
 
-def load_credentials(profile_dir: Path) -> Credentials | None:
-    """`profile_dir/credentials.json` を読み込む。
+def _load_credentials_from(path: Path) -> Credentials | None:
+    """指定パスから Credentials を fail-safe に読み込む共通実装。
 
-    ファイル非存在は「機能無効」として `None` を返す (自動再ログイン無効化と同義)。
-    JSON パース失敗・型不一致は認証情報を無視するために `None` に丸め、stderr に
-    警告を出す。認証情報そのもの (メアド/パスワード) はログに出さない。
+    ファイル非存在は `None`。JSON パース失敗・型不一致は認証情報を無視するために
+    `None` に丸め、stderr に警告を出す (認証情報そのものはログに出さない)。
     """
-    cred_file = _credentials_file(profile_dir)
-    if not cred_file.exists():
+    if not path.exists():
         return None
     try:
-        raw = json.loads(cred_file.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
         print(
-            f"[warn] {cred_file} を読めません: {e}。認証情報を無視します。",
+            f"[warn] {path} を読めません: {e}。認証情報を無視します。",
             file=sys.stderr,
         )
         return None
     if not isinstance(raw, dict):
         print(
-            f"[warn] {cred_file} のトップレベルが dict でありません。"
-            "認証情報を無視します。",
+            f"[warn] {path} のトップレベルが dict でありません。認証情報を無視します。",
             file=sys.stderr,
         )
         return None
@@ -1761,15 +1767,14 @@ def load_credentials(profile_dir: Path) -> Credentials | None:
         or not password
     ):
         print(
-            f"[warn] {cred_file} に bnid_email / bnid_password が"
-            "正しく入っていません。認証情報を無視します。",
+            f"[warn] {path} に bnid_email / bnid_password が正しく入っていません。"
+            "認証情報を無視します。",
             file=sys.stderr,
         )
         return None
     saved_at_raw = data.get("saved_at", "")
     saved_at = saved_at_raw if isinstance(saved_at_raw, str) else ""
     failure_count_raw = data.get("failure_count", 0)
-    # bool は int の subclass なので明示的に排除する
     is_valid_int = isinstance(failure_count_raw, int) and not isinstance(
         failure_count_raw, bool
     )
@@ -1785,17 +1790,14 @@ def load_credentials(profile_dir: Path) -> Credentials | None:
     )
 
 
-def save_credentials(profile_dir: Path, credentials: Credentials) -> None:
-    """`profile_dir/credentials.json` に atomic に書き出す。
+def _save_credentials_to(path: Path, credentials: Credentials) -> None:
+    """指定パスに Credentials を atomic 書き出し + 権限縮小する共通実装。
 
-    `save_account_state` と同じ「tempfile → fsync → replace」パターンで、
-    書き込み中クラッシュしても既存ファイルは壊れない。書き込み後にファイル権限を
-    最小限に絞る。
+    `save_account_state` と同じ「tempfile → fsync → replace」パターン。
     """
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    cred_file = _credentials_file(profile_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
-        prefix=".credentials-", suffix=".tmp", dir=str(profile_dir)
+        prefix=".credentials-", suffix=".tmp", dir=str(path.parent)
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1808,12 +1810,54 @@ def save_credentials(profile_dir: Path, credentials: Credentials) -> None:
             )
             f.flush()
             os.fsync(f.fileno())
-        Path(tmp_path).replace(cred_file)
+        Path(tmp_path).replace(path)
     except Exception:
         with contextlib.suppress(OSError):
             Path(tmp_path).unlink()
         raise
-    _apply_credentials_permissions(cred_file)
+    _apply_credentials_permissions(path)
+
+
+def load_credentials(profile_dir: Path) -> Credentials | None:
+    """`profile_dir/credentials.json` (active) を読み込む。"""
+    return _load_credentials_from(_credentials_file(profile_dir))
+
+
+def save_credentials(profile_dir: Path, credentials: Credentials) -> None:
+    """`profile_dir/credentials.json` (active) に atomic に書き出す。"""
+    _save_credentials_to(_credentials_file(profile_dir), credentials)
+
+
+def load_pending_credentials(profile_dir: Path) -> Credentials | None:
+    """`profile_dir/credentials.json.pending` (未検証) を読み込む。"""
+    return _load_credentials_from(_pending_credentials_file(profile_dir))
+
+
+def save_pending_credentials(profile_dir: Path, credentials: Credentials) -> None:
+    """`profile_dir/credentials.json.pending` (未検証) に atomic に書き出す。
+
+    実ログインで検証成功 (SUCCESS) するまで active を上書きしないための退避場所。
+    ここに書いた時点では既存 active credentials は温存される。
+    """
+    _save_credentials_to(_pending_credentials_file(profile_dir), credentials)
+
+
+def _activate_pending_credentials(profile_dir: Path) -> None:
+    """Pending を active に atomic 置換して有効化する。
+
+    login-init で auto_login が SUCCESS に達したときにのみ呼ぶ。既存 active は
+    ここで pending に置き換わる。
+    """
+    pending = _pending_credentials_file(profile_dir)
+    active = _credentials_file(profile_dir)
+    pending.replace(active)
+    _apply_credentials_permissions(active)
+
+
+def _discard_pending_credentials(profile_dir: Path) -> None:
+    """Pending credentials を破棄する (active は温存)。検証失敗時に呼ぶ。"""
+    with contextlib.suppress(OSError):
+        _pending_credentials_file(profile_dir).unlink()
 
 
 def update_checkin_state(
@@ -1940,13 +1984,17 @@ def _prompt_credentials() -> tuple[str, str]:
 
 
 def persist_login_init_credentials(profile_dir: Path) -> None:
-    """login-init サブコマンド用: 対話入力 → credentials.json に保存する。
+    """login-init サブコマンド用: 対話入力 → pending credentials に保存する。
+
+    active credentials.json は上書きしない。実ログインで検証成功 (SUCCESS) した
+    ときにだけ `_activate_pending_credentials` で active に昇格させる。これで
+    新パスワードのタイプミスによって旧 active credentials を失う事故を防ぐ。
 
     profile_dir は事前に mkdir 済みを前提とする。resume 状態や連続失敗ガードは
-    login-init で「認証情報を入れ直した」ことになるため 0 / None にリセットする。
+    「認証情報を入れ直した」ことになるため 0 / None にリセットして pending に書く。
     """
     email, password = _prompt_credentials()
-    save_credentials(
+    save_pending_credentials(
         profile_dir,
         Credentials(
             bnid_email=email,
@@ -1955,8 +2003,8 @@ def persist_login_init_credentials(profile_dir: Path) -> None:
         ),
     )
     print(
-        f"認証情報を {_credentials_file(profile_dir)} に保存しました。"
-        "続けてブラウザでログインを検証します。",
+        f"認証情報を {_pending_credentials_file(profile_dir)} に一時保存しました。"
+        "続けてブラウザで検証します (検証成功時のみ active に昇格します)。",
         file=sys.stderr,
     )
 
@@ -2026,6 +2074,17 @@ def auto_login(
     - FORM_ERROR: フォーム操作中の PlaywrightError。DOM 変更やページ未ロードの可能性が
       あるためリトライしない。
     """
+    # submit 前に CAPTCHA / 2FA を検知する。BNID が最初から CAPTCHA を出している
+    # ケース (連続失敗による動的挿入等) では、フォームに入力してから submit しても
+    # 認証エラーで失敗するだけなので、パスワードを送信しないうちに abort する。
+    if _detect_login_captcha(page):
+        print(
+            "[auto_login] submit 前に CAPTCHA/2FA を検知しました。"
+            "`uv run canvasser.py login --account NAME` で手動ログインしてください。",
+            file=sys.stderr,
+        )
+        return AutoLoginOutcome.CAPTCHA_DETECTED
+
     # フォーム入力・送信。ここで失敗したら本処理に入れないため即 FORM_ERROR。
     # `press_sequentially` は既存テキストに追記する仕様のため、Playwright の永続
     # コンテキスト側で残っている自動入力や前回の残骸を `fill("")` で明示クリアしてから
@@ -2043,9 +2102,20 @@ def auto_login(
         print(f"[auto_login] フォーム操作でエラー: {e}", file=sys.stderr)
         return AutoLoginOutcome.FORM_ERROR
 
+    return _poll_login_outcome(page, timeout_sec=timeout_sec, interval_sec=interval_sec)
+
+
+def _poll_login_outcome(
+    page: Page, *, timeout_sec: int, interval_sec: float
+) -> AutoLoginOutcome:
+    """Submit 済みログイン画面をポーリングし、SUCCESS / エラー / TIMEOUT を判定する。
+
+    ページ内の状態変化 (is_login / エラー DOM / CAPTCHA) を interval_sec ごとに
+    確認する。ログイン画面リダイレクト中の fetch は一時的に失敗するため
+    PlaywrightError は握って次のポーリングに委ねる。
+    """
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
-        # ログイン画面リダイレクト中の fetch は失敗する。次のポーリングに委ねる。
         with contextlib.suppress(PlaywrightError):
             if check_login(page):
                 print("[auto_login] ログイン成功を検知しました。", file=sys.stderr)
@@ -2324,34 +2394,37 @@ def run_login_flow(
 
 
 def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> int:
-    """login-init 用のログイン検証フロー。保存済み credentials で auto_login を試す。
+    """login-init 用: pending credentials を実ログインで検証してから active 化する。
 
-    既存 Cookie が有効だと `run_login_flow` は「保存 creds を試さないまま
-    check_login が真になる」擬似成功で抜けてしまい、ミスタイプしたパスワードが
-    そのまま保存される抜け穴がある。login-init は明示的な「認証情報の再登録」
-    フローなので、`context.clear_cookies()` で強制ログアウトしてから
-    LOGIN_ENTRY_URL に遷移し、保存 creds で `auto_login` を回して実ログインを検証する。
+    `persist_login_init_credentials` は pending ファイル (credentials.json.pending)
+    に保存する。ここでは pending を読んで auto_login を回し、**SUCCESS のときにだけ**
+    `_activate_pending_credentials` で active credentials.json を置き換える。
 
-    - SUCCESS: そのまま成功として exit 0。
-    - PASSWORD_ERROR: 保存 creds が明らかに間違っているため `credentials.json` を
-      削除して exit 1。
-    - CAPTCHA_DETECTED / TIMEOUT / FORM_ERROR: 保存 creds が正しいという証拠が
-      得られていないため exit 1。credentials.json は保持し (creds が正しい
-      可能性は残る)、ユーザに `login-init` 再実行または手動 `login` を促す。
-      run_login_flow へのフォールバックは **意図的に行わない**: フォールバック
-      すると、ユーザが正しい別 creds でブラウザからログインした場合に「Cookie
-      成立で成功」と誤検証され、保存されている未検証 creds が exit 0 で
-      抜けてしまう事故が起きるため。
+    設計理由:
+    - **active を上書きしない**: 新パスワードのタイプミスで PASSWORD_ERROR になっても
+      旧 active credentials は温存されるので、既存アカウントの自動再ログイン能力を
+      失わない。
+    - **未検証 creds を active に置かない**: CAPTCHA / TIMEOUT / FORM_ERROR の
+      いずれも「保存パスワードで実ログインできる」証明になっていないので、
+      `_ensure_authenticated` からの unattended auto-relogin で「間違ったパスワード
+      が BNID にどんどん送信される」事故を防ぐため active に昇格させない。
+
+    - SUCCESS: `_activate_pending_credentials` で置換 → exit 0。
+    - PASSWORD_ERROR: pending 破棄 → exit 1 (active は温存)。
+    - CAPTCHA_DETECTED / TIMEOUT / FORM_ERROR: pending 破棄 → exit 1
+      (active 温存、ユーザに再実行を促す)。
+    - `run_login_flow` フォールバックは **行わない**: ブラウザで別 creds を使った
+      手動ログイン成功を「pending が検証成功」と誤解する事故を防ぐ。
     """
-    creds = load_credentials(profile_dir)
-    if creds is None:
+    pending = load_pending_credentials(profile_dir)
+    if pending is None:
         # persist_login_init_credentials 直後なので通常は入っているはずだが、
-        # 手改変等で読めない場合はフォールバックで手動ログインへ回す
-        # (検証すべき creds が無いので誤検証リスクもない)。
-        print("[login-init] credentials.json を読めません。", file=sys.stderr)
+        # 手改変等で読めない場合は手動ログインへ回す (検証すべき pending が
+        # 無いので active credentials を汚染するリスクもない)。
+        print("[login-init] pending credentials を読めません。", file=sys.stderr)
         return run_login_flow(page)
 
-    # 保存済み creds を確実に試すため既存 cookie を破棄する。login-init は
+    # pending creds を確実に試すため既存 cookie を破棄する。login-init は
     # 「認証情報の再登録」で session invalidate はアラインしている。
     with contextlib.suppress(PlaywrightError):
         ctx.clear_cookies()
@@ -2359,42 +2432,41 @@ def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> i
     try:
         page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
     except PlaywrightError as e:
+        _discard_pending_credentials(profile_dir)
         print(
-            f"[login-init] BNID ログイン画面への遷移で失敗: {e}"
-            "。credentials.json は保持しました。もう一度 login-init を"
-            "実行してください。",
+            f"[login-init] BNID ログイン画面への遷移で失敗: {e}。"
+            "pending は破棄しました。もう一度 login-init を実行してください。",
             file=sys.stderr,
         )
         return 1
 
-    outcome = auto_login(page, creds)
+    outcome = auto_login(page, pending)
     if outcome is AutoLoginOutcome.SUCCESS:
+        _activate_pending_credentials(profile_dir)
         print(
-            "[login-init] 保存した認証情報での実ログインを確認しました。",
+            "[login-init] pending credentials での実ログインを確認、active に"
+            "昇格しました。",
             file=sys.stderr,
         )
         return 0
 
+    # 以下、いずれの失敗ケースでも pending を破棄して active は温存する。
+    _discard_pending_credentials(profile_dir)
+
     if outcome is AutoLoginOutcome.PASSWORD_ERROR:
-        cred_file = _credentials_file(profile_dir)
-        with contextlib.suppress(OSError):
-            cred_file.unlink()
         print(
-            f"[login-init] 保存した認証情報での実ログインに失敗しました "
-            f"(BNID から認証エラー)。{cred_file} を削除しました。"
-            "正しい認証情報で `login-init` を再実行してください。",
+            "[login-init] pending credentials は BNID から認証エラーで拒否"
+            "されました。pending を破棄しました (active は温存)。正しい認証情報で"
+            " `login-init` を再実行してください。",
             file=sys.stderr,
         )
         return 1
 
-    # CAPTCHA_DETECTED / TIMEOUT / FORM_ERROR: 検証未達。credentials.json は
-    # 保持するが exit 1 で抜け、ユーザに次のアクションを促す。フォールバックの
-    # `run_login_flow` は誤検証リスクがあるため使わない。
     print(
         f"[login-init] 自動検証に失敗しました (outcome={outcome.value})。"
-        "credentials.json は保持しています。手動ログインで検証したい場合は "
-        "`uv run canvasser.py login --account NAME` を、"
-        "認証情報を再入力する場合は `login-init` を再実行してください。",
+        "pending を破棄し active credentials は温存しました。"
+        "`login-init` を再実行するか、"
+        "`uv run canvasser.py login --account NAME` で手動ログインしてください。",
         file=sys.stderr,
     )
     return 1
