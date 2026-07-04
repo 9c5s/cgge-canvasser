@@ -92,9 +92,13 @@ class TestAutoLogin:
         _install_fake_time(monkeypatch)
         fake = FakePage(responses=[_is_login_response(is_login=True)])
 
-        result = canvasser.auto_login(as_page(fake), _sample_creds(), timeout_sec=1)
+        result, submitted = canvasser.auto_login(
+            as_page(fake), _sample_creds(), timeout_sec=1
+        )
 
         assert result is AutoLoginOutcome.SUCCESS
+        # 実 submit は 1 回 (click 経由の POST 相当)
+        assert submitted == 1
         # フォーム入力シーケンスの検証 (fill("") → press_sequentially → click)
         interactions = {"fill", "press_sequentially", "click"}
         locator_calls = [c for c in fake.calls if c[0] in interactions]
@@ -120,9 +124,13 @@ class TestAutoLogin:
             visibility={"#error-input-area .c-message--warning": True},
         )
 
-        result = canvasser.auto_login(as_page(fake), _sample_creds(), timeout_sec=1)
+        result, submitted = canvasser.auto_login(
+            as_page(fake), _sample_creds(), timeout_sec=1
+        )
 
         assert result is AutoLoginOutcome.PASSWORD_ERROR
+        # click 済みなので submit=1
+        assert submitted == 1
         assert "認証エラー" in capsys.readouterr().err
 
     def test_submit前のCAPTCHAで即CAPTCHA_DETECTED(
@@ -139,9 +147,13 @@ class TestAutoLogin:
             counts={'iframe[src*="recaptcha"]': 1},
         )
 
-        result = canvasser.auto_login(as_page(fake), _sample_creds(), timeout_sec=1)
+        result, submitted = canvasser.auto_login(
+            as_page(fake), _sample_creds(), timeout_sec=1
+        )
 
         assert result is AutoLoginOutcome.CAPTCHA_DETECTED
+        # BNID にパスワード送信していないので submit=0
+        assert submitted == 0
         # フォーム入力操作は 1 つも走っていない (パスワード送信なし)
         assert not any(c[0] == "fill" for c in fake.calls)
         assert not any(c[0] == "press_sequentially" for c in fake.calls)
@@ -169,29 +181,37 @@ class TestAutoLogin:
             counts={'iframe[src*="turnstile"]': 1},
         )
 
-        result = canvasser.auto_login(as_page(fake), _sample_creds(), timeout_sec=1)
+        result, submitted = canvasser.auto_login(
+            as_page(fake), _sample_creds(), timeout_sec=1
+        )
 
+        # 現実装では pre-submit check で先に検知されるので submit=0
         assert result is AutoLoginOutcome.CAPTCHA_DETECTED
+        assert submitted == 0
         err = capsys.readouterr().err
         assert "CAPTCHA/2FA" in err
 
     def test_タイムアウトでTIMEOUT(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """成功も失敗も検知できなければ deadline 経過で TIMEOUT。"""
+        """成功も失敗も検知できなければ deadline 経過で TIMEOUT + submit=1。"""
         _install_fake_time(monkeypatch)
         # ポーリング分だけ「未ログイン」を返し続けても deadline で抜ける
         fake = FakePage(responses=[_is_login_response(is_login=False)] * 20)
 
-        result = canvasser.auto_login(as_page(fake), _sample_creds(), timeout_sec=1)
+        result, submitted = canvasser.auto_login(
+            as_page(fake), _sample_creds(), timeout_sec=1
+        )
 
         assert result is AutoLoginOutcome.TIMEOUT
+        # click 済みなので submit=1
+        assert submitted == 1
         assert "タイムアウト" in capsys.readouterr().err
 
     def test_フォーム操作エラーで即FORM_ERROR(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """メール入力で PlaywrightError なら poll に入らず FORM_ERROR。"""
+        """メール入力で PlaywrightError なら poll に入らず FORM_ERROR + submit=0。"""
         _install_fake_time(monkeypatch)
         fake = FakePage(
             responses=[],
@@ -202,9 +222,13 @@ class TestAutoLogin:
             },
         )
 
-        result = canvasser.auto_login(as_page(fake), _sample_creds(), timeout_sec=1)
+        result, submitted = canvasser.auto_login(
+            as_page(fake), _sample_creds(), timeout_sec=1
+        )
 
         assert result is AutoLoginOutcome.FORM_ERROR
+        # click に到達していないので BNID に届いていない
+        assert submitted == 0
         assert "フォーム操作でエラー" in capsys.readouterr().err
 
 
@@ -654,6 +678,58 @@ class TestAttemptAutoRelogin:
         assert got is not None
         # 1 回目 TIMEOUT ぶんだけ計上
         assert got.failure_count == 1
+
+    def test_初回auto_loginの_pre_submit_CAPTCHAはfailure_count加算しない(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """auto_login が submit 前に CAPTCHA を検知した場合の失敗ガード。
+
+        BNID にパスワードを送信していないので、CAPTCHA_DETECTED であっても
+        failure_count は加算しない (無駄な失敗計上で disabled_until を早期発動
+        させない)。
+        """
+        _install_creds(tmp_path, failure_count=1)
+        _install_fake_time(monkeypatch)
+        # post-init check_login False → auto_login pre-check で CAPTCHA 検知
+        fake = FakePage(
+            responses=[_is_login_response(is_login=False)],
+            counts={'iframe[src*="hcaptcha"]': 1},
+        )
+
+        result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
+
+        assert result is False
+        got = canvasser.load_credentials(tmp_path)
+        assert got is not None
+        # 初期値 1 のまま (BNID に届いていないので加算しない)
+        assert got.failure_count == 1
+
+    def test_failure_count上限近くのTIMEOUTはリトライを控える(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """failure_count が MAX-1 の状態で 1 回目 TIMEOUT ならリトライしない。
+
+        1 回目 submit で failure_count が MAX に到達する見込みなので、リトライで
+        更にもう 1 submit を追加すると BNID アカウントロック閾値を超える。予算超過を
+        避けるため retry_after_timeout で判定して控える。
+        """
+        max_fail = canvasser.CREDENTIALS_MAX_FAILURES
+        _install_creds(tmp_path, failure_count=max_fail - 1)
+        _install_fake_time(monkeypatch, step=10.0)
+        # 1 回目 auto_login TIMEOUT のポーリング 5 回分だけ用意する
+        # (2 回目 auto_login が走らないことも同時に検証)
+        fake = FakePage(responses=[_is_login_response(is_login=False)] * 6)
+
+        result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
+
+        assert result is False
+        # goto は 1 回のみ (リトライしていない)
+        assert len([c for c in fake.calls if c[0] == "goto"]) == 1
+        got = canvasser.load_credentials(tmp_path)
+        assert got is not None
+        # 1 回分だけ加算されて MAX に達し disabled_until が設定される
+        assert got.failure_count == max_fail
+        assert got.disabled_until is not None
 
     def test_リトライ後TIMEOUT_late_successをSUCCESSとして拾う(
         self,
