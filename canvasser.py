@@ -2091,7 +2091,8 @@ def auto_login(
         )
         return AutoLoginOutcome.CAPTCHA_DETECTED, 0
 
-    # フォーム入力・送信。ここで失敗したら本処理に入れないため即 FORM_ERROR。
+    # フォーム入力 (submit の 1 手前まで)。ここで失敗したら BNID に届いていないので
+    # FORM_ERROR/submit=0。
     # `press_sequentially` は既存テキストに追記する仕様のため、Playwright の永続
     # コンテキスト側で残っている自動入力や前回の残骸を `fill("")` で明示クリアしてから
     # キー入力する。fill 自体は disabled 状態を解除しないので、Phase 1 制約の
@@ -2103,10 +2104,18 @@ def auto_login(
         page.locator(_LOGIN_PASS_SEL).press_sequentially(credentials.bnid_password)
         # disabled が外れるまで待ってからクリックする (Phase 1 の必須手順)
         page.locator(_LOGIN_BTN_ENABLED_SEL).wait_for(timeout=5000)
-        page.locator(_LOGIN_BTN_SEL).click()
     except PlaywrightError as e:
         print(f"[auto_login] フォーム操作でエラー: {e}", file=sys.stderr)
         return AutoLoginOutcome.FORM_ERROR, 0
+
+    # click は別 try に分離する。click が起こす navigation を Playwright が待って
+    # timeout した場合、パスワードは既に送信済みの可能性が高い。ここで FORM_ERROR に
+    # 落とすと submit=0 で failure_count が加算されず、無限に BNID にパスワードを
+    # 投げ続ける事故になる。`no_wait_after=True` で navigation 待機をそもそも切り、
+    # それでも raise した場合は polling に進んで実結果 (SUCCESS/PASSWORD_ERROR/
+    # CAPTCHA_DETECTED/TIMEOUT) で分類する (submit=1 で計上)。
+    with contextlib.suppress(PlaywrightError):
+        page.locator(_LOGIN_BTN_SEL).click(no_wait_after=True)
 
     outcome = _poll_login_outcome(
         page, timeout_sec=timeout_sec, interval_sec=interval_sec
@@ -2256,9 +2265,16 @@ def _retry_after_timeout(
             file=sys.stderr,
         )
         return AutoLoginOutcome.TIMEOUT, 0
-    if check_login(page):
-        print(f"[{name}] タイムアウト後に遅延成功を検知しました。", file=sys.stderr)
-        return AutoLoginOutcome.SUCCESS, 0
+    # check_login は redirect 進行中に PlaywrightError を投げうる。ここで例外が
+    # 上流に escape すると、1 回目 submit の failure_count 加算が飛んで無限ループ
+    # 気味に BNID にパスワードを投げ続ける事故になる。polling と同じく suppress する。
+    with contextlib.suppress(PlaywrightError):
+        if check_login(page):
+            print(
+                f"[{name}] タイムアウト後に遅延成功を検知しました。",
+                file=sys.stderr,
+            )
+            return AutoLoginOutcome.SUCCESS, 0
 
     return _resolve_retry_outcome(page, name, credentials)
 
@@ -2271,9 +2287,16 @@ def _resolve_retry_outcome(
     if outcome is AutoLoginOutcome.FORM_ERROR:
         # 2 回目は pre-submit で失敗 → submit は 1 回目のみ
         return AutoLoginOutcome.TIMEOUT, 0
-    if outcome is AutoLoginOutcome.TIMEOUT and check_login(page):
-        print(f"[{name}] リトライ後にも遅延成功を検知しました。", file=sys.stderr)
-        return AutoLoginOutcome.SUCCESS, submitted
+    if outcome is AutoLoginOutcome.TIMEOUT:
+        # check_login は redirect 中に PlaywrightError を投げうるので suppress する。
+        # 失敗時は outcome=TIMEOUT のまま抜ける (失敗ガードは caller が計上する)。
+        with contextlib.suppress(PlaywrightError):
+            if check_login(page):
+                print(
+                    f"[{name}] リトライ後にも遅延成功を検知しました。",
+                    file=sys.stderr,
+                )
+                return AutoLoginOutcome.SUCCESS, submitted
     return outcome, submitted
 
 
@@ -2338,7 +2361,12 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
     # 初回 check_login が false negative だった場合の救済。cookie が実は有効なら
     # LOGIN_ENTRY_URL は mission page へ戻され、そのまま auto_login すると
     # #mail が無く FORM_ERROR に落ちて有効 session を潰す。ここで検知して短絡する。
-    if check_login(page):
+    # check_login は redirect 中に PlaywrightError を投げうるので suppress する
+    # (例外が escape すると failure_count 更新前に process_account に飛んでしまう)。
+    session_valid = False
+    with contextlib.suppress(PlaywrightError):
+        session_valid = check_login(page)
+    if session_valid:
         print(
             f"[{name}] BNID ログイン画面遷移後にセッション有効を確認しました。",
             file=sys.stderr,

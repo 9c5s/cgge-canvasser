@@ -58,9 +58,18 @@ class FakeLocator:
         """キー入力相当の入力。selector と text を記録する。"""
         self._page.calls.append(("press_sequentially", (self._selector, text)))
 
-    def click(self) -> None:
-        """クリック。selector を記録する。"""
-        self._page.calls.append(("click", self._selector))
+    def click(self, **kwargs: object) -> None:
+        """クリック。selector と kwargs (no_wait_after 等) を記録する。
+
+        click_errors[selector] に非 None が入っていればそれを raise (submit 中の
+        PlaywrightError を再現する用途)。
+        """
+        self._page.calls.append(("click", (self._selector, kwargs)))
+        errors = self._page.click_errors.get(self._selector)
+        if errors:
+            err = errors.pop(0)
+            if err is not None:
+                raise err
 
     def wait_for(self, **kwargs: object) -> None:
         """要素の状態変化を待機する。
@@ -120,9 +129,10 @@ class FakePage:
         visibility: dict[str, bool] | None = None,
         counts: dict[str, int] | None = None,
         wait_for_errors: dict[str, list[Exception | None]] | None = None,
+        click_errors: dict[str, list[Exception | None]] | None = None,
         goto_errors: Sequence[Exception | None] | None = None,
     ) -> None:
-        """応答キュー・selector マップ・goto エラーキューを受け取る。"""
+        """応答キュー・selector マップ・goto/click エラーキューを受け取る。"""
         self._responses: list[object] = list(responses or [])
         self.calls: list[tuple[str, object]] = []
         self.visibility: dict[str, bool] = dict(visibility or {})
@@ -130,15 +140,23 @@ class FakePage:
         self.wait_for_errors: dict[str, list[Exception | None]] = {
             k: list(v) for k, v in (wait_for_errors or {}).items()
         }
+        self.click_errors: dict[str, list[Exception | None]] = {
+            k: list(v) for k, v in (click_errors or {}).items()
+        }
         self.goto_errors: list[Exception | None] = list(goto_errors or [])
 
     def evaluate(self, expression: str, arg: object = None) -> object:
-        """呼び出しを記録し、キュー先頭の応答を返す。"""
+        """呼び出しを記録し、キュー先頭の応答を返す。Exception なら raise する。"""
         self.calls.append((expression, arg))
         if not self._responses:
             msg = "FakePage: 想定外の evaluate 呼び出しが発生した"
             raise AssertionError(msg)
-        return self._responses.pop(0)
+        resp = self._responses.pop(0)
+        # 応答キューに Exception を積むと raise する (check_login の PlaywrightError
+        # を再現する用途)。
+        if isinstance(resp, Exception):
+            raise resp
+        return resp
 
     def locator(self, selector: str) -> FakeLocator:
         """FakeLocator を返す。呼び出しは calls に記録する。"""
