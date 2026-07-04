@@ -2027,8 +2027,14 @@ def auto_login(
       あるためリトライしない。
     """
     # フォーム入力・送信。ここで失敗したら本処理に入れないため即 FORM_ERROR。
+    # `press_sequentially` は既存テキストに追記する仕様のため、Playwright の永続
+    # コンテキスト側で残っている自動入力や前回の残骸を `fill("")` で明示クリアしてから
+    # キー入力する。fill 自体は disabled 状態を解除しないので、Phase 1 制約の
+    # 「実キー入力 (press_sequentially) が必要」は press_sequentially 側で満たす。
     try:
+        page.locator(_LOGIN_MAIL_SEL).fill("")
         page.locator(_LOGIN_MAIL_SEL).press_sequentially(credentials.bnid_email)
+        page.locator(_LOGIN_PASS_SEL).fill("")
         page.locator(_LOGIN_PASS_SEL).press_sequentially(credentials.bnid_password)
         # disabled が外れるまで待ってからクリックする (Phase 1 の必須手順)
         page.locator(_LOGIN_BTN_ENABLED_SEL).wait_for(timeout=5000)
@@ -2133,23 +2139,51 @@ def _record_credentials_failure(profile_dir: Path, credentials: Credentials) -> 
     )
 
 
+def _auto_login_with_retry(
+    page: Page, name: str, credentials: Credentials
+) -> AutoLoginOutcome:
+    """auto_login を回し、TIMEOUT のときだけ 1 回リトライして最終 outcome を返す。
+
+    同じページ状態でリトライすると `press_sequentially` が既存値に追記されて
+    二重入力になるため、`LOGIN_ENTRY_URL` に再遷移してフォームをリセットしてから
+    auto_login を再実行する。リトライ用の goto が失敗した場合は FORM_ERROR に
+    落として呼び出し側で failure_count に計上させる (1 回目 TIMEOUT はすでに認証を
+    試行済み)。
+    """
+    outcome = auto_login(page, credentials)
+    if outcome is not AutoLoginOutcome.TIMEOUT:
+        return outcome
+    print(f"[{name}] タイムアウトのため 1 回リトライします。", file=sys.stderr)
+    try:
+        page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
+    except PlaywrightError as e:
+        print(
+            f"[{name}] リトライ時の BNID ログイン画面への遷移で失敗: {e}",
+            file=sys.stderr,
+        )
+        return AutoLoginOutcome.FORM_ERROR
+    return auto_login(page, credentials)
+
+
 def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
     """process_account の未ログインルートで呼ぶ自動再ログインゲート。
 
-    credentials.json 非存在・disabled_until 有効・BNID ログイン画面遷移失敗などは
-    すべて False にまとめて丸め、呼び出し側では従来の未ログイン扱いに合流させる。
+    credentials.json 非存在・disabled_until 有効なら即 False。BNID ログイン画面
+    への初回遷移で失敗した場合は「認証情報を BNID に送っていない」ため
+    failure_count には計上せず False を返す (ネットワーク不調で BNID 側のロックを
+    刺激するのを避ける)。
 
-    タイムアウト時のみ 1 回リトライする (一時的なネットワーク遅延の可能性)。
-    その他の失敗 (パスワード誤り・CAPTCHA・フォーム操作エラー) は即 False にして
+    タイムアウトのみ `_auto_login_with_retry` が 1 回リトライする。それ以外の
+    失敗 (パスワード誤り・CAPTCHA・フォーム操作エラー・リトライ後失敗) は
     failure_count を +1 する。
     """
     credentials = load_credentials(profile_dir)
-    if credentials is None:
-        return False
-    if _credentials_disabled(credentials, name):
+    if credentials is None or _credentials_disabled(credentials, name):
         return False
 
     # BNID ログイン画面へ遷移 (OAuth リダイレクトチェーンは Chromium が追従する)。
+    # goto 失敗は認証試行に至る前の一時的なネットワーク不調なので、failure_count は
+    # 計上しない (BNID アカウントロックを刺激しないため)。
     try:
         page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
     except PlaywrightError as e:
@@ -2157,18 +2191,12 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
             f"[{name}] BNID ログイン画面への遷移で失敗: {e}",
             file=sys.stderr,
         )
-        _record_credentials_failure(profile_dir, credentials)
         return False
 
-    outcome = auto_login(page, credentials)
-    if outcome is AutoLoginOutcome.TIMEOUT:
-        print(f"[{name}] タイムアウトのため 1 回リトライします。", file=sys.stderr)
-        outcome = auto_login(page, credentials)
-
+    outcome = _auto_login_with_retry(page, name, credentials)
     if outcome is AutoLoginOutcome.SUCCESS:
         _reset_credentials_failure(profile_dir, credentials)
         return True
-
     _record_credentials_failure(profile_dir, credentials)
     return False
 
@@ -2180,10 +2208,19 @@ def _ensure_authenticated(
 
     False のときは呼び出し側で従来と同じ未ログイン扱い (exit_code=1) にする。
     ここでユーザ向けの案内メッセージも 1 か所に集約する。
+
+    dry-run (execute=False) では、たとえ credentials が保存されていても
+    自動再ログインは走らせない。auto_login は BNID にパスワード POST を送るため
+    「dry-run = GET のみ、副作用ゼロ」の契約を壊してしまう。dry-run でも
+    check_login のみでログイン済みかは判定する。
     """
     if check_login(page):
         return True
-    if options.auto_relogin and attempt_auto_relogin(page, profile_dir, name):
+    if (
+        options.auto_relogin
+        and options.execute
+        and attempt_auto_relogin(page, profile_dir, name)
+    ):
         return True
     print(
         f"[{name}] 未ログイン。"
@@ -2229,6 +2266,53 @@ def run_login_flow(
         file=sys.stderr,
     )
     return 1
+
+
+def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> int:
+    """login-init 用のログイン検証フロー。保存済み credentials で auto_login を試す。
+
+    既存 Cookie が有効だと `run_login_flow` は「保存 creds を試さないまま
+    check_login が真になる」擬似成功で抜けてしまい、ミスタイプしたパスワードが
+    そのまま保存される抜け穴がある。login-init は明示的な「認証情報の再登録」
+    フローなので、`context.clear_cookies()` で強制ログアウトしてから
+    LOGIN_ENTRY_URL に遷移し、保存 creds で `auto_login` を回して実ログインを検証する。
+
+    `auto_login` が成功しなかった場合は手動 `run_login_flow` にフォールバックする
+    (CAPTCHA / 2FA が予期せず出た場合や、DOM が変わって auto_login が働かない
+    ケースを吸収する)。
+    """
+    creds = load_credentials(profile_dir)
+    if creds is None:
+        # persist_login_init_credentials 直後なので通常は入っているはずだが、
+        # 手改変等で読めない場合はフォールバックで手動ログインへ回す。
+        print("[login-init] credentials.json を読めません。", file=sys.stderr)
+        return run_login_flow(page)
+
+    # 保存済み creds を確実に試すため既存 cookie を破棄する。login-init は
+    # 「認証情報の再登録」で session invalidate はアラインしている。
+    with contextlib.suppress(PlaywrightError):
+        ctx.clear_cookies()
+
+    try:
+        page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
+    except PlaywrightError as e:
+        print(f"[login-init] BNID ログイン画面への遷移で失敗: {e}", file=sys.stderr)
+        return run_login_flow(page)
+
+    outcome = auto_login(page, creds)
+    if outcome is AutoLoginOutcome.SUCCESS:
+        print(
+            "[login-init] 保存した認証情報での実ログインを確認しました。",
+            file=sys.stderr,
+        )
+        return 0
+
+    print(
+        f"[login-init] 自動検証に失敗しました (outcome={outcome.value})。"
+        "ブラウザで手動ログインしてください。",
+        file=sys.stderr,
+    )
+    return run_login_flow(page)
 
 
 # パストラバーサル (../) や絶対パス指定を排除するため、basename として安全な
@@ -2407,11 +2491,13 @@ def process_account(
         page = ctx.new_page()
         page.goto(MISSION_PAGE_URL, wait_until="domcontentloaded")
 
-        # login / login-init はどちらも headed ブラウザ + is_login ポーリングで
-        # ログイン成功を検知する。login-init は事前 (_main_impl) で credentials を
-        # 保存済みなので、ここでは検証だけ行う。
-        if options.login_mode or options.login_init_mode:
+        # login は headed ブラウザ + is_login ポーリングで手動ログイン成功を検知する。
+        if options.login_mode:
             return 0, run_login_flow(page)
+        # login-init は事前 (_main_impl) で credentials を保存済み。ここで cookie を
+        # 破棄してから auto_login で実ログインを検証する (擬似成功抜け防止)。
+        if options.login_init_mode:
+            return 0, run_login_init_flow(ctx, page, profile_dir)
 
         if not _ensure_authenticated(page, name, profile_dir, options):
             return 0, 1
