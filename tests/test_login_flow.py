@@ -106,7 +106,11 @@ class TestAutoLogin:
         assert ("fill", ("#pass", "")) in locator_calls
         assert ("press_sequentially", ("#mail", "user@example.com")) in locator_calls
         assert ("press_sequentially", ("#pass", "hunter2")) in locator_calls
-        assert ("click", "#btn-idpw-login") in locator_calls
+        # click は no_wait_after=True で呼ばれる (navigation 待ちで raise しないため)
+        assert (
+            "click",
+            ("#btn-idpw-login", {"no_wait_after": True}),
+        ) in locator_calls
         # fill は press_sequentially より前に来る
         assert locator_calls.index(("fill", ("#mail", ""))) < locator_calls.index((
             "press_sequentially",
@@ -207,6 +211,31 @@ class TestAutoLogin:
         # click 済みなので submit=1
         assert submitted == 1
         assert "タイムアウト" in capsys.readouterr().err
+
+    def test_click時のPlaywrightErrorはpollingに進みsubmitted1(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """click() が PlaywrightError を raise した場合の扱い。
+
+        BNID の redirect race で click が raise しても submit は既に発生している
+        可能性があるため、FORM_ERROR で切らずに polling に進んで実結果を判定する。
+        polling で is_login=True を検知したら SUCCESS + submit=1。
+        """
+        _install_fake_time(monkeypatch)
+        fake = FakePage(
+            responses=[_is_login_response(is_login=True)],
+            click_errors={
+                "#btn-idpw-login": [PlaywrightError("navigation raced with click")]
+            },
+        )
+
+        result, submitted = canvasser.auto_login(
+            as_page(fake), _sample_creds(), timeout_sec=1
+        )
+
+        assert result is AutoLoginOutcome.SUCCESS
+        # click は raise したが submit は起きている前提で計上する
+        assert submitted == 1
 
     def test_フォーム操作エラーで即FORM_ERROR(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -678,6 +707,40 @@ class TestAttemptAutoRelogin:
         assert got is not None
         # 1 回目 TIMEOUT ぶんだけ計上
         assert got.failure_count == 1
+
+    def test_リトライ後のcheck_login_PlaywrightErrorは2回目auto_loginに進む(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """リトライ用 goto 後の check_login が PlaywrightError の場合の扱い。
+
+        遅延成功チェックの check_login が redirect 中に raise しても例外が escape
+        しないようにする (escape すると failure_count 更新前に process_account へ
+        飛んで無限に BNID にパスワードを投げる事故が起きる)。
+        raise 後は 2 回目 auto_login に進み、TIMEOUT なら submit を計上する。
+        """
+        _install_creds(tmp_path)
+        _install_fake_time(monkeypatch, step=10.0)
+        # 1 個目 (post-init check): False → auto_login 1 へ
+        # 2-6 個目 (auto_login 1 の 5 iter): False → TIMEOUT
+        # 7 個目 (post-retry check): PlaywrightError → suppress + 2 回目 auto_login へ
+        # 8-12 個目 (auto_login 2 の 5 iter): False → TIMEOUT
+        # 13 個目 (post-2nd check): False (retry TIMEOUT に留まる)
+        # submit 回数は 1 + 1 = 2
+        fake = FakePage(
+            responses=[
+                *[_is_login_response(is_login=False)] * 6,
+                PlaywrightError("check_login raised during redirect"),
+                *[_is_login_response(is_login=False)] * 20,
+            ]
+        )
+
+        result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
+
+        assert result is False
+        got = canvasser.load_credentials(tmp_path)
+        assert got is not None
+        # 2 回の submit が計上される (1 回目 TIMEOUT + 2 回目 TIMEOUT)
+        assert got.failure_count == 2
 
     def test_初回auto_loginの_pre_submit_CAPTCHAはfailure_count加算しない(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
