@@ -4,6 +4,7 @@
 差し替える。それ以外の内部実装はモックせず、実物のロジックを通す方針である。
 """
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
@@ -15,6 +16,48 @@ if TYPE_CHECKING:
 def as_page(fake: FakePage) -> Page:
     """FakePage を Page として渡すための cast ヘルパー。"""
     return cast("Page", fake)
+
+
+class FakeLocator:
+    """`page.locator(sel)` の戻り値を模したテストダブル。
+
+    press_sequentially / click / wait_for は呼び出しを FakePage.calls に記録する。
+    is_visible / count は FakePage 側の可視性・件数マップを参照する。
+    """
+
+    def __init__(self, page: FakePage, selector: str) -> None:
+        """親 FakePage と selector を保持する。"""
+        self._page = page
+        self._selector = selector
+
+    def press_sequentially(self, text: str) -> None:
+        """キー入力相当の入力。selector と text を記録する。"""
+        self._page.calls.append(("press_sequentially", (self._selector, text)))
+
+    def click(self) -> None:
+        """クリック。selector を記録する。"""
+        self._page.calls.append(("click", self._selector))
+
+    def wait_for(self, **kwargs: object) -> None:
+        """要素の状態変化を待機する。
+
+        キュー `wait_for_errors[selector]` に非 None が入っていればそれを送出する
+        (タイムアウト等の再現用)。
+        """
+        self._page.calls.append(("wait_for", (self._selector, kwargs)))
+        errors = self._page.wait_for_errors.get(self._selector)
+        if errors:
+            err = errors.pop(0)
+            if err is not None:
+                raise err
+
+    def is_visible(self) -> bool:
+        """selector の可視性を FakePage.visibility から取得する (既定 False)。"""
+        return self._page.visibility.get(self._selector, False)
+
+    def count(self) -> int:
+        """selector の要素数を FakePage.counts から取得する (既定 0)。"""
+        return self._page.counts.get(self._selector, 0)
 
 
 def success_response(payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -41,12 +84,27 @@ class FakePage:
 
     呼び出しを `calls` に記録するため、送信された URL やメソッドの検証にも
     使える。キューが尽きた状態で呼ばれたら想定外のリクエストとして失敗させる。
+
+    `locator()` を使うテストのために、selector ごとの可視性・件数・wait_for
+    挙動を注入できる。省略時は「見えない・件数 0・wait_for は即帰る」既定。
     """
 
-    def __init__(self, responses: list[object]) -> None:
-        """先頭から順に返す応答のキューを受け取る。"""
-        self._responses = list(responses)
+    def __init__(
+        self,
+        responses: Sequence[object] | None = None,
+        *,
+        visibility: dict[str, bool] | None = None,
+        counts: dict[str, int] | None = None,
+        wait_for_errors: dict[str, list[Exception | None]] | None = None,
+    ) -> None:
+        """応答キュー・selector マップを受け取る。"""
+        self._responses: list[object] = list(responses or [])
         self.calls: list[tuple[str, object]] = []
+        self.visibility: dict[str, bool] = dict(visibility or {})
+        self.counts: dict[str, int] = dict(counts or {})
+        self.wait_for_errors: dict[str, list[Exception | None]] = {
+            k: list(v) for k, v in (wait_for_errors or {}).items()
+        }
 
     def evaluate(self, expression: str, arg: object = None) -> object:
         """呼び出しを記録し、キュー先頭の応答を返す。"""
@@ -55,6 +113,11 @@ class FakePage:
             msg = "FakePage: 想定外の evaluate 呼び出しが発生した"
             raise AssertionError(msg)
         return self._responses.pop(0)
+
+    def locator(self, selector: str) -> FakeLocator:
+        """FakeLocator を返す。呼び出しは calls に記録する。"""
+        self.calls.append(("locator", selector))
+        return FakeLocator(self, selector)
 
 
 class FakeGmapsClient:
