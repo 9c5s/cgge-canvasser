@@ -96,8 +96,9 @@ class FakePage:
         visibility: dict[str, bool] | None = None,
         counts: dict[str, int] | None = None,
         wait_for_errors: dict[str, list[Exception | None]] | None = None,
+        goto_errors: Sequence[Exception | None] | None = None,
     ) -> None:
-        """応答キュー・selector マップを受け取る。"""
+        """応答キュー・selector マップ・goto エラーキューを受け取る。"""
         self._responses: list[object] = list(responses or [])
         self.calls: list[tuple[str, object]] = []
         self.visibility: dict[str, bool] = dict(visibility or {})
@@ -105,6 +106,7 @@ class FakePage:
         self.wait_for_errors: dict[str, list[Exception | None]] = {
             k: list(v) for k, v in (wait_for_errors or {}).items()
         }
+        self.goto_errors: list[Exception | None] = list(goto_errors or [])
 
     def evaluate(self, expression: str, arg: object = None) -> object:
         """呼び出しを記録し、キュー先頭の応答を返す。"""
@@ -118,6 +120,15 @@ class FakePage:
         """FakeLocator を返す。呼び出しは calls に記録する。"""
         self.calls.append(("locator", selector))
         return FakeLocator(self, selector)
+
+    def goto(self, url: str, **kwargs: object) -> None:
+        """遷移を記録するだけの noop。goto_errors に例外が入っていれば送出する。"""
+        self.calls.append(("goto", (url, kwargs)))
+        errors = self.goto_errors
+        if errors:
+            err = errors.pop(0)
+            if err is not None:
+                raise err
 
 
 class FakeGmapsClient:

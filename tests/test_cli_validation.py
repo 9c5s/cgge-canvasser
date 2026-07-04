@@ -287,6 +287,34 @@ class TestBuildParser:
         assert args.execute is True
         assert args.daily_budget == 3
 
+    def test_missionは既定でauto_relogin有効(self) -> None:
+        """--no-auto-relogin 未指定時は auto_relogin フラグが False。"""
+        args = canvasser._build_parser().parse_args(["mission"])
+
+        assert args.no_auto_relogin is False
+
+    def test_missionに_no_auto_relogin_フラグを指定できる(self) -> None:
+        """--no-auto-relogin で auto-relogin をオプトアウトできる。"""
+        args = canvasser._build_parser().parse_args(["mission", "--no-auto-relogin"])
+
+        assert args.no_auto_relogin is True
+
+    def test_checkinに_no_auto_relogin_フラグを指定できる(self) -> None:
+        """checkin にも --no-auto-relogin フラグが載る (collect 親パーサ経由)。"""
+        args = canvasser._build_parser().parse_args(["checkin", "--no-auto-relogin"])
+
+        assert args.no_auto_relogin is True
+
+    def test_loginにno_auto_reloginフラグは無い(self) -> None:
+        """login サブコマンドは collect 親パーサを持たないためフラグを拒否する。"""
+        with pytest.raises(SystemExit):
+            canvasser._build_parser().parse_args([
+                "login",
+                "--account",
+                "main",
+                "--no-auto-relogin",
+            ])
+
     def test_loginはaccount必須(self) -> None:
         """login サブコマンドは --account なしでは通らない。"""
         with pytest.raises(SystemExit):
@@ -387,6 +415,23 @@ class TestBuildRunOptions:
         assert options.run_mission is True
         assert options.run_checkin is False
         assert options.execute is False
+        assert options.auto_relogin is True
+
+    def test_no_auto_reloginでauto_reloginが無効化される(self) -> None:
+        """--no-auto-relogin で RunOptions.auto_relogin が False になる。"""
+        args = canvasser._build_parser().parse_args(["mission", "--no-auto-relogin"])
+
+        options = canvasser._build_run_options(args)
+
+        assert options.auto_relogin is False
+
+    def test_checkin_no_auto_reloginでauto_reloginが無効化される(self) -> None:
+        """checkin でも --no-auto-relogin が RunOptions に伝搬する。"""
+        args = canvasser._build_parser().parse_args(["checkin", "--no-auto-relogin"])
+
+        options = canvasser._build_run_options(args)
+
+        assert options.auto_relogin is False
 
     def test_mission本番(self) -> None:
         """mission --execute で実行ゲートが開く。"""
