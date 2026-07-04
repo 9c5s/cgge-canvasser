@@ -2054,8 +2054,8 @@ def auto_login(
     *,
     timeout_sec: int = 60,
     interval_sec: float = 1.0,
-) -> AutoLoginOutcome:
-    """BNID ログイン画面でメール/パスワードを自動入力し、結果種別を返す。
+) -> tuple[AutoLoginOutcome, int]:
+    """BNID ログイン画面でメール/パスワードを自動入力し (outcome, submit 回数) を返す。
 
     Phase 1 で判明した DOM 制約に準拠する:
     - `fill()` は disabled を外せないため `press_sequentially()` で実キー入力を装う。
@@ -2064,15 +2064,21 @@ def auto_login(
     - HTTP ステータスは常に 200 なので、成功/失敗は「is_login フラグ vs エラー DOM」の
       race で判定する。
 
-    失敗パス (呼び出し側でリトライ可否を判定するため区別する):
+    submit 回数は failure_count の会計に使う。pre-submit で abort したケース
+    (CAPTCHA 事前検知 / フォーム操作エラー) は BNID に届いていないので 0、
+    click が成功して以降の結果 (SUCCESS / PASSWORD_ERROR / CAPTCHA_DETECTED /
+    TIMEOUT) は 1 を返す。
+
+    失敗パス:
     - PASSWORD_ERROR: `#error-input-area .c-message--warning` の可視化を検知。
       Username enumeration 対策のためメアド違いと PW 違いは区別できず、両方まとめて
-      「認証情報のいずれかが不正」で abort する。
-    - CAPTCHA_DETECTED: 監視 selector にマッチしたら手動 `login` へ誘導する。
-    - TIMEOUT: `timeout_sec` を超えても is_login にならなければ TIMEOUT。呼び出し側で
-      1 回だけリトライしてよい (一時的なネットワーク遅延の可能性がある)。
+      「認証情報のいずれかが不正」で abort する。submit=1。
+    - CAPTCHA_DETECTED: 監視 selector にマッチ。pre-submit で検知した場合 submit=0、
+      post-submit で挿入されたケースは submit=1。
+    - TIMEOUT: `timeout_sec` を超えても is_login にならなければ TIMEOUT。submit=1。
+      呼び出し側で 1 回だけリトライしてよい (一時的なネットワーク遅延の可能性)。
     - FORM_ERROR: フォーム操作中の PlaywrightError。DOM 変更やページ未ロードの可能性が
-      あるためリトライしない。
+      あるためリトライしない。submit=0。
     """
     # submit 前に CAPTCHA / 2FA を検知する。BNID が最初から CAPTCHA を出している
     # ケース (連続失敗による動的挿入等) では、フォームに入力してから submit しても
@@ -2083,7 +2089,7 @@ def auto_login(
             "`uv run canvasser.py login --account NAME` で手動ログインしてください。",
             file=sys.stderr,
         )
-        return AutoLoginOutcome.CAPTCHA_DETECTED
+        return AutoLoginOutcome.CAPTCHA_DETECTED, 0
 
     # フォーム入力・送信。ここで失敗したら本処理に入れないため即 FORM_ERROR。
     # `press_sequentially` は既存テキストに追記する仕様のため、Playwright の永続
@@ -2100,9 +2106,12 @@ def auto_login(
         page.locator(_LOGIN_BTN_SEL).click()
     except PlaywrightError as e:
         print(f"[auto_login] フォーム操作でエラー: {e}", file=sys.stderr)
-        return AutoLoginOutcome.FORM_ERROR
+        return AutoLoginOutcome.FORM_ERROR, 0
 
-    return _poll_login_outcome(page, timeout_sec=timeout_sec, interval_sec=interval_sec)
+    outcome = _poll_login_outcome(
+        page, timeout_sec=timeout_sec, interval_sec=interval_sec
+    )
+    return outcome, 1
 
 
 def _poll_login_outcome(
@@ -2224,6 +2233,20 @@ def _retry_after_timeout(
     の FORM_ERROR/TIMEOUT-late-success を扱う。呼び出し側で 1 回目 submit の 1
     を足して最終的な submit 回数にする。
     """
+    # 1 回目 submit は既に消化済み (呼び出し元で failure_count += 1 予定)。リトライ
+    # を投げると失敗ガード上限を超えて BNID にパスワードを送ってしまう可能性がある
+    # ため、リトライ用 submit が予算内に収まるかを事前チェックする。
+    # 目標: 「CREDENTIALS_MAX_FAILURES 回を超えて BNID にパスワードを送らない」。
+    # 1 回目 submit 直後の見込み failure_count は credentials.failure_count + 1。
+    # リトライで更に +1 されると MAX を超える場合は、リトライを控える。
+    if credentials.failure_count + 1 >= CREDENTIALS_MAX_FAILURES:
+        print(
+            f"[{name}] failure_count が上限のため、タイムアウト後のリトライは"
+            "控えます (BNID アカウントロック防止)。",
+            file=sys.stderr,
+        )
+        return AutoLoginOutcome.TIMEOUT, 0
+
     print(f"[{name}] タイムアウトのため 1 回リトライします。", file=sys.stderr)
     try:
         page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
@@ -2237,14 +2260,21 @@ def _retry_after_timeout(
         print(f"[{name}] タイムアウト後に遅延成功を検知しました。", file=sys.stderr)
         return AutoLoginOutcome.SUCCESS, 0
 
-    second = auto_login(page, credentials)
-    if second is AutoLoginOutcome.FORM_ERROR:
-        # 2 回目は pre-submit で失敗 → 追加 submit は 0、1 回目 TIMEOUT だけ計上
+    return _resolve_retry_outcome(page, name, credentials)
+
+
+def _resolve_retry_outcome(
+    page: Page, name: str, credentials: Credentials
+) -> tuple[AutoLoginOutcome, int]:
+    """リトライで 2 回目 auto_login を呼び、遅延成功も含めて outcome を確定する。"""
+    outcome, submitted = auto_login(page, credentials)
+    if outcome is AutoLoginOutcome.FORM_ERROR:
+        # 2 回目は pre-submit で失敗 → submit は 1 回目のみ
         return AutoLoginOutcome.TIMEOUT, 0
-    if second is AutoLoginOutcome.TIMEOUT and check_login(page):
+    if outcome is AutoLoginOutcome.TIMEOUT and check_login(page):
         print(f"[{name}] リトライ後にも遅延成功を検知しました。", file=sys.stderr)
-        return AutoLoginOutcome.SUCCESS, 1
-    return second, 1
+        return AutoLoginOutcome.SUCCESS, submitted
+    return outcome, submitted
 
 
 def _run_auto_login_sequence(
@@ -2260,17 +2290,16 @@ def _run_auto_login_sequence(
     に加算する量を決めるのに使う。BNID 側のアカウントロック閾値を刺激しないよう
     submit 回数を正確に計上する:
 
-    - `FORM_ERROR` (pre-submit フォーム操作失敗): submit=0。BNID に届いていない。
-    - `SUCCESS`/`PASSWORD_ERROR`/`CAPTCHA_DETECTED`/`TIMEOUT`: submit=1 以上。
+    - CAPTCHA/2FA 事前検知 (pre-submit): submit=0。
+    - FORM_ERROR (pre-submit フォーム操作失敗): submit=0。BNID に届いていない。
+    - SUCCESS/PASSWORD_ERROR/CAPTCHA_DETECTED (post-submit)/TIMEOUT: submit >= 1。
     - リトライ経路の詳細は `_retry_after_timeout` を参照。
     """
-    first = auto_login(page, credentials)
-    if first is AutoLoginOutcome.FORM_ERROR:
-        return first, 0
-    if first is not AutoLoginOutcome.TIMEOUT:
-        return first, 1
-    outcome, extra_submissions = _retry_after_timeout(page, name, credentials)
-    return outcome, 1 + extra_submissions
+    outcome, submitted = auto_login(page, credentials)
+    if outcome is not AutoLoginOutcome.TIMEOUT:
+        return outcome, submitted
+    retry_outcome, retry_submitted = _retry_after_timeout(page, name, credentials)
+    return retry_outcome, submitted + retry_submitted
 
 
 def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
@@ -2440,7 +2469,9 @@ def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> i
         )
         return 1
 
-    outcome = auto_login(page, pending)
+    # login-init は failure_count 会計と関係しない (pending は SUCCESS のときだけ
+    # 昇格するので、submit 回数はそのまま捨てる)
+    outcome, _submitted = auto_login(page, pending)
     if outcome is AutoLoginOutcome.SUCCESS:
         _activate_pending_credentials(profile_dir)
         print(
