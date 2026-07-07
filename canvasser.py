@@ -2296,6 +2296,62 @@ def _record_credentials_failure(
     )
 
 
+# NOTE: 以下 3 関数は Task 4 で attempt_auto_relogin から呼び出すまで本ファイル内
+# からは未参照になる (テストのみが直接検証する)。その間だけ reportUnusedFunction を
+# 抑制する。
+def _relogin_disabled(  # pyright: ignore[reportUnusedFunction]
+    guard: ReloginGuard, name: str
+) -> bool:
+    """`guard.disabled_until` が未来なら True (自動再ログインをスキップすべき)。
+
+    パース不能や過去時刻は False (=有効) として扱い、fail-safe に倒す。
+    未来なら残時間を stderr に案内する。
+    """
+    if guard.disabled_until is None:
+        return False
+    try:
+        deadline = datetime.fromisoformat(guard.disabled_until)
+    except ValueError:
+        return False
+    deadline = _as_jst_aware(deadline)
+    if datetime.now(JST) >= deadline:
+        return False
+    print(
+        f"[{name}] 自動再ログインは {guard.disabled_until} まで"
+        "一時停止中です (連続失敗ガード)。",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _reset_relogin_failure(  # pyright: ignore[reportUnusedFunction]
+    profile_dir: Path, guard: ReloginGuard
+) -> None:
+    """成功時の failure_count / disabled_until クリア (無変化なら書き込まない)。"""
+    if guard.failure_count == 0 and guard.disabled_until is None:
+        return
+    save_relogin_guard(profile_dir, ReloginGuard())
+
+
+def _record_relogin_failure(  # pyright: ignore[reportUnusedFunction]
+    profile_dir: Path, guard: ReloginGuard, *, submissions: int
+) -> None:
+    """失敗時に failure_count へ submissions を加算し、必要なら disabled_until を設定。
+
+    `CREDENTIALS_MAX_FAILURES` に達したら `CREDENTIALS_DISABLE_WINDOW_SEC` 秒後まで
+    自動再ログインを一時停止する。
+    """
+    new_count = guard.failure_count + submissions
+    new_disabled = guard.disabled_until
+    if new_count >= CREDENTIALS_MAX_FAILURES:
+        window = timedelta(seconds=CREDENTIALS_DISABLE_WINDOW_SEC)
+        new_disabled = (datetime.now(JST) + window).isoformat()
+    save_relogin_guard(
+        profile_dir,
+        ReloginGuard(failure_count=new_count, disabled_until=new_disabled),
+    )
+
+
 def _retry_after_timeout(
     page: Page, name: str, credentials: Credentials
 ) -> tuple[AutoLoginOutcome, int]:
