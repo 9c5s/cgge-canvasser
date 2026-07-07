@@ -1,6 +1,6 @@
 """ミッション回収フロー (collect_missions / _complete / _receive) のテスト。
 
-FakePage で API 応答を差し替え、dry-run と execute の分岐・ecode 別の
+FakePage で API 応答を差し替え、dry-run と本番実行の分岐・ecode 別の
 ハンドリング・獲得票数の集計を検証する。
 """
 
@@ -58,13 +58,13 @@ class TestCollectMissions:
         """dry-run では GET 2 回 (通常 + ASOBI STORE) のみで、POST/PUT を送らない。"""
         fake = FakePage([_listing([_mission(1, 30)]), _empty_listing()])
 
-        gained = canvasser.collect_missions(_as_page(fake), execute=False)
+        gained = canvasser.collect_missions(_as_page(fake), dry_run=True)
 
         assert gained == 30
         assert len(fake.calls) == 2
 
-    def test_executeは達成と受取を実行して票数を返す(self) -> None:
-        """execute では両一覧 GET を先に済ませてから POST → PUT を送る。"""
+    def test_本番実行は達成と受取を実行して票数を返す(self) -> None:
+        """本番実行では両一覧 GET を先に済ませてから POST → PUT を送る。"""
         receive_ok = success_response({"received_point": 30})
         fake = FakePage([
             _listing([_mission(1, 30)]),
@@ -73,7 +73,7 @@ class TestCollectMissions:
             receive_ok,
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
 
         assert gained == 30
         assert len(fake.calls) == 4
@@ -87,7 +87,7 @@ class TestCollectMissions:
             receive_ok,
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
 
         assert gained == 10
         assert len(fake.calls) == 3
@@ -99,7 +99,7 @@ class TestCollectMissions:
             _empty_listing(),
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
 
         assert gained == 0
         assert len(fake.calls) == 2
@@ -117,7 +117,7 @@ class TestCollectMissions:
             receive_ok,
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
 
         assert gained == 15
         assert len(fake.calls) == 3
@@ -129,7 +129,7 @@ class TestCollectMissions:
             _empty_listing(),
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
 
         assert gained == 0
         assert len(fake.calls) == 2
@@ -144,7 +144,7 @@ class TestCollectMissions:
             receive_ok,
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
 
         assert gained == 20
         assert len(fake.calls) == 4
@@ -157,7 +157,7 @@ class TestCollectMissions:
             _error_response("E1924"),
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
 
         assert gained == 0
         assert len(fake.calls) == 3
@@ -167,7 +167,7 @@ class TestCollectMissions:
         fake = FakePage([{"status": 500, "body": None, "error": "boom"}])
 
         with pytest.raises(RuntimeError, match="通常"):
-            canvasser.collect_missions(_as_page(fake), execute=False)
+            canvasser.collect_missions(_as_page(fake), dry_run=True)
 
     def test_ASOBI_STORE一覧の取得失敗もRuntimeError(self) -> None:
         """通常一覧が取れても ASOBI STORE 一覧が失敗すれば RuntimeError で止める。"""
@@ -177,7 +177,7 @@ class TestCollectMissions:
         ])
 
         with pytest.raises(RuntimeError, match="ASOBI STORE"):
-            canvasser.collect_missions(_as_page(fake), execute=False)
+            canvasser.collect_missions(_as_page(fake), dry_run=True)
 
     def test_通常とASOBI_STOREの両方から受取を集計する(self) -> None:
         """mission_type=0 と mission_type=1 の両方で受取を実行し合算する。
@@ -194,7 +194,7 @@ class TestCollectMissions:
             receive_asobi,
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), execute=True)
+        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
 
         assert gained == 5 + 2
         assert len(fake.calls) == 4
@@ -212,7 +212,7 @@ class TestCollectMissions:
         ])
 
         with pytest.raises(RuntimeError, match="ASOBI STORE"):
-            canvasser.collect_missions(_as_page(fake), execute=True)
+            canvasser.collect_missions(_as_page(fake), dry_run=False)
 
         # 2 GET のみで、通常一覧の PUT は 1 件も送られていない
         assert len(fake.calls) == 2
@@ -222,10 +222,10 @@ class TestComplete:
     """_complete の ecode 別の戻り値。"""
 
     def test_dryrunはPOSTせずokを返す(self) -> None:
-        """execute=False では evaluate を呼ばず "ok" を返す。"""
+        """dry_run=True では evaluate を呼ばず "ok" を返す。"""
         fake = FakePage([])
 
-        assert canvasser._complete(_as_page(fake), 1, "m", execute=False) == "ok"
+        assert canvasser._complete(_as_page(fake), 1, "m", dry_run=True) == "ok"
         assert fake.calls == []
 
     @pytest.mark.parametrize(
@@ -242,17 +242,17 @@ class TestComplete:
         """成功・既達成・条件未達・未知エラーをそれぞれの文字列に写す。"""
         fake = FakePage([response])
 
-        assert canvasser._complete(_as_page(fake), 1, "m", execute=True) == expected
+        assert canvasser._complete(_as_page(fake), 1, "m", dry_run=False) == expected
 
 
 class TestReceive:
     """_receive の票数集計。"""
 
     def test_dryrunはPUTせずptsを返す(self) -> None:
-        """execute=False では evaluate を呼ばず pts をそのまま返す。"""
+        """dry_run=True では evaluate を呼ばず pts をそのまま返す。"""
         fake = FakePage([])
 
-        got = canvasser._receive(_as_page(fake), 1, "m", 30, execute=False)
+        got = canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=True)
 
         assert got == 30
         assert fake.calls == []
@@ -262,10 +262,10 @@ class TestReceive:
         response = success_response({"received_point": 30})
         fake = FakePage([response])
 
-        assert canvasser._receive(_as_page(fake), 1, "m", 30, execute=True) == 30
+        assert canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=False) == 30
 
     def test_失敗時は0を返す(self) -> None:
         """PUT 失敗では票数に計上しない。"""
         fake = FakePage([_error_response("E9999")])
 
-        assert canvasser._receive(_as_page(fake), 1, "m", 30, execute=True) == 0
+        assert canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=False) == 0

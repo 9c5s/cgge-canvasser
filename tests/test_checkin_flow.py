@@ -66,7 +66,7 @@ def _no_sleep(_seconds: float) -> None:
 
 def _settings(
     *,
-    execute: bool = False,
+    dry_run: bool = True,
     daily_budget: int = 0,
     consecutive_failure_limit: int = 1,
     out_of_range_limit: int = 3,
@@ -74,9 +74,9 @@ def _settings(
     now_fn: Callable[[], datetime] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
 ) -> CheckinSettings:
-    """固定時刻・実待機なしのテスト用設定を組み立てる。"""
+    """固定時刻・実待機なしのテスト用設定を組み立てる。既定は dry-run。"""
     return CheckinSettings(
-        execute=execute,
+        dry_run=dry_run,
         daily_budget=daily_budget,
         consecutive_failure_limit=consecutive_failure_limit,
         out_of_range_limit=out_of_range_limit,
@@ -297,9 +297,9 @@ class TestBudgetReached:
 
         assert runner._budget_reached() is False
 
-    def test_executeはattemptedで判定する(self) -> None:
-        """execute=True では実 POST 試行回数がカウンタになる。"""
-        runner = _runner(settings=_settings(execute=True, daily_budget=2))
+    def test_本番はattemptedで判定する(self) -> None:
+        """dry_run=False (本番) では実 POST 試行回数がカウンタになる。"""
+        runner = _runner(settings=_settings(dry_run=False, daily_budget=2))
         runner.attempted = 2
         runner.successful = 0
 
@@ -345,9 +345,9 @@ class TestDeadlineOkBeforeTravel:
         assert "パースできません" in capsys.readouterr().err
         assert (runner.prev_lat, runner.prev_lng) == (34.99, 135.0)
 
-    def test_パース不能はexecuteでfail_closed(self) -> None:
-        """execute では期限パース失敗を FailClosedError で即停止する。"""
-        runner = _runner(settings=_settings(execute=True))
+    def test_パース不能は本番でfail_closed(self) -> None:
+        """本番 (dry_run=False) では期限パース失敗を FailClosedError で即停止する。"""
+        runner = _runner(settings=_settings(dry_run=False))
         runner.gained = 30
         spot = _typed(1, 35.0, 135.0, deadline="31/07/2026")
 
@@ -433,7 +433,7 @@ class TestSkipDoesNotAdvanceOrigin:
         spot2 = _typed(2, 40.00, 135.0, deadline="invalid-date")
         runner = canvasser._CheckinRunner(
             page=_as_page(FakePage([_POST_OK])),
-            settings=_settings(execute=True, sleep_fn=_no_sleep),
+            settings=_settings(dry_run=False, sleep_fn=_no_sleep),
             spots=[spot1, spot2],
             virtual_now=_FIXED_NOW,
         )
@@ -454,7 +454,7 @@ class TestSkipDoesNotAdvanceOrigin:
         spot2 = _typed(2, 40.00, 135.0, deadline="2026-01-01 00:00:00")
         runner = canvasser._CheckinRunner(
             page=_as_page(FakePage([_POST_OK])),
-            settings=_settings(execute=True, sleep_fn=_no_sleep),
+            settings=_settings(dry_run=False, sleep_fn=_no_sleep),
             spots=[spot1, spot2],
             virtual_now=_FIXED_NOW,
         )
@@ -475,7 +475,7 @@ class TestSkipDoesNotAdvanceOrigin:
         """
         random.seed(0)
         sleeps: list[float] = []
-        settings = _settings(execute=True, sleep_fn=sleeps.append)
+        settings = _settings(dry_run=False, sleep_fn=sleeps.append)
         spot1 = _typed(1, 35.00, 135.0)
         spot2 = _typed(2, 40.00, 135.0, deadline="2026-01-01 00:00:00")
         spot3 = _typed(3, 35.01, 135.0)
@@ -647,23 +647,23 @@ class TestCollectCheckinsDryRun:
 
         assert gained == 10
 
-    def test_破損stateはexecuteならfail_closed(self, tmp_path: Path) -> None:
-        """execute では state 破損を FailClosedError で即停止する。"""
+    def test_破損stateは本番ならfail_closed(self, tmp_path: Path) -> None:
+        """本番 (dry_run=False) では state 破損を FailClosedError で即停止する。"""
         (tmp_path / "canvasser_state.json").write_text("{{{", encoding="utf-8")
         spots = [_spot(1, 35.00, 135.0)]
         fake = FakePage([_listing(spots)])
 
         with pytest.raises(FailClosedError, match="破損しています"):
             canvasser.collect_checkins(
-                _as_page(fake), _settings(execute=True, profile_dir=tmp_path)
+                _as_page(fake), _settings(dry_run=False, profile_dir=tmp_path)
             )
 
 
 _POST_OK: dict[str, Any] = success_response()
 
 
-class TestCollectCheckinsExecute:
-    """collect_checkins の execute (実 POST) 成功経路。
+class TestCollectCheckinsProduction:
+    """collect_checkins の本番 (実 POST) 成功経路。
 
     実待機は sleep_fn 注入で無効化し、待機の発生自体は呼び出し記録で検証する。
     """
@@ -677,7 +677,7 @@ class TestCollectCheckinsExecute:
 
         gained = canvasser.collect_checkins(
             _as_page(fake),
-            _settings(execute=True, profile_dir=tmp_path, sleep_fn=sleeps.append),
+            _settings(dry_run=False, profile_dir=tmp_path, sleep_fn=sleeps.append),
         )
 
         assert gained == 20
@@ -697,7 +697,7 @@ class TestCollectCheckinsExecute:
 
         gained = canvasser.collect_checkins(
             _as_page(fake),
-            _settings(execute=True, daily_budget=1, profile_dir=tmp_path),
+            _settings(dry_run=False, daily_budget=1, profile_dir=tmp_path),
         )
 
         assert gained == 10
@@ -714,7 +714,7 @@ class TestCollectCheckinsExecute:
 
         with pytest.raises(FailClosedError, match="連続失敗") as ei:
             canvasser.collect_checkins(
-                _as_page(fake), _settings(execute=True, profile_dir=tmp_path)
+                _as_page(fake), _settings(dry_run=False, profile_dir=tmp_path)
             )
 
         assert ei.value.partial_gained == 10
@@ -762,7 +762,7 @@ class TestCollectCheckinsExecute:
 
         gained = canvasser.collect_checkins(
             _as_page(fake),
-            _settings(execute=True, profile_dir=tmp_path, sleep_fn=sleeps.append),
+            _settings(dry_run=False, profile_dir=tmp_path, sleep_fn=sleeps.append),
         )
 
         # 期限切れ 1 件を skip、2 件成功で 20 票
@@ -772,7 +772,7 @@ class TestCollectCheckinsExecute:
         assert len(sleeps) == 3
         assert all(s > 0 for s in sleeps)
 
-    def test_deadlineパース不能はexecuteで移動sleep前にfail_closed(
+    def test_deadlineパース不能は本番で移動sleep前にfail_closed(
         self, tmp_path: Path
     ) -> None:
         """deadline パース不能は fail_closed の前に移動 sleep を走らせない。
@@ -793,7 +793,7 @@ class TestCollectCheckinsExecute:
         with pytest.raises(FailClosedError, match="パースできません") as ei:
             canvasser.collect_checkins(
                 _as_page(fake),
-                _settings(execute=True, profile_dir=tmp_path, sleep_fn=sleeps.append),
+                _settings(dry_run=False, profile_dir=tmp_path, sleep_fn=sleeps.append),
             )
 
         assert ei.value.partial_gained == 10

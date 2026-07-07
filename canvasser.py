@@ -15,13 +15,14 @@ Playwright の persistent context でブラウザセッションを保持し、�
 複数アカウントは ./profiles/{account}/ 配下に分けて運用する。
 
   uv run canvasser.py login --account main         # 初回ログイン
-  uv run canvasser.py mission                      # ミッション ドライラン
-  uv run canvasser.py mission --execute            # ミッション本番
-  uv run canvasser.py checkin --execute            # チェックイン本番
+  uv run canvasser.py mission                      # ミッション本番
+  uv run canvasser.py mission --dry-run            # ミッション ドライラン
+  uv run canvasser.py checkin                      # チェックイン本番
+  uv run canvasser.py checkin --dry-run            # チェックイン ドライラン
   uv run canvasser.py mark-completed --account main cg_vote2026_17  # 手動完了登録
 
-mission と checkin は独立したサブコマンドで、同時実行はしない。`--execute`
-未指定なら GET のみのドライランとなり、POST/PUT は一切送らない。
+mission と checkin は独立したサブコマンドで、同時実行はしない。無指定なら本番、
+`--dry-run` を付けた場合のみ GET のみのドライランとなり、POST/PUT は一切送らない。
 """
 
 # print はこの CLI の仕様そのもの (標準出力が UI) のため、T201 はファイル全体で
@@ -253,7 +254,7 @@ def check_login(page: Page) -> bool:
 _MISSION_TYPES: tuple[tuple[int, str], ...] = ((0, "通常"), (1, "ASOBI STORE"))
 
 
-def collect_missions(page: Page, *, execute: bool = False) -> int:
+def collect_missions(page: Page, *, dry_run: bool) -> int:
     """API 経由で完了可能なミッションと、外部トリガー達成分の受取をまとめて消化する。
 
     通常 (`mission_type=0`) と ASOBI STORE 系 (`mission_type=1`) の両方を fetch する。
@@ -267,12 +268,11 @@ def collect_missions(page: Page, *, execute: bool = False) -> int:
       を防ぐため。
     - あいことばなど、達成条件が UI 経由のみのミッションは flag=False かつ未達成の
       ままなので、達成 POST も受取 PUT も送らない。
-    - `execute=False` (デフォルト) は完全ドライラン。GET のみ実行し、POST/PUT は
-      送らない。
+    - `dry_run=True` は完全ドライラン。GET のみ実行し、POST/PUT は送らない。
 
     戻り値は今回獲得した投票券数の合計 (dry-run 時は実行した場合の見込み)。
     """
-    mode_label = "EXECUTE (本番)" if execute else "DRY-RUN (POST/PUT送信なし)"
+    mode_label = "本番" if not dry_run else "DRY-RUN (POST/PUT送信なし)"
 
     # 両 listing を先に fetch してから POST/PUT を送る。前段で PUT (受取) を送った
     # 後に後段 fetch が失敗すると、run summary で「そのアカウント 0 gained」と誤記録
@@ -292,16 +292,14 @@ def collect_missions(page: Page, *, execute: bool = False) -> int:
             print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
         print(f"ミッションモード ({label}): {mode_label}")
         for m in cast("list[dict[str, Any]]", payload["missions"]):
-            gained += _process_one_mission(page, m, execute=execute)
+            gained += _process_one_mission(page, m, dry_run=dry_run)
 
-    result_label = "獲得見込み" if not execute else "獲得"
+    result_label = "獲得見込み" if dry_run else "獲得"
     print(f"ミッション {result_label}: {gained}枚")
     return gained
 
 
-def _process_one_mission(
-    page: Page, m: dict[str, Any], *, execute: bool = False
-) -> int:
+def _process_one_mission(page: Page, m: dict[str, Any], *, dry_run: bool) -> int:
     """1 ミッションの達成 / 受取を行い、獲得票数を返す。
 
     分岐:
@@ -320,23 +318,23 @@ def _process_one_mission(
     remaining = m.get("remaining_completable_count") or 0
 
     if completed and not received:
-        return _receive(page, mid, name, pts, execute=execute)
+        return _receive(page, mid, name, pts, dry_run=dry_run)
 
     if not api_completable:
         return 0
 
     if not completed and remaining > 0:
-        outcome = _complete(page, mid, name, execute=execute)
+        outcome = _complete(page, mid, name, dry_run=dry_run)
         # 累計達成数系ミッション (#100-104) はサーバ側で自動達成されるが、
         # 一覧の completed フラグ更新が遅延する。達成 POST が「既に達成済み」を
         # 返した場合も受取 PUT は通る。
         if outcome in ("ok", "already_done"):
-            return _receive(page, mid, name, pts, execute=execute)
+            return _receive(page, mid, name, pts, dry_run=dry_run)
 
     return 0
 
 
-def _complete(page: Page, mid: int, name: str, *, execute: bool = False) -> str:
+def _complete(page: Page, mid: int, name: str, *, dry_run: bool) -> str:
     """ミッション達成の POST を送る。
 
     一覧取得は `/missions` (複数形) だが個別操作は `/mission` (単数形)。
@@ -349,7 +347,7 @@ def _complete(page: Page, mid: int, name: str, *, execute: bool = False) -> str:
       - "error"          : その他失敗
     """
     print(f"[達成] #{mid} {name}")
-    if not execute:
+    if dry_run:
         print("  -> DRY-RUN (POST送信なし)")
         return "ok"
     res = call_api(page, "POST", f"/mission/{mid}")
@@ -370,15 +368,13 @@ def _complete(page: Page, mid: int, name: str, *, execute: bool = False) -> str:
     return "error"
 
 
-def _receive(
-    page: Page, mid: int, name: str, pts: int, *, execute: bool = False
-) -> int:
+def _receive(page: Page, mid: int, name: str, pts: int, *, dry_run: bool) -> int:
     """投票券受取の PUT を送る。
 
     成功時は加算票数、dry-run 時は「実行していれば得た pts」を返す。
     """
     print(f"[受取] #{mid} {name} (+{pts})")
-    if not execute:
+    if dry_run:
         print("  -> DRY-RUN (PUT送信なし)")
         return pts
     res = call_api(page, "PUT", f"/mission/{mid}/receive")
@@ -664,13 +660,13 @@ def _pop_nearest(unvisited: list[Spot], lat: float, lng: float) -> Spot:
 class CheckinSettings:
     """collect_checkins の動作設定。
 
-    `execute=False` (デフォルト) は完全ドライラン (POST を送らず、sleep もなく、
-    state も書き換えない)。`now_fn` と `sleep_fn` はテスト時に差し替えるための
-    現在時刻取得・実待機関数で、runner はモジュール global の time.sleep を
-    直接呼ばない。
+    `dry_run=True` は完全ドライラン (POST を送らず、sleep もなく、state も
+    書き換えない)。デフォルト (`dry_run=False`) は本番実行。`now_fn` と
+    `sleep_fn` はテスト時に差し替えるための現在時刻取得・実待機関数で、runner は
+    モジュール global の time.sleep を直接呼ばない。
     """
 
-    execute: bool = False
+    dry_run: bool = False
     daily_budget: int = 0
     consecutive_failure_limit: int = 1
     out_of_range_limit: int = 3
@@ -693,16 +689,16 @@ def _fetch_checkin_spots(page: Page) -> list[Spot]:
 def _load_resume_context(
     settings: CheckinSettings,
 ) -> tuple[float | None, float | None, datetime | None, set[str]]:
-    """state.json から resume 情報を読む。破損時は execute なら fail closed する。"""
+    """state.json から resume 情報を読む。破損時は本番実行なら fail closed する。"""
     if settings.profile_dir is None:
         return None, None, None, set()
     try:
-        return resume_context(settings.profile_dir, strict=settings.execute)
+        return resume_context(settings.profile_dir, strict=not settings.dry_run)
     except StateFileCorruptedError as e:
         msg = (
             f"state.json が破損しています: {e}。手動で確認してから再実行してください。"
         )
-        if settings.execute:
+        if not settings.dry_run:
             raise FailClosedError(msg) from e
         # dry-run は空 state のまま継続してスポット取得後の検証を回す
         print(msg, file=sys.stderr)
@@ -734,7 +730,7 @@ def _announce_checkin_plan(
         if _get_gmaps_client() is not None
         else "haversine (自前計算)"
     )
-    mode_label = "EXECUTE (本番)" if settings.execute else "DRY-RUN (POST送信なし)"
+    mode_label = "本番" if not settings.dry_run else "DRY-RUN (POST送信なし)"
     print(
         f"チェックイン対象スポット: {len(spots)}件"
         f" (全 {total_spots}, 完了済み {skipped})"
@@ -782,7 +778,7 @@ class _CheckinRunner:
     """チェックイン走行の可変状態と 1 スポットずつの手続きを束ねる。
 
     `collect_checkins` から 1 実行につき 1 個生成して使い捨てる。カウンタの意味:
-      - attempted: execute=True でのみ加算する実 POST 試行回数
+      - attempted: dry_run=False (本番) でのみ加算する実 POST 試行回数
       - successful: チェックイン成功 (dry-run では見込み) の件数
     """
 
@@ -846,13 +842,13 @@ class _CheckinRunner:
     def _budget_reached(self) -> bool:
         """日次上限に達したかを判定する。
 
-        上限判定のカウンタを execute の状態で切替える。execute=True の attempted は
-        「実 POST を厳密に daily_budget 回だけ送る」ためのゲートで、既達成・範囲外・
-        失敗のいずれも 1 リクエスト = 1 消費として扱う。
+        上限判定のカウンタを dry_run の状態で切替える。本番 (dry_run=False) の
+        attempted は「実 POST を厳密に daily_budget 回だけ送る」ためのゲートで、
+        既達成・範囲外・失敗のいずれも 1 リクエスト = 1 消費として扱う。
         """
         if self.settings.daily_budget <= 0:
             return False
-        counter = self.attempted if self.settings.execute else self.successful
+        counter = self.attempted if not self.settings.dry_run else self.successful
         return counter >= self.settings.daily_budget
 
     def _move_origin_to(self, spot: Spot) -> None:
@@ -901,7 +897,7 @@ class _CheckinRunner:
         """移動計画に沿って実 sleep して仮想時刻を進める。
 
         deadline OK 判定を経て「この spot へ実際に行く」と決めてから呼ぶ。
-        execute=False (dry-run) では実 sleep せず、仮想時刻だけ進める。
+        dry_run=True (dry-run) では実 sleep せず、仮想時刻だけ進める。
         """
         deferred_note = (
             f", 翌朝発に押戻し +{humanize_duration(plan.deferred_seconds)}"
@@ -913,7 +909,7 @@ class _CheckinRunner:
             f" 直線 {plan.straight_km:.1f}km{deferred_note})"
             f" -> 到着 {plan.arrival:%m/%d %H:%M}"
         )
-        if self.settings.execute:
+        if not self.settings.dry_run:
             self.settings.sleep_fn(plan.wait_seconds)
         self.virtual_now = plan.arrival
 
@@ -923,7 +919,7 @@ class _CheckinRunner:
         ここで skip / fail-closed に落とせば、travel estimation (gmaps API
         呼び出し含む) も実 sleep も避けられる。純粋判定に近い副作用 (print) のみ。
 
-        パース不能 (deadline=None) は execute では fail closed に落として、
+        パース不能 (deadline=None) は本番 (dry_run=False) では fail closed に落として、
         サーバ形式変更を早期検知する (個別 skip では気付きにくい)。
         """
         slug = spot.slug
@@ -933,7 +929,7 @@ class _CheckinRunner:
                 f"[{slug}] checkin_end_datetime = {spot.deadline_raw!r} "
                 "がパースできません。サーバ側の日付形式が変わった可能性があります。"
             )
-            if self.settings.execute:
+            if not self.settings.dry_run:
                 raise FailClosedError(msg, partial_gained=self.gained)
             print(f"  {msg} (dry-run: skip)", file=sys.stderr)
             return False
@@ -969,14 +965,14 @@ class _CheckinRunner:
         """このスポットの後にループを継続するかを判定する。
 
         呼び出し時点で attempted・successful は加算済み、`_remaining` からは
-        当該 spot が pop 済みという前提。execute の True と False で参照する
+        当該 spot が pop 済みという前提。dry_run の True と False で参照する
         カウンタが違う点だけ注意する。
         """
         if not self._remaining:
             return False
         if self.settings.daily_budget <= 0:
             return True
-        counter = self.attempted if self.settings.execute else self.successful
+        counter = self.attempted if not self.settings.dry_run else self.successful
         return counter < self.settings.daily_budget
 
     def _attempt(self, spot: Spot, index: int) -> None:
@@ -995,7 +991,7 @@ class _CheckinRunner:
         )
 
         stay_secs = natural_stay_seconds()
-        if not self.settings.execute:
+        if self.settings.dry_run:
             self._simulate(spot, body, stay_secs)
             return
 
@@ -1119,9 +1115,9 @@ class _CheckinRunner:
 
     def _print_footer(self) -> None:
         """獲得サマリ行を出力する。"""
-        label = "獲得見込み" if not self.settings.execute else "獲得"
+        label = "獲得見込み" if self.settings.dry_run else "獲得"
         footer = f"{self.successful}スポット成功"
-        if self.settings.execute:
+        if not self.settings.dry_run:
             footer += f", 実POST試行 {self.attempted}件"
         footer += f", 仮想終了時刻 {self.virtual_now:%m/%d %H:%M}"
         print(f"{label}: 約{self.gained}票 ({footer})")
@@ -1131,8 +1127,8 @@ def collect_checkins(page: Page, settings: CheckinSettings) -> int:
     """全スポットに対してチェックインを試みる。戻り値は獲得票数の見込み。
 
     セーフティ:
-      - `settings.execute=False` (デフォルト) は完全ドライラン (POST を送らず、
-        sleep もなく、state も書き換えない)。
+      - `settings.dry_run=True` は完全ドライラン (POST を送らず、sleep もなく、
+        state も書き換えない)。デフォルト (`dry_run=False`) は本番実行。
       - `state.completed_spots` にある slug は事前に skip する。
       - 未観測 ecode (SUCCESS と E5005 以外) は fail closed で即停止する。
         BAN シグナル・認証切れ・予期せぬ状態のいずれかとして扱う。
@@ -1141,11 +1137,12 @@ def collect_checkins(page: Page, settings: CheckinSettings) -> int:
       - `daily_budget > 0` で件数上限を設ける (0 は無制限)。
       - スポット間には交通機関稼働時間帯 (06:00-24:00) を考慮した移動待機を挟む。
       - `checkin_end_datetime` を過ぎたスポットは skip する (イベント全体期限とは別)。
-      - deadline がパースできないスポットは `execute=True` の場合に fail closed で扱う。
+      - deadline がパースできないスポットは本番 (`dry_run=False`) の場合に
+        fail closed で扱う。
       - 各スポットで 10〜30 分の滞在時間を挟む (最終スポットや budget 到達時は skip)。
       - state.json は実 POST 成功時に限り atomic に更新する。
-      - state.json 破損時は `execute=True` で FailClosedError を送出し、dry-run では
-        空 state で継続する。
+      - state.json 破損時は本番 (`dry_run=False`) で FailClosedError を送出し、
+        dry-run では空 state で継続する。
       - `out_of_range_limit` 件以上 E5005 が続いたら停止する (crypto・body・radius
         の不一致が疑われるため、実 POST を 51 件全部撃たせない)。
     """
@@ -1619,7 +1616,7 @@ def load_account_state(profile_dir: Path, *, strict: bool = False) -> dict[str, 
     """`profile_dir/canvasser_state.json` を読み込む。
 
     strict=False は dry-run 用の緩め扱いで、パース失敗や型不一致でも空 dict を返す。
-    strict=True は `--execute` 用で、破損時に `StateFileCorruptedError` を送出し、
+    strict=True は本番実行用で、破損時に `StateFileCorruptedError` を送出し、
     追加でスキーマ検証も行う。
     """
     state_file = profile_dir / _STATE_FILENAME
@@ -1871,7 +1868,7 @@ def update_checkin_state(
 
     `mark_completed=True` の場合、`spot.slug` を `completed_spots` へ追加して
     次回起動時の事前 skip 対象にする。実行中の破損 state を空 dict で上書き
-    してしまわないよう、読み込みは strict にする (execute 経路からのみ呼ばれる)。
+    してしまわないよう、読み込みは strict にする (本番経路からのみ呼ばれる)。
     """
     state = load_account_state(profile_dir, strict=True)
     state["last_checkin"] = {
@@ -1904,7 +1901,7 @@ def resume_context(
     last = cast("dict[str, Any]", state.get("last_checkin") or {})
     # schema_version が一致しない last_checkin は「実 POST 成功由来か」を保証
     # できないため resume には使わない。旧 dry-run の simulated route を
-    # execute run の起点にすると、偽の位置と時刻から始まって有効スポットを
+    # 本番 run の起点にすると、偽の位置と時刻から始まって有効スポットを
     # skip する事故になる。
     schema_ok = last.get("schema_version") == LAST_CHECKIN_SCHEMA_VERSION
     lat = last.get("location_latitude") if schema_ok else None
@@ -2391,7 +2388,7 @@ def _ensure_authenticated(
     False のときは呼び出し側で従来と同じ未ログイン扱い (exit_code=1) にする。
     ここでユーザ向けの案内メッセージも 1 か所に集約する。
 
-    dry-run (execute=False) では、たとえ credentials が保存されていても
+    dry-run (dry_run=True) では、たとえ credentials が保存されていても
     自動再ログインは走らせない。auto_login は BNID にパスワード POST を送るため
     「dry-run = GET のみ、副作用ゼロ」の契約を壊してしまう。dry-run でも
     check_login のみでログイン済みかは判定する。
@@ -2400,7 +2397,7 @@ def _ensure_authenticated(
         return True
     if (
         options.auto_relogin
-        and options.execute
+        and not options.dry_run
         and attempt_auto_relogin(page, profile_dir, name)
     ):
         return True
@@ -2679,7 +2676,7 @@ class RunOptions:
     login_init_mode: bool = False
     run_mission: bool = False
     run_checkin: bool = False
-    execute: bool = False
+    dry_run: bool = False
     daily_budget: int = 0
     consecutive_failure_limit: int = 1
     out_of_range_limit: int = 3
@@ -2696,7 +2693,7 @@ def process_account(
 ) -> tuple[int, int]:
     """1 アカウント分の処理を行う。戻り値は `(獲得票数, exit_code)`。
 
-    `execute` は実 POST ゲートで、False なら完全ドライラン (GET のみで
+    `dry_run` はドライランゲートで、True なら完全ドライラン (GET のみで
     POST/PUT は送らない)。
     未ログイン検知時は exit_code=1 を返し、呼び出し側で他アカウントへ進む。
     """
@@ -2722,14 +2719,14 @@ def process_account(
         exit_code = 0
         if options.run_mission:
             # dry-run の見込み枚数は集計に混ぜず、アカウント総計を汚さない
-            mission_gain = collect_missions(page, execute=options.execute)
-            if options.execute:
+            mission_gain = collect_missions(page, dry_run=options.dry_run)
+            if not options.dry_run:
                 gained += mission_gain
         if options.run_checkin:
             # Referer を合わせるためチェックインページに一度 navigate しておく
             page.goto(CHECKIN_PAGE_URL, wait_until="domcontentloaded")
             settings = CheckinSettings(
-                execute=options.execute,
+                dry_run=options.dry_run,
                 daily_budget=options.daily_budget,
                 consecutive_failure_limit=options.consecutive_failure_limit,
                 out_of_range_limit=options.out_of_range_limit,
@@ -2737,13 +2734,13 @@ def process_account(
             )
             try:
                 checkin_gain = collect_checkins(page, settings)
-                if options.execute:
+                if not options.dry_run:
                     gained += checkin_gain
             except FailClosedError as e:
                 # fail-closed 前に成功していた POST の reward は
                 # e.partial_gained に入っているので、集計から落とさないよう合流させる。
                 print(f"[{name}] fail closed: {e}", file=sys.stderr)
-                if options.execute:
+                if not options.dry_run:
                     gained += e.partial_gained
                 exit_code = 1
         return gained, exit_code
@@ -2805,10 +2802,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "順次処理する",
     )
     collect.add_argument(
-        "--execute",
+        "--dry-run",
         action="store_true",
-        help="実 POST/PUT を送る。未指定は GET のみのドライラン (state 更新や "
-        "checkin の滞在 sleep も行わない)。",
+        help="POST/PUT を送らない完全ドライラン (GET のみ)。state 更新や checkin の"
+        "滞在 sleep も行わない。無指定なら本番実行。",
     )
     collect.add_argument(
         "--no-auto-relogin",
@@ -2934,12 +2931,12 @@ def _build_run_options(args: argparse.Namespace) -> RunOptions:
     if args.command == "mission":
         return RunOptions(
             run_mission=True,
-            execute=args.execute,
+            dry_run=args.dry_run,
             auto_relogin=not args.no_auto_relogin,
         )
     return RunOptions(
         run_checkin=True,
-        execute=args.execute,
+        dry_run=args.dry_run,
         daily_budget=args.daily_budget,
         consecutive_failure_limit=args.consecutive_failure_limit,
         out_of_range_limit=args.out_of_range_limit,

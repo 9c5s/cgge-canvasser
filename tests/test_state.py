@@ -283,7 +283,7 @@ class TestResumeContext:
         assert got == (None, None, None, set())
 
     def test_strictでは破損stateの例外が伝播する(self, tmp_path: Path) -> None:
-        """execute 経路相当の strict=True では破損を丸めず例外を上げる。"""
+        """本番経路相当の strict=True では破損を丸めず例外を上げる。"""
         (tmp_path / "canvasser_state.json").write_text("{{{", encoding="utf-8")
 
         with pytest.raises(StateFileCorruptedError, match="canvasser_state"):
