@@ -1857,6 +1857,72 @@ def _discard_pending_credentials(profile_dir: Path) -> None:
         _pending_credentials_file(profile_dir).unlink()
 
 
+_RELOGIN_GUARD_FILENAME = "relogin_guard.json"
+
+
+@dataclass(kw_only=True)
+class ReloginGuard:
+    """自動再ログインの連続失敗ガード state。パスワードを含まない。
+
+    - `failure_count`: 連続失敗回数。成功で 0 にリセットする。
+    - `disabled_until`: MAX_FAILURES に達したときに設定する JST ISO8601。
+    """
+
+    failure_count: int = 0
+    disabled_until: str | None = None
+
+
+def _relogin_guard_file(profile_dir: Path) -> Path:
+    return profile_dir / _RELOGIN_GUARD_FILENAME
+
+
+def load_relogin_guard(profile_dir: Path) -> ReloginGuard:
+    """profile_dir/relogin_guard.json を読み込む。欠損・破損は既定値。"""
+    path = _relogin_guard_file(profile_dir)
+    if not path.exists():
+        return ReloginGuard()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(
+            f"[warn] {path} を読めません: {e}。ガードを既定値にリセットします。",
+            file=sys.stderr,
+        )
+        return ReloginGuard()
+    if not isinstance(raw, dict):
+        print(
+            f"[warn] {path} のトップレベルが dict でありません。既定値を使います。",
+            file=sys.stderr,
+        )
+        return ReloginGuard()
+    data = cast("dict[str, Any]", raw)
+    fc_raw = data.get("failure_count", 0)
+    is_valid_int = isinstance(fc_raw, int) and not isinstance(fc_raw, bool)
+    failure_count = fc_raw if is_valid_int else 0
+    du_raw = data.get("disabled_until")
+    disabled_until = du_raw if isinstance(du_raw, str) else None
+    return ReloginGuard(failure_count=failure_count, disabled_until=disabled_until)
+
+
+def save_relogin_guard(profile_dir: Path, guard: ReloginGuard) -> None:
+    """profile_dir/relogin_guard.json に atomic に書き出す。"""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    path = _relogin_guard_file(profile_dir)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".relogin_guard-", suffix=".tmp", dir=str(profile_dir)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(asdict(guard), f, ensure_ascii=False, indent=2, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        Path(tmp_path).replace(path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            Path(tmp_path).unlink()
+        raise
+
+
 def update_checkin_state(
     profile_dir: Path,
     spot: Spot,
