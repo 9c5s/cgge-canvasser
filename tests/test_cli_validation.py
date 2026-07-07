@@ -249,13 +249,13 @@ class TestValidateThresholds:
 class TestBuildParser:
     """_build_parser のサブコマンド構成。"""
 
-    def test_missionの既定値はドライラン(self) -> None:
-        """mission 単独では実 POST ゲートが閉じている。"""
+    def test_missionの既定値は本番(self) -> None:
+        """mission 単独では無指定=本番でドライランゲートが閉じている。"""
         args = canvasser._build_parser().parse_args(["mission"])
 
         assert args.command == "mission"
         assert args.account is None
-        assert args.execute is False
+        assert args.dry_run is False
         assert args.profiles_dir == "./profiles"
 
     def test_missionにチェックイン用の安全弁は無い(self) -> None:
@@ -263,28 +263,28 @@ class TestBuildParser:
         with pytest.raises(SystemExit):
             canvasser._build_parser().parse_args(["mission", "--daily-budget", "3"])
 
-    def test_checkinの既定値はドライラン(self) -> None:
-        """checkin 単独では実 POST ゲートが閉じ、安全弁は既定値になる。"""
+    def test_checkinの既定値は本番(self) -> None:
+        """checkin 単独では無指定なら本番になり、安全弁は既定値になる。"""
         args = canvasser._build_parser().parse_args(["checkin"])
 
         assert args.command == "checkin"
         assert args.account is None
-        assert args.execute is False
+        assert args.dry_run is False
         assert args.daily_budget == 0
         assert args.consecutive_failure_limit == 1
         assert args.out_of_range_limit == 3
         assert args.profiles_dir == "./profiles"
 
-    def test_checkinのexecuteと安全弁を指定できる(self) -> None:
-        """checkin は --execute とチェックイン専用の安全弁を受け取る。"""
+    def test_checkinのdry_runと安全弁を指定できる(self) -> None:
+        """checkin は --dry-run とチェックイン専用の安全弁を受け取る。"""
         args = canvasser._build_parser().parse_args([
             "checkin",
-            "--execute",
+            "--dry-run",
             "--daily-budget",
             "3",
         ])
 
-        assert args.execute is True
+        assert args.dry_run is True
         assert args.daily_budget == 3
 
     def test_missionは既定でauto_relogin有効(self) -> None:
@@ -387,7 +387,7 @@ class TestBuildRunOptions:
         assert options.login_init_mode is False
         assert options.run_mission is False
         assert options.run_checkin is False
-        assert options.execute is False
+        assert options.dry_run is False
 
     def test_login_initコマンドはlogin_init_modeのみ有効(self) -> None:
         """login-init ではタスクと実行ゲートがすべて閉じ、login_init_mode だけ立つ。"""
@@ -403,10 +403,10 @@ class TestBuildRunOptions:
         assert options.login_init_mode is True
         assert options.run_mission is False
         assert options.run_checkin is False
-        assert options.execute is False
+        assert options.dry_run is False
 
-    def test_missionドライラン(self) -> None:
-        """mission 単独では mission のみ選択され、ゲートは閉じたまま。"""
+    def test_mission既定は本番(self) -> None:
+        """mission 単独では mission のみ選択され、無指定=本番でゲートは開く。"""
         args = canvasser._build_parser().parse_args(["mission"])
 
         options = canvasser._build_run_options(args)
@@ -414,7 +414,7 @@ class TestBuildRunOptions:
         assert options.login_mode is False
         assert options.run_mission is True
         assert options.run_checkin is False
-        assert options.execute is False
+        assert options.dry_run is False
         assert options.auto_relogin is True
 
     def test_no_auto_reloginでauto_reloginが無効化される(self) -> None:
@@ -433,25 +433,25 @@ class TestBuildRunOptions:
 
         assert options.auto_relogin is False
 
-    def test_mission本番(self) -> None:
-        """mission --execute で実行ゲートが開く。"""
-        args = canvasser._build_parser().parse_args(["mission", "--execute"])
+    def test_missionドライランを指定できる(self) -> None:
+        """mission --dry-run でドライランゲートが開く (実 POST を送らない)。"""
+        args = canvasser._build_parser().parse_args(["mission", "--dry-run"])
 
         options = canvasser._build_run_options(args)
 
         assert options.run_mission is True
         assert options.run_checkin is False
-        assert options.execute is True
+        assert options.dry_run is True
 
-    def test_checkin本番はmissionを含まない(self) -> None:
-        """checkin --execute では mission 側は動かない。"""
-        args = canvasser._build_parser().parse_args(["checkin", "--execute"])
+    def test_checkinドライランはmissionを含まない(self) -> None:
+        """checkin --dry-run では mission 側は動かない。"""
+        args = canvasser._build_parser().parse_args(["checkin", "--dry-run"])
 
         options = canvasser._build_run_options(args)
 
         assert options.run_mission is False
         assert options.run_checkin is True
-        assert options.execute is True
+        assert options.dry_run is True
 
     def test_checkinの閾値が引き継がれる(self) -> None:
         """checkin の安全弁引数が RunOptions へそのまま渡る。"""

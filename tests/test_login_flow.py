@@ -825,10 +825,10 @@ class TestAttemptAutoRelogin:
         assert "リトライ後にも遅延成功" in capsys.readouterr().err
 
 
-def _run_options(*, execute: bool, auto_relogin: bool = True) -> canvasser.RunOptions:
+def _run_options(*, dry_run: bool, auto_relogin: bool = True) -> canvasser.RunOptions:
     """_ensure_authenticated テスト用の RunOptions を組み立てる。"""
     return canvasser.RunOptions(
-        run_mission=True, execute=execute, auto_relogin=auto_relogin
+        run_mission=True, dry_run=dry_run, auto_relogin=auto_relogin
     )
 
 
@@ -838,7 +838,7 @@ class TestEnsureAuthenticated:
     def test_ログイン済みならTrue(self) -> None:
         """check_login が true なら auto_relogin を試さずに True。"""
         fake = FakePage(responses=[_is_login_response(is_login=True)])
-        opts = _run_options(execute=True)
+        opts = _run_options(dry_run=False)
 
         assert (
             canvasser._ensure_authenticated(
@@ -853,12 +853,12 @@ class TestEnsureAuthenticated:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """execute=False では credentials が保存されていても auto_login を送らない。"""
+        """dry_run=True では credentials が保存されていても auto_login を送らない。"""
         _install_creds(tmp_path)
         _install_fake_time(monkeypatch)
         # check_login: 未ログイン、以降 auto_login への呼び出しは想定しない
         fake = FakePage(responses=[_is_login_response(is_login=False)])
-        opts = _run_options(execute=False)
+        opts = _run_options(dry_run=True)
 
         result = canvasser._ensure_authenticated(as_page(fake), "haruo", tmp_path, opts)
 
@@ -869,24 +869,24 @@ class TestEnsureAuthenticated:
         # 未ログインメッセージだけ出る
         assert "未ログイン" in capsys.readouterr().err
 
-    def test_execute_かつauto_relogin無効なら自動再ログインを走らせない(
+    def test_本番かつauto_relogin無効なら自動再ログインを走らせない(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """--no-auto-relogin は execute でも auto_login を封じる (opt-out 尊重)。"""
+        """--no-auto-relogin は本番実行でも auto_login を封じる (opt-out 尊重)。"""
         _install_creds(tmp_path)
         _install_fake_time(monkeypatch)
         fake = FakePage(responses=[_is_login_response(is_login=False)])
-        opts = _run_options(execute=True, auto_relogin=False)
+        opts = _run_options(dry_run=False, auto_relogin=False)
 
         result = canvasser._ensure_authenticated(as_page(fake), "haruo", tmp_path, opts)
 
         assert result is False
         assert not any(c[0] == "press_sequentially" for c in fake.calls)
 
-    def test_execute_かつauto_relogin有効なら自動再ログインを試す(
+    def test_本番かつauto_relogin有効なら自動再ログインを試す(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """execute + auto_relogin 有効かつ credentials 保存で auto_login が走る。
+        """本番実行 + auto_relogin 有効かつ credentials 保存で auto_login が走る。
 
         流れ: _ensure_authenticated の check_login=false →
         attempt_auto_relogin(goto + post-init check_login=false + auto_login SUCCESS)。
@@ -900,7 +900,7 @@ class TestEnsureAuthenticated:
                 _is_login_response(is_login=True),  # auto_login iter 1 SUCCESS
             ]
         )
-        opts = _run_options(execute=True)
+        opts = _run_options(dry_run=False)
 
         assert (
             canvasser._ensure_authenticated(as_page(fake), "haruo", tmp_path, opts)
