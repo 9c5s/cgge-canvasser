@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import pytest
+    from playwright.sync_api import Page
 
 
 def _sample_creds() -> Credentials:
@@ -29,6 +30,11 @@ def _sample_creds() -> Credentials:
         bnid_password="hunter2",
         saved_at="2026-07-05T00:00:00+09:00",
     )
+
+
+def _load_sample_creds(profile_dir: Path) -> Credentials | None:
+    """`load_credentials` の monkeypatch 用スタブ。常に `_sample_creds()` を返す。"""
+    return _sample_creds()
 
 
 def _is_login_response(*, is_login: bool) -> dict[str, object]:
@@ -420,6 +426,119 @@ def _install_pending_creds(profile_dir: Path, **overrides: object) -> Credential
     return creds
 
 
+def _install_guard(profile_dir: Path, **overrides: object) -> canvasser.ReloginGuard:
+    """テスト用に relogin_guard.json を保存し、書いた ReloginGuard を返す。"""
+    fields: dict[str, object] = {
+        "failure_count": 0,
+        "disabled_until": None,
+    }
+    fields.update(overrides)
+    guard = canvasser.ReloginGuard(**fields)  # pyright: ignore[reportArgumentType]
+    canvasser.save_relogin_guard(profile_dir, guard)
+    return guard
+
+
+class TestRunGuardedAutoLogin:
+    """`_run_guarded_auto_login` の共有ヘルパー契約を直接検証する。
+
+    `attempt_auto_relogin` 経由だけだと ASOBI 連携復旧ドライバ (Task 8) からの
+    呼び出しがカバーされないため、ここで直接テストする。
+    """
+
+    def test_run_guarded_auto_login_no_credentials_returns_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """credentials 復号失敗 (None) なら False (ブラウザ側には触らない)。"""
+
+        def _load_none(profile_dir: Path) -> Credentials | None:
+            return None
+
+        monkeypatch.setattr(canvasser, "load_credentials", _load_none)
+        fake = FakePage(responses=[])
+        result = canvasser._run_guarded_auto_login(as_page(fake), tmp_path, "test")
+        assert result is False
+
+    def test_run_guarded_auto_login_disabled_returns_false(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """guard.disabled_until が未来なら auto_login を試さず False。"""
+        monkeypatch.setattr(canvasser, "load_credentials", _load_sample_creds)
+        future = (datetime.now(JST) + timedelta(hours=1)).isoformat()
+        canvasser.save_relogin_guard(
+            tmp_path,
+            canvasser.ReloginGuard(failure_count=3, disabled_until=future),
+        )
+        fake = FakePage(responses=[])
+        result = canvasser._run_guarded_auto_login(as_page(fake), tmp_path, "test")
+        assert result is False
+
+    def test_run_guarded_auto_login_success_resets_guard(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SUCCESS なら True を返し、guard の failure_count をリセットする。"""
+
+        def _sequence_success(
+            page: Page,
+            name: str,
+            credentials: Credentials,
+            guard: canvasser.ReloginGuard,
+        ) -> tuple[AutoLoginOutcome, int]:
+            return AutoLoginOutcome.SUCCESS, 1
+
+        monkeypatch.setattr(canvasser, "load_credentials", _load_sample_creds)
+        canvasser.save_relogin_guard(tmp_path, canvasser.ReloginGuard(failure_count=2))
+        monkeypatch.setattr(canvasser, "_run_auto_login_sequence", _sequence_success)
+        fake = FakePage(responses=[])
+        result = canvasser._run_guarded_auto_login(as_page(fake), tmp_path, "test")
+        assert result is True
+        assert canvasser.load_relogin_guard(tmp_path).failure_count == 0
+
+    def test_run_guarded_auto_login_failure_records_submissions(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """失敗 (submissions>0) なら False を返し、guard に失敗を記録する。"""
+
+        def _sequence_password_error(
+            page: Page,
+            name: str,
+            credentials: Credentials,
+            guard: canvasser.ReloginGuard,
+        ) -> tuple[AutoLoginOutcome, int]:
+            return AutoLoginOutcome.PASSWORD_ERROR, 1
+
+        monkeypatch.setattr(canvasser, "load_credentials", _load_sample_creds)
+        monkeypatch.setattr(
+            canvasser, "_run_auto_login_sequence", _sequence_password_error
+        )
+        fake = FakePage(responses=[])
+        result = canvasser._run_guarded_auto_login(as_page(fake), tmp_path, "test")
+        assert result is False
+        assert canvasser.load_relogin_guard(tmp_path).failure_count == 1
+
+    def test_run_guarded_auto_login_no_submission_no_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FORM_ERROR (submissions=0) の場合、failure_count を加算しない。
+
+        BNID にパスワードを送っていないため、guard への書き込み自体を省く。
+        """
+
+        def _sequence_form_error(
+            page: Page,
+            name: str,
+            credentials: Credentials,
+            guard: canvasser.ReloginGuard,
+        ) -> tuple[AutoLoginOutcome, int]:
+            return AutoLoginOutcome.FORM_ERROR, 0
+
+        monkeypatch.setattr(canvasser, "load_credentials", _load_sample_creds)
+        monkeypatch.setattr(canvasser, "_run_auto_login_sequence", _sequence_form_error)
+        fake = FakePage(responses=[])
+        result = canvasser._run_guarded_auto_login(as_page(fake), tmp_path, "test")
+        assert result is False
+        assert not (tmp_path / "relogin_guard.json").exists()  # 書き込みしない
+
+
 class TestAttemptAutoRelogin:
     """attempt_auto_relogin のゲート・リトライ・失敗ガードの合流点。"""
 
@@ -435,7 +554,8 @@ class TestAttemptAutoRelogin:
     def test_disabled_until有効ならFalseでgotoしない(self, tmp_path: Path) -> None:
         """disabled_until が未来ならブラウザ側にも触らない。"""
         future = (datetime.now(JST) + timedelta(hours=1)).isoformat()
-        _install_creds(tmp_path, disabled_until=future)
+        _install_creds(tmp_path)
+        _install_guard(tmp_path, disabled_until=future)
         fake = FakePage()
 
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
@@ -450,7 +570,8 @@ class TestAttemptAutoRelogin:
 
         post-init check_login=False (auto_login まで進む) → auto_login iter 1 で True。
         """
-        _install_creds(tmp_path, failure_count=2)
+        _install_creds(tmp_path)
+        _install_guard(tmp_path, failure_count=2)
         _install_fake_time(monkeypatch)
         fake = FakePage(
             responses=[
@@ -462,8 +583,7 @@ class TestAttemptAutoRelogin:
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is True
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         assert got.failure_count == 0
         # auto_login のフォーム操作が実際に走った (post-init 短絡ではない)
         assert any(c[0] == "press_sequentially" for c in fake.calls)
@@ -480,7 +600,8 @@ class TestAttemptAutoRelogin:
         auto_login (mission page への redirect で #mail 無し → FORM_ERROR) を回避
         して即 SUCCESS で抜け、failure_count も減らす。
         """
-        _install_creds(tmp_path, failure_count=1)
+        _install_creds(tmp_path)
+        _install_guard(tmp_path, failure_count=1)
         _install_fake_time(monkeypatch)
         fake = FakePage(responses=[_is_login_response(is_login=True)])
 
@@ -490,8 +611,7 @@ class TestAttemptAutoRelogin:
         # auto_login のフォーム操作は一切走らない
         assert not any(c[0] == "press_sequentially" for c in fake.calls)
         # failure_count は 0 にリセット
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         assert got.failure_count == 0
         assert "セッション有効を確認" in capsys.readouterr().err
 
@@ -531,7 +651,8 @@ class TestAttemptAutoRelogin:
         を回すと valid cookie で mission page へ redirect → #mail 無し → FORM_ERROR に
         誤判定するのを避けるため、post-retry check_login で SUCCESS として拾う。
         """
-        _install_creds(tmp_path, failure_count=1)
+        _install_creds(tmp_path)
+        _install_guard(tmp_path, failure_count=1)
         _install_fake_time(monkeypatch, step=10.0)
         # post-init: False, auto_login 1: 5 False → TIMEOUT, post-retry: True → SUCCESS
         fake = FakePage(
@@ -548,8 +669,7 @@ class TestAttemptAutoRelogin:
         press_calls = [c for c in fake.calls if c[0] == "press_sequentially"]
         # 1 回目 auto_login のみ: fill 2 回 + press_sequentially 2 回
         assert len(press_calls) == 2
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         assert got.failure_count == 0
         assert "遅延成功を検知" in capsys.readouterr().err
 
@@ -571,8 +691,7 @@ class TestAttemptAutoRelogin:
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is False
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         # BNID に 2 回 submit されているので 2 回分計上する
         assert got.failure_count == 2
         assert "リトライします" in capsys.readouterr().err
@@ -601,8 +720,7 @@ class TestAttemptAutoRelogin:
         assert result is False
         # goto は 1 回のみ (リトライしていない)
         assert len([c for c in fake.calls if c[0] == "goto"]) == 1
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         assert got.failure_count == 1
 
     def test_初回goto失敗はFalseだがfailure_countは加算しない(
@@ -613,15 +731,15 @@ class TestAttemptAutoRelogin:
         BNID にパスワードを送っていないので BNID ロックの原因にならず、
         failure_count は加算せず disabled_until への進行も止める。
         """
-        _install_creds(tmp_path, failure_count=2)
+        _install_creds(tmp_path)
+        _install_guard(tmp_path, failure_count=2)
         fake = FakePage(goto_errors=[PlaywrightError("navigation failed")])
 
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is False
         assert "BNID ログイン画面への遷移で失敗" in capsys.readouterr().err
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         # 初期値 2 のまま + disabled_until も未設定 (自動再ログインは次回も試せる)
         assert got.failure_count == 2
         assert got.disabled_until is None
@@ -646,8 +764,7 @@ class TestAttemptAutoRelogin:
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is False
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         assert got.failure_count == 1
 
     def test_初回auto_login_FORM_ERRORはfailure_count加算しない(
@@ -657,7 +774,8 @@ class TestAttemptAutoRelogin:
 
         BNID にはパスワードを送っていないので、failure_count を消費しない。
         """
-        _install_creds(tmp_path, failure_count=1)
+        _install_creds(tmp_path)
+        _install_guard(tmp_path, failure_count=1)
         _install_fake_time(monkeypatch)
         # post-init check False → auto_login: wait_for が失敗 → FORM_ERROR
         fake = FakePage(
@@ -670,8 +788,7 @@ class TestAttemptAutoRelogin:
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is False
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         # 初期値 1 のまま (加算されない)
         assert got.failure_count == 1
 
@@ -702,8 +819,7 @@ class TestAttemptAutoRelogin:
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is False
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         # 1 回目 TIMEOUT ぶんだけ計上
         assert got.failure_count == 1
 
@@ -736,8 +852,7 @@ class TestAttemptAutoRelogin:
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is False
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         # 2 回の submit が計上される (1 回目 TIMEOUT + 2 回目 TIMEOUT)
         assert got.failure_count == 2
 
@@ -750,7 +865,8 @@ class TestAttemptAutoRelogin:
         failure_count は加算しない (無駄な失敗計上で disabled_until を早期発動
         させない)。
         """
-        _install_creds(tmp_path, failure_count=1)
+        _install_creds(tmp_path)
+        _install_guard(tmp_path, failure_count=1)
         _install_fake_time(monkeypatch)
         # post-init check_login False → auto_login pre-check で CAPTCHA 検知
         fake = FakePage(
@@ -761,8 +877,7 @@ class TestAttemptAutoRelogin:
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is False
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         # 初期値 1 のまま (BNID に届いていないので加算しない)
         assert got.failure_count == 1
 
@@ -776,7 +891,8 @@ class TestAttemptAutoRelogin:
         避けるため retry_after_timeout で判定して控える。
         """
         max_fail = canvasser.CREDENTIALS_MAX_FAILURES
-        _install_creds(tmp_path, failure_count=max_fail - 1)
+        _install_creds(tmp_path)
+        _install_guard(tmp_path, failure_count=max_fail - 1)
         _install_fake_time(monkeypatch, step=10.0)
         # 1 回目 auto_login TIMEOUT のポーリング 5 回分だけ用意する
         # (2 回目 auto_login が走らないことも同時に検証)
@@ -787,8 +903,7 @@ class TestAttemptAutoRelogin:
         assert result is False
         # goto は 1 回のみ (リトライしていない)
         assert len([c for c in fake.calls if c[0] == "goto"]) == 1
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         # 1 回分だけ加算されて MAX に達し disabled_until が設定される
         assert got.failure_count == max_fail
         assert got.disabled_until is not None
@@ -806,7 +921,8 @@ class TestAttemptAutoRelogin:
         → SUCCESS。responses は post-init 1 + auto_login 1 = 5 + post-retry 1 +
         auto_login 2 = 5 + 遅延成功 check 1 = 13。
         """
-        _install_creds(tmp_path, failure_count=1)
+        _install_creds(tmp_path)
+        _install_guard(tmp_path, failure_count=1)
         _install_fake_time(monkeypatch, step=10.0)
         fake = FakePage(
             responses=[
@@ -818,8 +934,7 @@ class TestAttemptAutoRelogin:
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is True
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
+        got = canvasser.load_relogin_guard(tmp_path)
         # 遅延成功で failure_count はリセット
         assert got.failure_count == 0
         assert "リトライ後にも遅延成功" in capsys.readouterr().err
