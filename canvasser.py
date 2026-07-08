@@ -337,7 +337,9 @@ def _filter_listings(
     return filtered
 
 
-def collect_missions(page: Page, profile_dir: Path, name: str, *, dry_run: bool) -> int:
+def collect_missions(
+    page: Page, profile_dir: Path, name: str, *, dry_run: bool, auto_relogin: bool
+) -> int:
     """API 経由で完了可能なミッションと、外部トリガー達成分の受取をまとめて消化する。
 
     通常 (`mission_type=0`) と ASOBI STORE 系 (`mission_type=1`) の両方を fetch する。
@@ -353,6 +355,9 @@ def collect_missions(page: Page, profile_dir: Path, name: str, *, dry_run: bool)
       ままなので、達成 POST も受取 PUT も送らない。
     - `dry_run=True` は完全ドライラン。GET のみ実行し、POST/PUT は送らない (ASOBI
       連携復旧 driver も起動しない)。
+    - `auto_relogin=False` の場合、BNID にパスワードを送らないユーザーの明示的な
+      opt-out を尊重して ASOBI 連携復旧 driver を起動しない (driver は BNID フォーム
+      を経由するため保存された password を submit する経路を含むため)。
 
     ASOBI 連携トークン切れ (E1926) を検知した場合、`_run_asobi_linkage_recovery`
     で連携を再確立し、該当ミッションだけに絞って 1 回だけ再走する。listings の
@@ -369,6 +374,16 @@ def collect_missions(page: Page, profile_dir: Path, name: str, *, dry_run: bool)
         total_gained += result.gained
         if not result.linkage_expired_ids or dry_run:
             # dry_run では副作用ゼロの契約を守るため復旧 driver を起動しない
+            break
+        if not auto_relogin:
+            # --no-auto-relogin のユーザー opt-out を尊重する。driver は
+            # 中間 BNID フォームに到達したとき保存された password を submit
+            # する経路を含むため、opt-out 時は driver 全体を起動しない
+            print(
+                f"[{name}] E1926 検知だが --no-auto-relogin 指定のため復旧を"
+                "スキップする (該当ミッションは翌日再試行)",
+                file=sys.stderr,
+            )
             break
         if attempt == 2:
             # driver は 1 回のみ。2 回目でも残っていれば諦める
@@ -2660,12 +2675,20 @@ def _ensure_authenticated(
 
 
 def run_login_flow(
-    page: Page, timeout_sec: int = 600, interval_sec: float = 3.0
+    page: Page,
+    timeout_sec: int = 600,
+    interval_sec: float = 3.0,
+    save_password_grace_sec: int = 30,
 ) -> int:
     """ブラウザを headed で起動し、ログイン成功を is_login フラグでポーリング検知する。
 
     対話入力に頼らないので、bash-input のような非対話環境でも動作する。中断はブラウザを
     閉じるか Ctrl+C で行える。
+
+    ログイン成功検知後は `save_password_grace_sec` 秒だけブラウザを開いたまま待機する。
+    Chrome の「パスワードを保存しますか?」プロンプトが submit 直後に出るため、ユーザーが
+    応答する前に context を閉じると Login Data に書き込まれず、後の自動再ログインが
+    silent に無資格情報で失敗するのを防ぐ。
     """
     print("ブラウザが立ち上がりました。", file=sys.stderr)
     print(
@@ -2682,9 +2705,16 @@ def run_login_flow(
         # ログイン画面へのリダイレクト中などに fetch は失敗する。次のポーリングを待つ。
         with contextlib.suppress(PlaywrightError):
             if check_login(page):
+                print("ログイン状態を確認しました。", file=sys.stderr)
                 print(
-                    "ログイン状態を確認しました。次回から mission / checkin を"
-                    "実行できます。",
+                    "Chrome の「パスワードを保存しますか?」プロンプトが出たら"
+                    f"「保存」をクリックしてください ({save_password_grace_sec} 秒後に"
+                    "ブラウザを閉じます)。保存すると次回以降の自動再ログインで参照される。",
+                    file=sys.stderr,
+                )
+                time.sleep(save_password_grace_sec)
+                print(
+                    "次回から mission / checkin を実行できます。",
                     file=sys.stderr,
                 )
                 return 0
@@ -2882,7 +2912,11 @@ def process_account(
         if options.run_mission:
             # dry-run の見込み枚数は集計に混ぜず、アカウント総計を汚さない
             mission_gain = collect_missions(
-                page, profile_dir, name, dry_run=options.dry_run
+                page,
+                profile_dir,
+                name,
+                dry_run=options.dry_run,
+                auto_relogin=options.auto_relogin,
             )
             if not options.dry_run:
                 gained += mission_gain

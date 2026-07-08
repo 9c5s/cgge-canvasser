@@ -67,7 +67,7 @@ class TestCollectMissions:
         fake = FakePage([_listing([_mission(1, 30)]), _empty_listing()])
 
         gained = canvasser.collect_missions(
-            _as_page(fake), tmp_path, "test", dry_run=True
+            _as_page(fake), tmp_path, "test", dry_run=True, auto_relogin=True
         )
 
         assert gained == 30
@@ -84,7 +84,7 @@ class TestCollectMissions:
         ])
 
         gained = canvasser.collect_missions(
-            _as_page(fake), tmp_path, "test", dry_run=False
+            _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
         )
 
         assert gained == 30
@@ -100,7 +100,7 @@ class TestCollectMissions:
         ])
 
         gained = canvasser.collect_missions(
-            _as_page(fake), tmp_path, "test", dry_run=False
+            _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
         )
 
         assert gained == 10
@@ -114,7 +114,7 @@ class TestCollectMissions:
         ])
 
         gained = canvasser.collect_missions(
-            _as_page(fake), tmp_path, "test", dry_run=False
+            _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
         )
 
         assert gained == 0
@@ -136,7 +136,7 @@ class TestCollectMissions:
         ])
 
         gained = canvasser.collect_missions(
-            _as_page(fake), tmp_path, "test", dry_run=False
+            _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
         )
 
         assert gained == 15
@@ -150,7 +150,7 @@ class TestCollectMissions:
         ])
 
         gained = canvasser.collect_missions(
-            _as_page(fake), tmp_path, "test", dry_run=False
+            _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
         )
 
         assert gained == 0
@@ -167,7 +167,7 @@ class TestCollectMissions:
         ])
 
         gained = canvasser.collect_missions(
-            _as_page(fake), tmp_path, "test", dry_run=False
+            _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
         )
 
         assert gained == 20
@@ -182,7 +182,7 @@ class TestCollectMissions:
         ])
 
         gained = canvasser.collect_missions(
-            _as_page(fake), tmp_path, "test", dry_run=False
+            _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
         )
 
         assert gained == 0
@@ -193,7 +193,9 @@ class TestCollectMissions:
         fake = FakePage([{"status": 500, "body": None, "error": "boom"}])
 
         with pytest.raises(RuntimeError, match="通常"):
-            canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=True)
+            canvasser.collect_missions(
+                _as_page(fake), tmp_path, "test", dry_run=True, auto_relogin=True
+            )
 
     def test_ASOBI_STORE一覧の取得失敗もRuntimeError(self, tmp_path: Path) -> None:
         """通常一覧が取れても ASOBI STORE 一覧が失敗すれば RuntimeError で止める。"""
@@ -203,7 +205,9 @@ class TestCollectMissions:
         ])
 
         with pytest.raises(RuntimeError, match="ASOBI STORE"):
-            canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=True)
+            canvasser.collect_missions(
+                _as_page(fake), tmp_path, "test", dry_run=True, auto_relogin=True
+            )
 
     def test_通常とASOBI_STOREの両方から受取を集計する(self, tmp_path: Path) -> None:
         """mission_type=0 と mission_type=1 の両方で受取を実行し合算する。
@@ -221,7 +225,7 @@ class TestCollectMissions:
         ])
 
         gained = canvasser.collect_missions(
-            _as_page(fake), tmp_path, "test", dry_run=False
+            _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
         )
 
         assert gained == 5 + 2
@@ -242,7 +246,9 @@ class TestCollectMissions:
         ])
 
         with pytest.raises(RuntimeError, match="ASOBI STORE"):
-            canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=False)
+            canvasser.collect_missions(
+                _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
+            )
 
         # 2 GET のみで、通常一覧の PUT は 1 件も送られていない
         assert len(fake.calls) == 2
@@ -279,7 +285,9 @@ def test_collect_missions_e1926_recovery_flow(
         success_response({"received_point": 2}),
     ])
 
-    gained = canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=False)
+    gained = canvasser.collect_missions(
+        _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
+    )
 
     # gained = 5 (normal, attempt 1) + 2 (asobi, attempt 2) = 7、driver は 1 回のみ
     assert gained == 7
@@ -303,7 +311,9 @@ def test_collect_missions_e1926_driver_failure_returns_partial_gained(
         _error_response("E1926"),
     ])
 
-    gained = canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=False)
+    gained = canvasser.collect_missions(
+        _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=True
+    )
 
     assert gained == 5  # normal (#10) だけ回収、asobi (#21) は復旧失敗でスキップ
 
@@ -323,9 +333,43 @@ def test_collect_missions_dry_run_does_not_trigger_recovery(
     # 万が一混入しても driver を起動しないことを回帰的に確認する。
     fake = FakePage([_empty_listing(), _empty_listing()])
 
-    canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=True)
+    canvasser.collect_missions(
+        _as_page(fake), tmp_path, "test", dry_run=True, auto_relogin=True
+    )
 
     assert call_log == []
+
+
+def test_collect_missions_no_auto_relogin_skips_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """auto_relogin=False (--no-auto-relogin) では E1926 でも driver を起動しない。
+
+    ユーザーが明示的に自動再ログインを opt-out している場合、driver 経由で
+    BNID 保存パスワードが submit される経路も遮断する必要がある。
+    E1926 だったミッションはスキップし、翌日再試行に落とす。
+    """
+    call_log: list[str] = []
+
+    def fake_recovery(page: Page, profile_dir: Path, name: str) -> bool:
+        call_log.append("driver")
+        return True
+
+    monkeypatch.setattr(canvasser, "_run_asobi_linkage_recovery", fake_recovery)
+    fake = FakePage([
+        _listing([_mission(10, 5)]),
+        success_response({"missions": [_mission(21, 2)]}),
+        _OK,
+        success_response({"received_point": 5}),
+        _error_response("E1926"),
+    ])
+
+    gained = canvasser.collect_missions(
+        _as_page(fake), tmp_path, "test", dry_run=False, auto_relogin=False
+    )
+
+    assert gained == 5  # normal (#10) だけ回収、asobi (#21) は driver 起動せずスキップ
+    assert call_log == []  # driver 起動されない
 
 
 class TestComplete:
