@@ -2,6 +2,8 @@
 
 DPAPI 部分はテスト決定性のため monkeypatch でスタブする。GCM 部分は
 実 pycryptodome で往復させる。SQLite fixture は sqlite3 で組む。
+末尾には `load_credentials` の end-to-end テスト (Local State + Login Data +
+DPAPI モックを組み合わせた統合検証) も含む。
 """
 
 from __future__ import annotations
@@ -13,10 +15,12 @@ from typing import TYPE_CHECKING
 
 from Crypto.Cipher import AES
 
+import canvasser
 from canvasser import (
     _decrypt_v10_password,
     _load_chrome_master_key,
     _read_bnid_login_row,
+    load_credentials,
 )
 
 if TYPE_CHECKING:
@@ -189,3 +193,69 @@ def test_read_bnid_login_row_empty_username_returns_none(tmp_path: Path) -> None
         [("https://account.bandainamcoid.com/login.html", "", b"v10XX")],
     )
     assert _read_bnid_login_row(tmp_path) is None
+
+
+def test_load_credentials_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Local State + Login Data + DPAPI モックで Credentials を組み立てる (正常系)。"""
+    fake_key = b"k" * 32
+
+    def _fake_dpapi_unprotect(blob: bytes) -> bytes | None:
+        del blob
+        return fake_key
+
+    monkeypatch.setattr("canvasser._dpapi_unprotect", _fake_dpapi_unprotect)
+    local_state = tmp_path / "Local State"
+    encrypted_b64 = base64.b64encode(b"DPAPI" + b"garbage").decode()
+    local_state.write_text(
+        json.dumps({"os_crypt": {"encrypted_key": encrypted_b64}}),
+        encoding="utf-8",
+    )
+    default = tmp_path / "Default"
+    default.mkdir()
+    _make_login_data_db(
+        default / "Login Data",
+        [
+            (
+                "https://account.bandainamcoid.com/login.html",
+                "user@example.com",
+                _encrypt_v10(fake_key, "correct_pw"),
+            )
+        ],
+    )
+
+    creds = load_credentials(tmp_path)
+
+    assert creds is not None
+    assert creds.bnid_email == "user@example.com"
+    assert creds.bnid_password == "correct_pw"
+
+
+def test_load_credentials_no_login_data_returns_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """master_key の復号に成功しても Login Data が無ければ None。"""
+
+    def _fake_dpapi_unprotect(blob: bytes) -> bytes | None:
+        del blob
+        return b"k" * 32
+
+    monkeypatch.setattr("canvasser._dpapi_unprotect", _fake_dpapi_unprotect)
+    local_state = tmp_path / "Local State"
+    encrypted_b64 = base64.b64encode(b"DPAPI" + b"x").decode()
+    local_state.write_text(
+        json.dumps({"os_crypt": {"encrypted_key": encrypted_b64}}),
+        encoding="utf-8",
+    )
+
+    assert load_credentials(tmp_path) is None
+
+
+def test_load_credentials_non_windows_returns_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """非 Windows では master_key 取得を試みる前に None を返す。"""
+    monkeypatch.setattr(canvasser.os, "name", "posix")
+
+    assert load_credentials(tmp_path) is None

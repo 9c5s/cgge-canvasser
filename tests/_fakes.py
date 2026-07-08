@@ -10,32 +10,12 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from datetime import datetime
 
-    from playwright.sync_api import BrowserContext, Page
+    from playwright.sync_api import Page
 
 
 def as_page(fake: FakePage) -> Page:
     """FakePage を Page として渡すための cast ヘルパー。"""
     return cast("Page", fake)
-
-
-def as_context(fake: FakeBrowserContext) -> BrowserContext:
-    """FakeBrowserContext を BrowserContext として渡すための cast ヘルパー。"""
-    return cast("BrowserContext", fake)
-
-
-class FakeBrowserContext:
-    """`context.clear_cookies()` だけを模す最小フェイク。
-
-    login-init での Cookie 明示破棄の呼び出しを検証するのに使う。
-    """
-
-    def __init__(self) -> None:
-        """呼び出し記録用の calls を空で初期化する。"""
-        self.calls: list[str] = []
-
-    def clear_cookies(self) -> None:
-        """呼ばれたことだけを記録する。"""
-        self.calls.append("clear_cookies")
 
 
 class FakeLocator:

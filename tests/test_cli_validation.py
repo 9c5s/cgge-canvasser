@@ -327,22 +327,6 @@ class TestBuildParser:
         assert args.command == "login"
         assert args.account == "main"
 
-    def test_login_initはaccount必須(self) -> None:
-        """login-init サブコマンドも --account なしでは通らない。"""
-        with pytest.raises(SystemExit):
-            canvasser._build_parser().parse_args(["login-init"])
-
-    def test_login_initコマンドを解釈する(self) -> None:
-        """login-init --account NAME で command と account が入る。"""
-        args = canvasser._build_parser().parse_args([
-            "login-init",
-            "--account",
-            "main",
-        ])
-
-        assert args.command == "login-init"
-        assert args.account == "main"
-
     def test_mark_completedはslug位置引数を受け取る(self) -> None:
         """slug は複数の位置引数として受け取る (カンマ区切りではない)。"""
         args = canvasser._build_parser().parse_args([
@@ -384,23 +368,6 @@ class TestBuildRunOptions:
         options = canvasser._build_run_options(args)
 
         assert options.login_mode is True
-        assert options.login_init_mode is False
-        assert options.run_mission is False
-        assert options.run_checkin is False
-        assert options.dry_run is False
-
-    def test_login_initコマンドはlogin_init_modeのみ有効(self) -> None:
-        """login-init ではタスクと実行ゲートがすべて閉じ、login_init_mode だけ立つ。"""
-        args = canvasser._build_parser().parse_args([
-            "login-init",
-            "--account",
-            "main",
-        ])
-
-        options = canvasser._build_run_options(args)
-
-        assert options.login_mode is False
-        assert options.login_init_mode is True
         assert options.run_mission is False
         assert options.run_checkin is False
         assert options.dry_run is False
