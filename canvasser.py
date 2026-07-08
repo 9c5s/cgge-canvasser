@@ -2225,7 +2225,14 @@ def _poll_login_outcome(
     return AutoLoginOutcome.TIMEOUT
 
 
-def _credentials_disabled(credentials: Credentials, name: str) -> bool:
+# NOTE: 以下 3 関数は Task 4 で attempt_auto_relogin の呼び出しを
+# _run_guarded_auto_login (ReloginGuard ベース) 経由に置き換えたため、本ファイル内
+# からは未参照になった (テストのみが直接検証する)。Task 6 でこの 3 関数ごと
+# credentials.json の failure_count/disabled_until フィールドを削除するまでの間
+# だけ reportUnusedFunction を抑制する。
+def _credentials_disabled(  # pyright: ignore[reportUnusedFunction]
+    credentials: Credentials, name: str
+) -> bool:
     """`disabled_until` が未来なら True (自動再ログインをスキップすべき)。
 
     非パース文字列や過去時刻は False (=有効) として扱い、fail-safe に倒す。
@@ -2248,7 +2255,9 @@ def _credentials_disabled(credentials: Credentials, name: str) -> bool:
     return True
 
 
-def _reset_credentials_failure(profile_dir: Path, credentials: Credentials) -> None:
+def _reset_credentials_failure(  # pyright: ignore[reportUnusedFunction]
+    profile_dir: Path, credentials: Credentials
+) -> None:
     """成功時の failure_count / disabled_until クリア。
 
     変更が無ければ書き込みしない (無駄な I/O と saved_at 保護)。
@@ -2267,7 +2276,7 @@ def _reset_credentials_failure(profile_dir: Path, credentials: Credentials) -> N
     )
 
 
-def _record_credentials_failure(
+def _record_credentials_failure(  # pyright: ignore[reportUnusedFunction]
     profile_dir: Path, credentials: Credentials, *, submissions: int = 1
 ) -> None:
     """失敗時に failure_count へ submissions を加算し、必要なら disabled_until を設定。
@@ -2296,12 +2305,7 @@ def _record_credentials_failure(
     )
 
 
-# NOTE: 以下 3 関数は Task 4 で attempt_auto_relogin から呼び出すまで本ファイル内
-# からは未参照になる (テストのみが直接検証する)。その間だけ reportUnusedFunction を
-# 抑制する。
-def _relogin_disabled(  # pyright: ignore[reportUnusedFunction]
-    guard: ReloginGuard, name: str
-) -> bool:
+def _relogin_disabled(guard: ReloginGuard, name: str) -> bool:
     """`guard.disabled_until` が未来なら True (自動再ログインをスキップすべき)。
 
     パース不能や過去時刻は False (=有効) として扱い、fail-safe に倒す。
@@ -2324,16 +2328,14 @@ def _relogin_disabled(  # pyright: ignore[reportUnusedFunction]
     return True
 
 
-def _reset_relogin_failure(  # pyright: ignore[reportUnusedFunction]
-    profile_dir: Path, guard: ReloginGuard
-) -> None:
+def _reset_relogin_failure(profile_dir: Path, guard: ReloginGuard) -> None:
     """成功時の failure_count / disabled_until クリア (無変化なら書き込まない)。"""
     if guard.failure_count == 0 and guard.disabled_until is None:
         return
     save_relogin_guard(profile_dir, ReloginGuard())
 
 
-def _record_relogin_failure(  # pyright: ignore[reportUnusedFunction]
+def _record_relogin_failure(
     profile_dir: Path, guard: ReloginGuard, *, submissions: int
 ) -> None:
     """失敗時に failure_count へ submissions を加算し、必要なら disabled_until を設定。
@@ -2353,7 +2355,7 @@ def _record_relogin_failure(  # pyright: ignore[reportUnusedFunction]
 
 
 def _retry_after_timeout(
-    page: Page, name: str, credentials: Credentials
+    page: Page, name: str, credentials: Credentials, guard: ReloginGuard
 ) -> tuple[AutoLoginOutcome, int]:
     """1 回目 TIMEOUT を受けてリトライを実行し、(outcome, 追加 submit 回数) を返す。
 
@@ -2361,13 +2363,13 @@ def _retry_after_timeout(
     の FORM_ERROR/TIMEOUT-late-success を扱う。呼び出し側で 1 回目 submit の 1
     を足して最終的な submit 回数にする。
     """
-    # 1 回目 submit は既に消化済み (呼び出し元で failure_count += 1 予定)。リトライ
-    # を投げると失敗ガード上限を超えて BNID にパスワードを送ってしまう可能性がある
-    # ため、リトライ用 submit が予算内に収まるかを事前チェックする。
+    # 1 回目 submit は既に消化済み (呼び出し元で guard.failure_count += 1 予定)。
+    # リトライを投げると失敗ガード上限を超えて BNID にパスワードを送ってしまう
+    # 可能性があるため、リトライ用 submit が予算内に収まるかを事前チェックする。
     # 目標: 「CREDENTIALS_MAX_FAILURES 回を超えて BNID にパスワードを送らない」。
-    # 1 回目 submit 直後の見込み failure_count は credentials.failure_count + 1。
+    # 1 回目 submit 直後の見込み failure_count は guard.failure_count + 1。
     # リトライで更に +1 されると MAX を超える場合は、リトライを控える。
-    if credentials.failure_count + 1 >= CREDENTIALS_MAX_FAILURES:
+    if guard.failure_count + 1 >= CREDENTIALS_MAX_FAILURES:
         print(
             f"[{name}] failure_count が上限のため、タイムアウト後のリトライは"
             "控えます (BNID アカウントロック防止)。",
@@ -2420,7 +2422,7 @@ def _resolve_retry_outcome(
 
 
 def _run_auto_login_sequence(
-    page: Page, name: str, credentials: Credentials
+    page: Page, name: str, credentials: Credentials, guard: ReloginGuard
 ) -> tuple[AutoLoginOutcome, int]:
     """auto_login を最大 2 回試して (最終 outcome, 実 submit 回数) を返す。
 
@@ -2435,34 +2437,62 @@ def _run_auto_login_sequence(
     - CAPTCHA/2FA 事前検知 (pre-submit): submit=0。
     - FORM_ERROR (pre-submit フォーム操作失敗): submit=0。BNID に届いていない。
     - SUCCESS/PASSWORD_ERROR/CAPTCHA_DETECTED (post-submit)/TIMEOUT: submit >= 1。
-    - リトライ経路の詳細は `_retry_after_timeout` を参照。
+    - リトライ経路の詳細は `_retry_after_timeout` を参照 (`guard` はリトライ予算
+      判定にそのまま渡す)。
     """
     outcome, submitted = auto_login(page, credentials)
     if outcome is not AutoLoginOutcome.TIMEOUT:
         return outcome, submitted
-    retry_outcome, retry_submitted = _retry_after_timeout(page, name, credentials)
+    retry_outcome, retry_submitted = _retry_after_timeout(
+        page, name, credentials, guard
+    )
     return retry_outcome, submitted + retry_submitted
+
+
+def _run_guarded_auto_login(page: Page, profile_dir: Path, name: str) -> bool:
+    """`credentials` + `guard` を読み、ガード付きで auto_login し成功なら True を返す。
+
+    - credentials の復号に失敗したら False。
+    - `guard.disabled_until` が未来なら False (連続失敗ガードで無言スキップ)。
+    - `_run_auto_login_sequence` を呼び、SUCCESS なら guard をリセットし、失敗
+      なら実 submit 回数ぶんだけ guard に失敗を記録する (BNID に届いていない
+      pre-submit 失敗は加算しない)。
+    - `attempt_auto_relogin` と ASOBI 連携復旧ドライバ (Task 8) の両方から呼ぶ
+      共有ヘルパーである。
+    """
+    credentials = load_credentials(profile_dir)
+    if credentials is None:
+        return False
+    guard = load_relogin_guard(profile_dir)
+    if _relogin_disabled(guard, name):
+        return False
+    outcome, submissions = _run_auto_login_sequence(page, name, credentials, guard)
+    if outcome is AutoLoginOutcome.SUCCESS:
+        _reset_relogin_failure(profile_dir, guard)
+        return True
+    if submissions > 0:
+        _record_relogin_failure(profile_dir, guard, submissions=submissions)
+    return False
 
 
 def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
     """process_account の未ログインルートで呼ぶ自動再ログインゲート。
 
-    credentials.json 非存在・disabled_until 有効なら即 False。BNID ログイン画面
-    への初回遷移で失敗した場合は「認証情報を BNID に送っていない」ため
-    failure_count には計上せず False を返す (ネットワーク不調で BNID 側のロックを
-    刺激するのを避ける)。
+    credentials 復号非成功・`guard.disabled_until` 有効時の判定は
+    `_run_guarded_auto_login` に委ねる。ここでは LOGIN_ENTRY_URL への遷移と、
+    遷移直後の `check_login()` による「初回 check_login の false negative」
+    救済 (cookie が実は有効なケース) だけを扱い、auto_login の実行・失敗記録・
+    成功時の guard リセットは `_run_guarded_auto_login` に集約する。
 
-    goto 直後には `check_login()` で「初回 check_login の false negative」を
-    確認する。cookie が実は有効で mission page へリダイレクトされている場合、
-    LOGIN_ENTRY_URL 遷移後も #mail が無く FORM_ERROR に落ちてしまうため、
-    ここで検知して短絡する。
-
-    auto_login の呼び出しは `_run_auto_login_sequence` に委譲し、実 submit 回数
-    ぶんだけ failure_count を加算する。pre-submit の FORM_ERROR (BNID に届いて
-    いない) はそもそも加算しない。
+    LOGIN_ENTRY_URL への初回遷移で失敗した場合は「認証情報を BNID に送って
+    いない」ため failure_count には計上せず False を返す (ネットワーク不調で
+    BNID 側のロックを刺激するのを避ける)。
     """
     credentials = load_credentials(profile_dir)
-    if credentials is None or _credentials_disabled(credentials, name):
+    if credentials is None:
+        return False
+    guard = load_relogin_guard(profile_dir)
+    if _relogin_disabled(guard, name):
         return False
 
     # BNID ログイン画面へ遷移 (OAuth リダイレクトチェーンは Chromium が追従する)。
@@ -2490,16 +2520,10 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
             f"[{name}] BNID ログイン画面遷移後にセッション有効を確認しました。",
             file=sys.stderr,
         )
-        _reset_credentials_failure(profile_dir, credentials)
+        _reset_relogin_failure(profile_dir, guard)
         return True
 
-    outcome, submissions = _run_auto_login_sequence(page, name, credentials)
-    if outcome is AutoLoginOutcome.SUCCESS:
-        _reset_credentials_failure(profile_dir, credentials)
-        return True
-    if submissions > 0:
-        _record_credentials_failure(profile_dir, credentials, submissions=submissions)
-    return False
+    return _run_guarded_auto_login(page, profile_dir, name)
 
 
 def _ensure_authenticated(
