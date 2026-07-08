@@ -32,6 +32,7 @@ mission と checkin は独立したサブコマンドで、同時実行はしな
 import argparse
 import base64
 import contextlib
+import ctypes
 import functools
 import getpass
 import hashlib
@@ -41,6 +42,7 @@ import os
 import random
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1855,6 +1857,164 @@ def _discard_pending_credentials(profile_dir: Path) -> None:
     """Pending credentials を破棄する (active は温存)。検証失敗時に呼ぶ。"""
     with contextlib.suppress(OSError):
         _pending_credentials_file(profile_dir).unlink()
+
+
+def _dpapi_unprotect(blob: bytes) -> bytes | None:
+    """Windows CryptUnprotectData で blob を復号する。失敗は None。
+
+    非 Windows は使用不可 (呼び出し側で os.name をチェックすること)。
+    """
+    if os.name != "nt":
+        return None
+
+    class _DataBlob(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.c_void_p)]
+
+    in_blob = _DataBlob(len(blob), ctypes.cast(ctypes.c_char_p(blob), ctypes.c_void_p))
+    out_blob = _DataBlob()
+    try:
+        ok = ctypes.windll.crypt32.CryptUnprotectData(  # type: ignore[attr-defined]
+            ctypes.byref(in_blob),
+            None,
+            None,
+            None,
+            None,
+            0,
+            ctypes.byref(out_blob),
+        )
+    except OSError as e:
+        print(f"[warn] DPAPI 呼び出し失敗: {e}", file=sys.stderr)
+        return None
+    if not ok:
+        print("[warn] DPAPI 復号失敗", file=sys.stderr)
+        return None
+    try:
+        buf = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(out_blob.pbData)  # type: ignore[attr-defined]
+    return buf
+
+
+def _decode_dpapi_blob(local_state: Path, encrypted_b64: str) -> bytes | None:
+    """encrypted_key を base64 デコードし、DPAPI プレフィックスを剥がして返す。
+
+    `_load_chrome_master_key` の返り値チェック数を抑えるための下請け関数。
+    """
+    try:
+        encrypted = base64.b64decode(encrypted_b64)
+    except (ValueError, TypeError) as e:
+        print(f"[warn] encrypted_key の base64 デコード失敗: {e}", file=sys.stderr)
+        return None
+    if not encrypted.startswith(b"DPAPI"):
+        print(f"[warn] {local_state} の DPAPI プレフィックスが無い", file=sys.stderr)
+        return None
+    return encrypted[5:]
+
+
+# NOTE: 以下 3 関数は Task 6 で load_credentials を Chrome Login Data 直読みに
+# 書き換えるまでの間、本ファイル内からは未参照 (テストのみが直接検証する) ため
+# reportUnusedFunction を抑制する。Task 6 で呼び出し元が付き次第、この
+# ignore コメントごと削除する。
+def _load_chrome_master_key(  # pyright: ignore[reportUnusedFunction]
+    profile_dir: Path,
+) -> bytes | None:
+    """Local State から DPAPI 経由で AES-256 マスタキーを取得する。
+
+    失敗 (ファイル非存在 / JSON パース失敗 / DPAPI 失敗 / 誤フォーマット) は
+    stderr に警告を出しつつ None を返す。
+    """
+    local_state = profile_dir / "Local State"
+    if not local_state.exists():
+        return None
+    try:
+        raw = json.loads(local_state.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[warn] {local_state} を読めません: {e}", file=sys.stderr)
+        return None
+    # dict の isinstance 絞り込みだけだと型引数が Unknown に落ちるため、
+    # 既存の _as_str_dict (dict[str, Any] への絞り込み + cast の共通化) に乗せる。
+    raw_dict = _as_str_dict(raw) or {}
+    os_crypt = _as_str_dict(raw_dict.get("os_crypt")) or {}
+    encrypted_b64 = os_crypt.get("encrypted_key")
+    if not isinstance(encrypted_b64, str):
+        print(f"[warn] {local_state} に os_crypt.encrypted_key が無い", file=sys.stderr)
+        return None
+    dpapi_payload = _decode_dpapi_blob(local_state, encrypted_b64)
+    if dpapi_payload is None:
+        return None
+    return _dpapi_unprotect(dpapi_payload)
+
+
+def _decrypt_v10_password(  # pyright: ignore[reportUnusedFunction]
+    master_key: bytes, blob: bytes
+) -> str | None:
+    """v10 プレフィックスを剥がして GCM 復号 → UTF-8。不一致・失敗は None。"""
+    if not blob.startswith(b"v10"):
+        return None
+    nonce = blob[3:15]
+    ct_and_tag = blob[15:]
+    if len(ct_and_tag) < 16:
+        return None
+    ct = ct_and_tag[:-16]
+    tag = ct_and_tag[-16:]
+    try:
+        cipher = AES.new(  # pyright: ignore[reportUnknownMemberType]
+            master_key, AES.MODE_GCM, nonce=nonce
+        )
+        plain = cipher.decrypt_and_verify(ct, tag)
+    except ValueError, KeyError:
+        return None
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _read_bnid_login_row(  # pyright: ignore[reportUnusedFunction]
+    profile_dir: Path,
+) -> tuple[str, bytes] | None:
+    """Login Data (SQLite) から bandainamcoid の最新 1 行を返す。
+
+    mode=ro + timeout=5.0 で開く (immutable=1 は WAL 破損リスクがあるため
+    使わない)。LATEST 行 (date_last_used DESC の先頭) の username_value が
+    空文字、または password_value が bytes 以外なら None を返す (古い有効行
+    への fallback はしない)。Chrome は idle 時に Login Data のロックを保持
+    しないため通常は即読める。SQLITE_BUSY は timeout 内に解消しない場合のみ
+    発生し、その時も None に倒す。
+    """
+    login_data = profile_dir / "Default" / "Login Data"
+    if not login_data.exists():
+        return None
+    try:
+        con = sqlite3.connect(
+            f"{login_data.as_uri()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+    except sqlite3.OperationalError as e:
+        print(f"[warn] {login_data} を開けません: {e}", file=sys.stderr)
+        return None
+    try:
+        row = con.execute(
+            "SELECT username_value, password_value FROM logins"
+            " WHERE origin_url LIKE 'https://%.bandainamcoid.com/%'"
+            " ORDER BY date_last_used DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error as e:
+        print(f"[warn] {login_data} の SELECT で失敗: {e}", file=sys.stderr)
+        return None
+    finally:
+        con.close()
+    # 3 チェック (行なし/username 不正/password 型不正) を 1 return に畳んで
+    # 返り値チェック数を抑える。いずれも「無効行」として扱いは同じ (fail-safe)。
+    username, password_blob = row if row is not None else (None, None)
+    if (
+        not isinstance(username, str)
+        or not username
+        or not isinstance(password_blob, bytes)
+    ):
+        return None
+    return username, password_blob
 
 
 _RELOGIN_GUARD_FILENAME = "relogin_guard.json"
