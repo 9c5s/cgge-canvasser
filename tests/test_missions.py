@@ -3,10 +3,11 @@
 FakePage で API 応答を差し替え、dry-run と本番実行の分岐・ecode 別の
 ハンドリング・獲得票数の集計を検証する。E1926 (ASOBI 連携トークン切れ) 検知時に
 `_complete`/`_receive`/`_process_one_mission` が `MissionOutcome` で
-`linkage_expired_id` を伝搬することも検証する。
+`linkage_expired_id` を伝搬することも検証する。`collect_missions` が E1926 検知後に
+`_run_asobi_linkage_recovery` を起動して再走する end-to-end フローも検証する。
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -17,6 +18,11 @@ from tests._fakes import (
     error_response as _error_response,
     success_response,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from playwright.sync_api import Page
 
 
 def _mission(
@@ -56,16 +62,18 @@ _OK = success_response()
 class TestCollectMissions:
     """collect_missions の全体フロー。"""
 
-    def test_dryrunは達成可能ミッションの見込み票数を返す(self) -> None:
+    def test_dryrunは達成可能ミッションの見込み票数を返す(self, tmp_path: Path) -> None:
         """dry-run では GET 2 回 (通常 + ASOBI STORE) のみで、POST/PUT を送らない。"""
         fake = FakePage([_listing([_mission(1, 30)]), _empty_listing()])
 
-        gained = canvasser.collect_missions(_as_page(fake), dry_run=True)
+        gained = canvasser.collect_missions(
+            _as_page(fake), tmp_path, "test", dry_run=True
+        )
 
         assert gained == 30
         assert len(fake.calls) == 2
 
-    def test_本番実行は達成と受取を実行して票数を返す(self) -> None:
+    def test_本番実行は達成と受取を実行して票数を返す(self, tmp_path: Path) -> None:
         """本番実行では両一覧 GET を先に済ませてから POST → PUT を送る。"""
         receive_ok = success_response({"received_point": 30})
         fake = FakePage([
@@ -75,12 +83,14 @@ class TestCollectMissions:
             receive_ok,
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
+        gained = canvasser.collect_missions(
+            _as_page(fake), tmp_path, "test", dry_run=False
+        )
 
         assert gained == 30
         assert len(fake.calls) == 4
 
-    def test_達成済み未受取は受取のみ行う(self) -> None:
+    def test_達成済み未受取は受取のみ行う(self, tmp_path: Path) -> None:
         """is_mission_completed=True かつ未受取なら受取 PUT だけを送る。"""
         receive_ok = success_response({"received_point": 10})
         fake = FakePage([
@@ -89,24 +99,30 @@ class TestCollectMissions:
             receive_ok,
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
+        gained = canvasser.collect_missions(
+            _as_page(fake), tmp_path, "test", dry_run=False
+        )
 
         assert gained == 10
         assert len(fake.calls) == 3
 
-    def test_APIフラグなしミッションは対象外(self) -> None:
+    def test_APIフラグなしミッションは対象外(self, tmp_path: Path) -> None:
         """flag=False かつ未達成なら達成も受取も送らない。"""
         fake = FakePage([
             _listing([_mission(3, 50, flag=False)]),
             _empty_listing(),
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
+        gained = canvasser.collect_missions(
+            _as_page(fake), tmp_path, "test", dry_run=False
+        )
 
         assert gained == 0
         assert len(fake.calls) == 2
 
-    def test_APIフラグなしでも達成済み未受取は受取のみ行う(self) -> None:
+    def test_APIフラグなしでも達成済み未受取は受取のみ行う(
+        self, tmp_path: Path
+    ) -> None:
         """flag=False でも completed かつ未受取なら受取 PUT だけを送る。
 
         チェックインボーナス (`#99`) のように外部トリガーで達成扱いになる分の
@@ -119,24 +135,28 @@ class TestCollectMissions:
             receive_ok,
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
+        gained = canvasser.collect_missions(
+            _as_page(fake), tmp_path, "test", dry_run=False
+        )
 
         assert gained == 15
         assert len(fake.calls) == 3
 
-    def test_APIフラグなしで達成済み受取済みは何もしない(self) -> None:
+    def test_APIフラグなしで達成済み受取済みは何もしない(self, tmp_path: Path) -> None:
         """flag=False かつ既に受取済みなら PUT も送らない (重複受取回避)。"""
         fake = FakePage([
             _listing([_mission(7, 15, flag=False, completed=True, received=True)]),
             _empty_listing(),
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
+        gained = canvasser.collect_missions(
+            _as_page(fake), tmp_path, "test", dry_run=False
+        )
 
         assert gained == 0
         assert len(fake.calls) == 2
 
-    def test_達成済みE1906でも受取を試みる(self) -> None:
+    def test_達成済みE1906でも受取を試みる(self, tmp_path: Path) -> None:
         """達成 POST が E1906 (既達成) を返しても受取 PUT は送る。"""
         receive_ok = success_response({"received_point": 20})
         fake = FakePage([
@@ -146,12 +166,14 @@ class TestCollectMissions:
             receive_ok,
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
+        gained = canvasser.collect_missions(
+            _as_page(fake), tmp_path, "test", dry_run=False
+        )
 
         assert gained == 20
         assert len(fake.calls) == 4
 
-    def test_条件未達E1924は受取を送らない(self) -> None:
+    def test_条件未達E1924は受取を送らない(self, tmp_path: Path) -> None:
         """達成 POST が E1924 (条件未達) なら受取 PUT を送らずスキップする。"""
         fake = FakePage([
             _listing([_mission(5, 20)]),
@@ -159,19 +181,21 @@ class TestCollectMissions:
             _error_response("E1924"),
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
+        gained = canvasser.collect_missions(
+            _as_page(fake), tmp_path, "test", dry_run=False
+        )
 
         assert gained == 0
         assert len(fake.calls) == 3
 
-    def test_一覧取得失敗はRuntimeError(self) -> None:
+    def test_一覧取得失敗はRuntimeError(self, tmp_path: Path) -> None:
         """通常一覧 GET が失敗すれば ASOBI STORE 到達前に RuntimeError で止める。"""
         fake = FakePage([{"status": 500, "body": None, "error": "boom"}])
 
         with pytest.raises(RuntimeError, match="通常"):
-            canvasser.collect_missions(_as_page(fake), dry_run=True)
+            canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=True)
 
-    def test_ASOBI_STORE一覧の取得失敗もRuntimeError(self) -> None:
+    def test_ASOBI_STORE一覧の取得失敗もRuntimeError(self, tmp_path: Path) -> None:
         """通常一覧が取れても ASOBI STORE 一覧が失敗すれば RuntimeError で止める。"""
         fake = FakePage([
             _listing([]),
@@ -179,9 +203,9 @@ class TestCollectMissions:
         ])
 
         with pytest.raises(RuntimeError, match="ASOBI STORE"):
-            canvasser.collect_missions(_as_page(fake), dry_run=True)
+            canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=True)
 
-    def test_通常とASOBI_STOREの両方から受取を集計する(self) -> None:
+    def test_通常とASOBI_STOREの両方から受取を集計する(self, tmp_path: Path) -> None:
         """mission_type=0 と mission_type=1 の両方で受取を実行し合算する。
 
         ASOBI STORE 系のプレミアム会員ログインボーナス (flag=True で達成済み) を
@@ -196,12 +220,16 @@ class TestCollectMissions:
             receive_asobi,
         ])
 
-        gained = canvasser.collect_missions(_as_page(fake), dry_run=False)
+        gained = canvasser.collect_missions(
+            _as_page(fake), tmp_path, "test", dry_run=False
+        )
 
         assert gained == 5 + 2
         assert len(fake.calls) == 4
 
-    def test_ASOBI_STORE_fetch失敗時は通常mission_typeのPUTも送らない(self) -> None:
+    def test_ASOBI_STORE_fetch失敗時は通常mission_typeのPUTも送らない(
+        self, tmp_path: Path
+    ) -> None:
         """後段 fetch エラーで前段 PUT が消えて 0 gained と誤記録される事故を防ぐ。
 
         両 listing の取得を先に済ませてから POST/PUT を送る設計により、後段
@@ -214,10 +242,90 @@ class TestCollectMissions:
         ])
 
         with pytest.raises(RuntimeError, match="ASOBI STORE"):
-            canvasser.collect_missions(_as_page(fake), dry_run=False)
+            canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=False)
 
         # 2 GET のみで、通常一覧の PUT は 1 件も送られていない
         assert len(fake.calls) == 2
+
+
+def test_collect_missions_e1926_recovery_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """E1926 検知で driver 起動 → 再走して成功すると gained が累積される。
+
+    `_fetch_mission_listings` は 1 回だけ呼ばれる想定。driver 成功後は
+    `_filter_listings` で E1926 だった mission_id (21) に絞って再走するため、
+    応答キューは fetch 2 回 (mt=0/mt=1) + attempt 1 の POST/PUT + attempt 2 の
+    POST/PUT のみでよく、2 回目の fetch 応答は積まない。
+    """
+    call_log: list[str] = []
+
+    def fake_recovery(page: Page, profile_dir: Path, name: str) -> bool:
+        """復旧 driver のモック。呼ばれたことだけ記録して成功を返す。"""
+        call_log.append("driver")
+        return True
+
+    monkeypatch.setattr(canvasser, "_run_asobi_linkage_recovery", fake_recovery)
+    fake = FakePage([
+        # fetch (1 回のみ): mt=0 に通常ミッション 1 件、mt=1 に ASOBI 1 件
+        _listing([_mission(10, 5)]),
+        success_response({"missions": [_mission(21, 2)]}),
+        # attempt 1: normal (#10) は POST/PUT とも成功、asobi (#21) は POST が E1926
+        _OK,
+        success_response({"received_point": 5}),
+        _error_response("E1926"),
+        # driver 成功 (mock) 後の attempt 2: #21 だけ再走、POST/PUT とも成功
+        _OK,
+        success_response({"received_point": 2}),
+    ])
+
+    gained = canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=False)
+
+    # gained = 5 (normal, attempt 1) + 2 (asobi, attempt 2) = 7、driver は 1 回のみ
+    assert gained == 7
+    assert call_log == ["driver"]
+
+
+def test_collect_missions_e1926_driver_failure_returns_partial_gained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """driver が復旧に失敗したら、E1926 だったミッション分は諦め部分獲得を返す。"""
+
+    def fake_recovery_fail(page: Page, profile_dir: Path, name: str) -> bool:
+        return False
+
+    monkeypatch.setattr(canvasser, "_run_asobi_linkage_recovery", fake_recovery_fail)
+    fake = FakePage([
+        _listing([_mission(10, 5)]),
+        success_response({"missions": [_mission(21, 2)]}),
+        _OK,
+        success_response({"received_point": 5}),
+        _error_response("E1926"),
+    ])
+
+    gained = canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=False)
+
+    assert gained == 5  # normal (#10) だけ回収、asobi (#21) は復旧失敗でスキップ
+
+
+def test_collect_missions_dry_run_does_not_trigger_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dry_run=True では E1926 が起きても driver を起動しない (副作用ゼロを維持)。"""
+    call_log: list[str] = []
+
+    def fake_recovery(page: Page, profile_dir: Path, name: str) -> bool:
+        call_log.append("driver")
+        return True
+
+    monkeypatch.setattr(canvasser, "_run_asobi_linkage_recovery", fake_recovery)
+    # dry-run では POST/PUT を送らないため実際には E1926 は発生しない想定だが、
+    # 万が一混入しても driver を起動しないことを回帰的に確認する。
+    fake = FakePage([_empty_listing(), _empty_listing()])
+
+    canvasser.collect_missions(_as_page(fake), tmp_path, "test", dry_run=True)
+
+    assert call_log == []
 
 
 class TestComplete:
