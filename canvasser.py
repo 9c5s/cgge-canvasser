@@ -273,8 +273,7 @@ class MissionOutcome:
 class MissionRunResult:
     """ミッション回収 1 回分の集計結果。
 
-    Task 9 で `collect_missions` の集計と ASOBI 連携再認証のリトライ判定に使う
-    (本タスクでは型定義のみで、実際の生成・消費はまだ行わない)。
+    Task 9 で `collect_missions` の集計と ASOBI 連携再認証のリトライ判定に使う。
     """
 
     gained: int = 0
