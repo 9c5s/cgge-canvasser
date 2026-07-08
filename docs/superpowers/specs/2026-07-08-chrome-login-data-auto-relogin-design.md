@@ -264,7 +264,7 @@ def _process_one_mission(page, m, *, dry_run: bool) -> MissionOutcome:
 
 ```python
 def collect_missions(
-    page: Page, profile_dir: Path, name: str, *, dry_run: bool
+    page: Page, profile_dir: Path, name: str, *, dry_run: bool, auto_relogin: bool
 ) -> int:
     listings = _fetch_mission_listings(page)  # 現状の 2 listing GET を関数化
     total_gained = 0
@@ -273,6 +273,8 @@ def collect_missions(
         total_gained += result.gained  # attempt ごとの獲得を累積
         if not result.linkage_expired_ids or dry_run:
             return total_gained
+        if not auto_relogin:
+            return total_gained  # --no-auto-relogin の opt-out を尊重
         if not _run_asobi_linkage_recovery(page, profile_dir, name):
             return total_gained  # 復旧失敗 → 現行と同じスキップ扱い
         # 復旧成功、次の attempt で linkage_expired だった id だけを対象に再走
@@ -280,7 +282,7 @@ def collect_missions(
     return total_gained
 ```
 
-`collect_missions` の signature 拡張 (`profile_dir`, `name` を追加、`dry_run` は 4.2 のハイブリッド方針に従い必須引数): 復旧ドライバが BNID フォームに落ちた際に guard 記録するために必要。`process_account` からは `collect_missions(page, profile_dir, name, dry_run=options.dry_run)` を渡す。
+`collect_missions` の signature 拡張 (`profile_dir`, `name` を追加、`dry_run` は 4.2 のハイブリッド方針に従い必須引数、`auto_relogin` は `--no-auto-relogin` opt-out を driver 起動でも尊重するため必須引数): 復旧ドライバが BNID フォームに落ちた際に guard 記録するために必要、かつ保存パスワードの submit 経路をユーザー意志で全遮断できるようにするため。`process_account` からは `collect_missions(page, profile_dir, name, dry_run=options.dry_run, auto_relogin=options.auto_relogin)` を渡す。
 
 - E1926 が起きた `mission_id` を `result.linkage_expired_ids: set[int]` に集約
 - 復旧ドライバは 1 実行につき最大 1 回
@@ -366,7 +368,7 @@ def _run_asobi_linkage_recovery(
 
 **POST-able 関数 (実 POST/PUT を送りうる)**: デフォルト無しの必須引数にする。関数の caller は多く、将来 helper が増える度に「引数忘れ = 本番 POST」ハザードを持ち込むため、型/実行時で失敗させる:
 
-- `collect_missions(page, profile_dir, name, *, dry_run: bool)` — デフォルト無し
+- `collect_missions(page, profile_dir, name, *, dry_run: bool, auto_relogin: bool)` — デフォルト無し
 - `_complete(page, mid, name, *, dry_run: bool)` — デフォルト無し
 - `_receive(page, mid, name, pts, *, dry_run: bool) -> MissionOutcome` — デフォルト無し
 - `_process_one_mission(page, m, *, dry_run: bool)` — デフォルト無し
