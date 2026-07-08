@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.14"
 # dependencies = [
-#     "playwright>=1.40.0",
+#     "playwright>=1.51.0",
 #     "pycryptodome>=3.19",
 #     "googlemaps>=4.10",
 #     "python-dotenv>=1.0",
