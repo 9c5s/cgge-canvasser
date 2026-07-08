@@ -7,6 +7,8 @@ FakePage で API 応答を差し替え、dry-run と本番実行の分岐・ecod
 `_run_asobi_linkage_recovery` を起動して再走する end-to-end フローも検証する。
 """
 
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, Any
 
 import pytest
