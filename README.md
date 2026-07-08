@@ -24,22 +24,6 @@ GMAPS_KEY=AIzaSy...
 
 初回起動時に依存関係 (playwright, pycryptodome, googlemaps, python-dotenv) と Chromium バイナリを自動取得する。
 
-自動再ログインを使う場合、`./profiles/{account}/credentials.json` に BNID の資格情報が保存される (`login-init` サブコマンドが対話入力で作成する)。ファイル権限は POSIX で `0o600`、Windows は `icacls` でカレントユーザー限定に絞る。 gitignore は `profiles/` 全体に効いているため誤コミットは防げるが、平文保存である以上 PC 盗難時のリスクは残る。
-
-```json
-{
-  "bnid_email": "user@example.com",
-  "bnid_password": "PASSWORD",
-  "saved_at": "2026-07-05T12:34:56+09:00",
-  "failure_count": 0,
-  "disabled_until": null
-}
-```
-
-- `saved_at`: 対話入力で保存した時刻 (JST ISO8601)。デバッグ・監査用。
-- `failure_count`: 自動再ログイン連続失敗数。成功で 0 にリセットする。
-- `disabled_until`: `failure_count` が上限 (3) に達したときに設定する JST ISO8601。この時刻までは自動再ログインをスキップし、BNID 側のアカウントロックを刺激しない。
-
 ## 使い方
 
 ### 初回ログイン (アカウントごとに1回)
@@ -52,28 +36,17 @@ uv run canvasser.py login --account sub
 - `--account NAME` は必須。`./profiles/NAME/` にプロファイルが作られる。
 - Chromium が可視状態で立ち上がる。BNID でログインしてミッションページが表示されると、自動でログインを検知して終了する。
 
-### 自動再ログイン用の資格情報登録 (`login-init`)
-
-BNID の Cookie 有効期限が切れた際に、手動介入なしで再ログインさせたい場合は `login-init` サブコマンドを使う。
-
-```powershell
-uv run canvasser.py login-init --account main
-```
-
-- 対話プロンプトでメールアドレス (`input`) とパスワード (`getpass`) を入力する。パスワードは echo されない。
-- 入力を `./profiles/main/credentials.json` に保存し、その後 headed Chromium で実ログインを検証する (`login` と同じフロー)。
-- 以降 `mission` / `checkin` 実行時に Cookie 期限切れを検出したら、この資格情報で `#mail` → `#pass` → ログインボタン click を自動再生し、成功したら本処理を続行する。
-- パスワードを変更した場合は再度 `login-init` を実行して上書きする (`failure_count` と `disabled_until` もリセットされる)。
+初回ログイン時に BNID フォームでパスワードを入力する際、Chrome の「パスワードを保存しますか?」プロンプトで **保存を選択** すること。この保存された資格情報は Playwright プロファイル内 (`profiles/{account}/Default/Login Data`) に Windows DPAPI + AES-256-GCM で暗号化されて格納され、以降 BNID セッション切れが検知されたときに自動再ログインの供給源として使われる。
 
 ### 日次実行 (ミッション回収、全アカウント)
 
 ```powershell
-uv run canvasser.py mission --execute
+uv run canvasser.py mission
 ```
 
 `./profiles/` 配下の全アカウントを順次処理する。ミッション回収 (ログインボーナス、動画視聴、公式 X フォロー、達成回数など) を実行する。
 
-`--execute` を付けない場合は完全ドライラン (GET のみ、POST/PUT なし)。
+`--dry-run` を付けた場合は完全ドライラン (GET のみ、POST/PUT なし)。
 
 ### 特定アカウントのみ実行
 
@@ -86,16 +59,16 @@ uv run canvasser.py mission --account main
 mission と checkin は独立したサブコマンドで、同時実行はしない。
 
 ```powershell
-uv run canvasser.py checkin            # ドライラン (POST は送らない)
-uv run canvasser.py checkin --execute  # 本番
+uv run canvasser.py checkin            # 本番
+uv run canvasser.py checkin --dry-run  # ドライラン (POST は送らない)
 ```
 
-`--execute` を付けなかった場合は完全ドライランとして扱う (GET のみ、POST は送らず、sleep も skip)。ペイロード生成、経路シミュレーション、state を触らないダミーループだけを回す。
+`--dry-run` を付けた場合は完全ドライランとして扱う (GET のみ、POST は送らず、sleep も skip)。ペイロード生成、経路シミュレーション、state を触らないダミーループだけを回す。
 
 ### 慎重に少数件から試す
 
 ```powershell
-uv run canvasser.py checkin --account main --execute --daily-budget 3
+uv run canvasser.py checkin --account main --daily-budget 3
 ```
 
 チェックイン専用の安全弁 (checkin サブコマンドのみ):
@@ -110,7 +83,7 @@ uv run canvasser.py checkin --account main --execute --daily-budget 3
 
 mission と checkin にのみ効く自動再ログイン制御:
 
-- `--no-auto-relogin`：`credentials.json` が保存されていても自動再ログインを行わない。手動運用に戻したいときや、疑わしいログイン失敗を追跡したいときにだけ使う。
+- `--no-auto-relogin`：Chrome 自動保存の BNID 資格情報が読める場合でも自動再ログインを行わない。手動運用に戻したいときや、疑わしいログイン失敗を追跡したいときにだけ使う。
 
 ### 既に消化済みスポットを state に手動登録
 
@@ -127,14 +100,20 @@ uv run canvasser.py mark-completed --account syota cg_vote2026_17 cg_vote2026_19
 ```powershell
 $dir = "D:\projects\cgge-canvasser"
 $action  = New-ScheduledTaskAction -Execute "uv" `
-             -Argument "run canvasser.py mission --execute --profiles-dir $dir\profiles" `
+             -Argument "run canvasser.py mission --profiles-dir $dir\profiles" `
              -WorkingDirectory $dir
 $trigger = New-ScheduledTaskTrigger -Daily -At 12:05
 Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trigger `
              -Description "シンデレラガール総選挙2026 デイリー自動回収"
 ```
 
+登録済みのタスクを更新する手順、および rollback 時の手順は `docs/superpowers/specs/2026-07-08-chrome-login-data-auto-relogin-design.md` の Rollout 節を参照。
+
 ## 挙動の要点
+
+### ASOBI STORE 連携の自動復旧
+
+`mission_type=1` のミッション (ASOBI STORE 系、プレミアム会員ログボ #21 など) で `E1926` (ASOBISTORE への再ログインが必要) が返ったら、`linkages/as/login` を踏んで自動復旧する。途中の中間ページ (legacy-login.asobistore.jp) は「バンダイナムコIDでログイン」を自動クリック、BNID フォームが出た場合は Chrome 自動保存の資格情報で自動突破する。復旧に失敗した場合はミッションはスキップされ、翌日に再試行される。
 
 ### ミッション回収 (`collect_missions`)
 
@@ -193,7 +172,7 @@ FailClosedError は `process_account` で捕捉され、`exit_code=1` として�
 
 - `completed_spots` は次回起動時の事前フィルタに使う。既に成功したスポットへは実 POST を送らない。
 - `spot_slug` は正規表現 `^cg_vote2026_[0-9]{1,6}$` にマッチする形式が必須 (schema 検証で strict チェック)。手動編集する場合は `cg_vote2026_19` のような実 slug 形式を守る。
-- state.json の JSON パース失敗や schema 不整合は、チェックイン実 POST (`checkin --execute`) 時に fail closed として即停止する。手動で確認・修復してから再実行する。
+- state.json の JSON パース失敗や schema 不整合は、チェックイン実 POST (`checkin`、`--dry-run` 未指定) 時に fail closed として即停止する。手動で確認・修復してから再実行する。
 - ドライランでは破損した state を空 dict として扱い、そのまま続行する。
 
 ## API 仕様 (参考)
@@ -236,7 +215,7 @@ Next.js チャンク解析で判明した仕様。
 - `.env` も Git 管理外に置く (`.gitignore` 設定済み)。
 - `login` / `mission` / `checkin` 実行時に `--profiles-dir` が `.gitignore` 対象になっているかを `git check-ignore` で自動検証する。未 ignore の場合は実行を拒否する (Cookie 誤コミット防止)。回避したい場合は `--allow-unignored-profiles-dir` を明示する。
 - キャンペーン規約に自動化禁止条項がある場合は、自己責任で判断する。
-- Cookie の有効期限が切れた場合は `login --account NAME` で再ログインする (`login-init` を使っていれば自動再ログインが試みられる)。
+- Cookie の有効期限が切れた場合は `login --account NAME` で再ログインする (Chrome に BNID の資格情報が自動保存されていれば自動再ログインが試みられる)。
 - 未観測 ecode が 1 件出たら fail closed で即停止する (デフォルト)。BAN シグナル・認証切れ・予期せぬ状態のいずれかとして扱う。
-- `credentials.json` は平文保存 (POSIX で `0o600`、Windows は `icacls` でカレントユーザー限定)。PC 盗難時のリスクは残るため、共有 PC への配置は避ける。パスワードを変更した場合は `login-init --account NAME` で再登録する。
+- BNID の資格情報は Chrome の Login Data (`profiles/{account}/Default/Login Data`) に Windows DPAPI + AES-256-GCM で暗号化されて保存される。復号には同一 Windows ユーザーアカウントでのログインが必要なため、Chrome 本体のパスワード保護と同水準のリスクに留まる。パスワードを変更した場合は、次回 `login` 実行時に Chrome の「パスワードを更新しますか?」プロンプトで更新を選択する。
 - BNID 側が CAPTCHA / 2FA / パスキー強制を導入すると、自動再ログインは失敗するようになり手動 `login` に退化する。`auto_login` は CAPTCHA / 2FA を検知すると即 abort する (詳細は `canvasser.py` の `_LOGIN_CAPTCHA_SELECTORS` を参照)。
