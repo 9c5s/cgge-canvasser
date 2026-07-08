@@ -73,6 +73,14 @@ class FakeLocator:
         """
         return self
 
+    def filter(self, **_kwargs: object) -> FakeLocator:
+        """Playwright locator.filter 相当。
+
+        テストでは絞り込みは意味を持たず、self を返して visible=True 等の
+        chain 呼び出しを受け止めるだけである。
+        """
+        return self
+
     def is_visible(self) -> bool:
         """selector の可視性を FakePage.visibility から取得する (既定 False)。"""
         return self._page.visibility.get(self._selector, False)
