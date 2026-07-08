@@ -14,7 +14,7 @@ from playwright.sync_api import Error as PlaywrightError
 
 import canvasser
 from canvasser import JST, AutoLoginOutcome, Credentials
-from tests._fakes import FakeBrowserContext, FakePage, as_context, as_page
+from tests._fakes import FakePage, as_page
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -25,11 +25,7 @@ if TYPE_CHECKING:
 
 def _sample_creds() -> Credentials:
     """テスト用の Credentials インスタンス。"""
-    return Credentials(
-        bnid_email="user@example.com",
-        bnid_password="hunter2",
-        saved_at="2026-07-05T00:00:00+09:00",
-    )
+    return Credentials(bnid_email="user@example.com", bnid_password="hunter2")
 
 
 def _load_sample_creds(profile_dir: Path) -> Credentials | None:
@@ -266,163 +262,24 @@ class TestAutoLogin:
         assert "フォーム操作でエラー" in capsys.readouterr().err
 
 
-class TestCredentialsDisabled:
-    """`_credentials_disabled` の disabled_until 判定。"""
+def _install_creds(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> Credentials:
+    """`load_credentials` を monkeypatch し、固定の Credentials を注入する。
 
-    def test_disabled_untilが未来なら停止扱い(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """未来 ISO なら True と共に stderr へ案内を出す。"""
-        future = (datetime.now(JST) + timedelta(hours=1)).isoformat()
-        creds = Credentials(
-            bnid_email="u@e",
-            bnid_password="pw",
-            saved_at="2026-07-05T00:00:00+09:00",
-            disabled_until=future,
-        )
-
-        assert canvasser._credentials_disabled(creds, "haruo") is True
-        assert "一時停止中" in capsys.readouterr().err
-
-    def test_disabled_untilが過去なら継続可能(self) -> None:
-        """過去時刻は fail-safe に「有効」として扱う。"""
-        past = (datetime.now(JST) - timedelta(hours=1)).isoformat()
-        creds = Credentials(
-            bnid_email="u@e",
-            bnid_password="pw",
-            saved_at="2026-07-05T00:00:00+09:00",
-            disabled_until=past,
-        )
-
-        assert canvasser._credentials_disabled(creds, "haruo") is False
-
-    def test_disabled_untilがNoneなら継続可能(self) -> None:
-        """初期状態 (None) では停止しない。"""
-        creds = Credentials(
-            bnid_email="u@e",
-            bnid_password="pw",
-            saved_at="2026-07-05T00:00:00+09:00",
-        )
-
-        assert canvasser._credentials_disabled(creds, "haruo") is False
-
-    def test_パース不能なdisabled_untilは継続可能(self) -> None:
-        """手改変で不正な文字列でも fail-safe に扱う。"""
-        creds = Credentials(
-            bnid_email="u@e",
-            bnid_password="pw",
-            saved_at="2026-07-05T00:00:00+09:00",
-            disabled_until="not-a-date",
-        )
-
-        assert canvasser._credentials_disabled(creds, "haruo") is False
-
-
-class TestRecordCredentialsFailure:
-    """連続失敗ガードの書き戻し。"""
-
-    def test_失敗するとfailure_countが増える(self, tmp_path: Path) -> None:
-        """1 回失敗で failure_count が +1 されて保存される。"""
-        creds = Credentials(
-            bnid_email="u@e",
-            bnid_password="pw",
-            saved_at="2026-07-05T00:00:00+09:00",
-        )
-        canvasser.save_credentials(tmp_path, creds)
-
-        canvasser._record_credentials_failure(tmp_path, creds)
-
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
-        assert got.failure_count == 1
-        assert got.disabled_until is None
-
-    def test_上限到達でdisabled_untilが設定される(self, tmp_path: Path) -> None:
-        """CREDENTIALS_MAX_FAILURES に達すると disabled_until が未来時刻になる。"""
-        creds = Credentials(
-            bnid_email="u@e",
-            bnid_password="pw",
-            saved_at="2026-07-05T00:00:00+09:00",
-            failure_count=canvasser.CREDENTIALS_MAX_FAILURES - 1,
-        )
-        canvasser.save_credentials(tmp_path, creds)
-
-        canvasser._record_credentials_failure(tmp_path, creds)
-
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
-        assert got.failure_count == canvasser.CREDENTIALS_MAX_FAILURES
-        assert got.disabled_until is not None
-        # ISO パースできる未来時刻
-        deadline = datetime.fromisoformat(got.disabled_until)
-        assert deadline > datetime.now(JST)
-
-    def test_成功リセットはfailure_countをゼロにする(self, tmp_path: Path) -> None:
-        """成功時 failure_count と disabled_until がクリアされる。"""
-        creds = Credentials(
-            bnid_email="u@e",
-            bnid_password="pw",
-            saved_at="2026-07-05T00:00:00+09:00",
-            failure_count=2,
-            disabled_until="2026-07-05T06:00:00+09:00",
-        )
-        canvasser.save_credentials(tmp_path, creds)
-
-        canvasser._reset_credentials_failure(tmp_path, creds)
-
-        got = canvasser.load_credentials(tmp_path)
-        assert got is not None
-        assert got.failure_count == 0
-        assert got.disabled_until is None
-
-    def test_成功リセットは変更なしなら書き込まない(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """初期状態 (failure_count=0, disabled_until=None) は無駄な I/O を避ける。"""
-        creds = Credentials(
-            bnid_email="u@e",
-            bnid_password="pw",
-            saved_at="2026-07-05T00:00:00+09:00",
-        )
-        calls: list[tuple[Path, Credentials]] = []
-
-        def _spy_save(profile_dir: Path, credentials: Credentials) -> None:
-            calls.append((profile_dir, credentials))
-
-        monkeypatch.setattr(canvasser, "save_credentials", _spy_save)
-
-        canvasser._reset_credentials_failure(tmp_path, creds)
-
-        assert calls == []
-
-
-def _install_creds(profile_dir: Path, **overrides: object) -> Credentials:
-    """テスト用に active credentials.json を保存し、書いた Credentials を返す。"""
-    fields: dict[str, object] = {
+    Chrome Login Data 経由に差し替わったことで credentials はファイル永続化
+    しなくなったため、profile_dir に書き込む代わりに `load_credentials` 自体を
+    差し替える。
+    """
+    fields: dict[str, str] = {
         "bnid_email": "u@e",
         "bnid_password": "pw",
-        "saved_at": "2026-07-05T00:00:00+09:00",
-        "failure_count": 0,
-        "disabled_until": None,
     }
     fields.update(overrides)
-    creds = Credentials(**fields)  # pyright: ignore[reportArgumentType]
-    canvasser.save_credentials(profile_dir, creds)
-    return creds
+    creds = Credentials(**fields)
 
+    def _fake_load(profile_dir: Path) -> Credentials | None:
+        return creds
 
-def _install_pending_creds(profile_dir: Path, **overrides: object) -> Credentials:
-    """テスト用に pending credentials.json.pending を保存する。"""
-    fields: dict[str, object] = {
-        "bnid_email": "u@e",
-        "bnid_password": "pw",
-        "saved_at": "2026-07-05T00:00:00+09:00",
-        "failure_count": 0,
-        "disabled_until": None,
-    }
-    fields.update(overrides)
-    creds = Credentials(**fields)  # pyright: ignore[reportArgumentType]
-    canvasser.save_pending_credentials(profile_dir, creds)
+    monkeypatch.setattr(canvasser, "load_credentials", _fake_load)
     return creds
 
 
@@ -543,7 +400,7 @@ class TestAttemptAutoRelogin:
     """attempt_auto_relogin のゲート・リトライ・失敗ガードの合流点。"""
 
     def test_credentialsが無ければFalseでgotoしない(self, tmp_path: Path) -> None:
-        """credentials.json 非存在ではブラウザ側にも触らず False。"""
+        """Chrome Login Data から復号できない (None) ではブラウザ側にも触らず False。"""
         fake = FakePage()
 
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
@@ -551,10 +408,12 @@ class TestAttemptAutoRelogin:
         assert result is False
         assert not any(c[0] == "goto" for c in fake.calls)
 
-    def test_disabled_until有効ならFalseでgotoしない(self, tmp_path: Path) -> None:
+    def test_disabled_until有効ならFalseでgotoしない(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """disabled_until が未来ならブラウザ側にも触らない。"""
         future = (datetime.now(JST) + timedelta(hours=1)).isoformat()
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_guard(tmp_path, disabled_until=future)
         fake = FakePage()
 
@@ -570,7 +429,7 @@ class TestAttemptAutoRelogin:
 
         post-init check_login=False (auto_login まで進む) → auto_login iter 1 で True。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_guard(tmp_path, failure_count=2)
         _install_fake_time(monkeypatch)
         fake = FakePage(
@@ -600,7 +459,7 @@ class TestAttemptAutoRelogin:
         auto_login (mission page への redirect で #mail 無し → FORM_ERROR) を回避
         して即 SUCCESS で抜け、failure_count も減らす。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_guard(tmp_path, failure_count=1)
         _install_fake_time(monkeypatch)
         fake = FakePage(responses=[_is_login_response(is_login=True)])
@@ -623,7 +482,7 @@ class TestAttemptAutoRelogin:
         responses = [False (post-init), False x5 (auto_login 1 TIMEOUT),
         False (post-retry), True (auto_login 2 iter 1 SUCCESS)] = 8 応答。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_fake_time(monkeypatch, step=10.0)
         fake = FakePage(
             responses=[
@@ -651,7 +510,7 @@ class TestAttemptAutoRelogin:
         を回すと valid cookie で mission page へ redirect → #mail 無し → FORM_ERROR に
         誤判定するのを避けるため、post-retry check_login で SUCCESS として拾う。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_guard(tmp_path, failure_count=1)
         _install_fake_time(monkeypatch, step=10.0)
         # post-init: False, auto_login 1: 5 False → TIMEOUT, post-retry: True → SUCCESS
@@ -683,7 +542,7 @@ class TestAttemptAutoRelogin:
 
         BNID には 2 回パスワードを送っているので failure_count に 2 加算する。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_fake_time(monkeypatch, step=10.0)
         # 2 回の auto_login + post-init/retry check 分のポーリング応答
         fake = FakePage(responses=[_is_login_response(is_login=False)] * 40)
@@ -705,7 +564,7 @@ class TestAttemptAutoRelogin:
         responses = [False (post-init), False (auto_login iter 1)] で
         visibility=True にすることで iter 1 内でエラー DOM 検知 → PASSWORD_ERROR。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_fake_time(monkeypatch)
         fake = FakePage(
             responses=[
@@ -724,14 +583,17 @@ class TestAttemptAutoRelogin:
         assert got.failure_count == 1
 
     def test_初回goto失敗はFalseだがfailure_countは加算しない(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         """認証情報を BNID に送る前の一時的なネットワーク不調は据え置く。
 
         BNID にパスワードを送っていないので BNID ロックの原因にならず、
         failure_count は加算せず disabled_until への進行も止める。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_guard(tmp_path, failure_count=2)
         fake = FakePage(goto_errors=[PlaywrightError("navigation failed")])
 
@@ -753,7 +615,7 @@ class TestAttemptAutoRelogin:
         goto が失敗しても認証試行 1 回分は計上する (BNID 側から見て入力送信済)。
         responses は post-init 1 + auto_login 1 で 5 iter = 計 6 個必要。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_fake_time(monkeypatch, step=10.0)
         fake = FakePage(
             responses=[_is_login_response(is_login=False)] * 8,
@@ -774,7 +636,7 @@ class TestAttemptAutoRelogin:
 
         BNID にはパスワードを送っていないので、failure_count を消費しない。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_guard(tmp_path, failure_count=1)
         _install_fake_time(monkeypatch)
         # post-init check False → auto_login: wait_for が失敗 → FORM_ERROR
@@ -800,7 +662,7 @@ class TestAttemptAutoRelogin:
         2 回目は pre-submit で失敗しているため実 submit は 1 回のみ、failure_count は
         1 だけ加算される。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_fake_time(monkeypatch, step=10.0)
         # 5 個 False で auto_login 1 TIMEOUT、その次に post-retry check False、
         # そのあと 2 回目 auto_login の wait_for が失敗して FORM_ERROR
@@ -833,7 +695,7 @@ class TestAttemptAutoRelogin:
         飛んで無限に BNID にパスワードを投げる事故が起きる)。
         raise 後は 2 回目 auto_login に進み、TIMEOUT なら submit を計上する。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_fake_time(monkeypatch, step=10.0)
         # 1 個目 (post-init check): False → auto_login 1 へ
         # 2-6 個目 (auto_login 1 の 5 iter): False → TIMEOUT
@@ -865,7 +727,7 @@ class TestAttemptAutoRelogin:
         failure_count は加算しない (無駄な失敗計上で disabled_until を早期発動
         させない)。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_guard(tmp_path, failure_count=1)
         _install_fake_time(monkeypatch)
         # post-init check_login False → auto_login pre-check で CAPTCHA 検知
@@ -891,7 +753,7 @@ class TestAttemptAutoRelogin:
         避けるため retry_after_timeout で判定して控える。
         """
         max_fail = canvasser.CREDENTIALS_MAX_FAILURES
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_guard(tmp_path, failure_count=max_fail - 1)
         _install_fake_time(monkeypatch, step=10.0)
         # 1 回目 auto_login TIMEOUT のポーリング 5 回分だけ用意する
@@ -921,7 +783,7 @@ class TestAttemptAutoRelogin:
         → SUCCESS。responses は post-init 1 + auto_login 1 = 5 + post-retry 1 +
         auto_login 2 = 5 + 遅延成功 check 1 = 13。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_guard(tmp_path, failure_count=1)
         _install_fake_time(monkeypatch, step=10.0)
         fake = FakePage(
@@ -969,7 +831,7 @@ class TestEnsureAuthenticated:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """dry_run=True では credentials が保存されていても auto_login を送らない。"""
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_fake_time(monkeypatch)
         # check_login: 未ログイン、以降 auto_login への呼び出しは想定しない
         fake = FakePage(responses=[_is_login_response(is_login=False)])
@@ -988,7 +850,7 @@ class TestEnsureAuthenticated:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """--no-auto-relogin は本番実行でも auto_login を封じる (opt-out 尊重)。"""
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_fake_time(monkeypatch)
         fake = FakePage(responses=[_is_login_response(is_login=False)])
         opts = _run_options(dry_run=False, auto_relogin=False)
@@ -1006,7 +868,7 @@ class TestEnsureAuthenticated:
         流れ: _ensure_authenticated の check_login=false →
         attempt_auto_relogin(goto + post-init check_login=false + auto_login SUCCESS)。
         """
-        _install_creds(tmp_path)
+        _install_creds(monkeypatch)
         _install_fake_time(monkeypatch)
         fake = FakePage(
             responses=[
@@ -1023,172 +885,3 @@ class TestEnsureAuthenticated:
         )
         # auto_login のフォーム操作が実際に呼ばれた
         assert any(c[0] == "press_sequentially" for c in fake.calls)
-
-
-class TestRunLoginInitFlow:
-    """run_login_init_flow の pending 検証 + 昇格フロー。
-
-    login-init は pending credentials (credentials.json.pending) を実ログインで
-    検証し、SUCCESS のときだけ active (credentials.json) に昇格させる。
-    非 SUCCESS 時は pending を破棄して既存 active を温存する。
-    """
-
-    def test_成功時はpendingをactiveに昇格して0を返す(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """auto_login SUCCESS で pending → active に昇格、終了コード 0。"""
-        _install_pending_creds(tmp_path, bnid_password="new-password")
-        _install_fake_time(monkeypatch)
-        fake_page = FakePage(responses=[_is_login_response(is_login=True)])
-        fake_ctx = FakeBrowserContext()
-
-        code = canvasser.run_login_init_flow(
-            as_context(fake_ctx), as_page(fake_page), tmp_path
-        )
-
-        assert code == 0
-        assert fake_ctx.calls == ["clear_cookies"]
-        # pending は消えて active が新パスワードで作られている
-        assert not (tmp_path / "credentials.json.pending").exists()
-        active = canvasser.load_credentials(tmp_path)
-        assert active is not None
-        assert active.bnid_password == "new-password"
-        assert any(c[0] == "press_sequentially" for c in fake_page.calls)
-
-    def test_pending無しでは手動フローにフォールバック(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """pending が読めない場合は run_login_flow に委譲する。"""
-        _install_fake_time(monkeypatch)
-        # run_login_flow は check_login を is_login=true で 1 回返せば即 return 0
-        fake_page = FakePage(responses=[_is_login_response(is_login=True)])
-        fake_ctx = FakeBrowserContext()
-
-        code = canvasser.run_login_init_flow(
-            as_context(fake_ctx), as_page(fake_page), tmp_path
-        )
-
-        assert code == 0
-        # Cookie 破棄は pending が無いのでスキップされる
-        assert fake_ctx.calls == []
-        assert "pending credentials を読めません" in capsys.readouterr().err
-
-    def test_PASSWORD_ERRORはpendingを破棄しactiveを温存(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """pending PASSWORD_ERROR で pending を破棄。既存 active は温存される。
-
-        (パスワード変更時のタイプミス相当。旧 active credentials で auto-relogin
-        が引き続き機能する。)
-        """
-        _install_creds(tmp_path, bnid_password="old-verified-password")
-        _install_pending_creds(tmp_path, bnid_password="mistyped")
-        _install_fake_time(monkeypatch)
-        fake_page = FakePage(
-            responses=[_is_login_response(is_login=False)],
-            visibility={"#error-input-area .c-message--warning": True},
-        )
-        fake_ctx = FakeBrowserContext()
-
-        code = canvasser.run_login_init_flow(
-            as_context(fake_ctx), as_page(fake_page), tmp_path
-        )
-
-        assert code == 1
-        # pending は破棄
-        assert not (tmp_path / "credentials.json.pending").exists()
-        # 既存 active は温存 (旧パスワード)
-        active = canvasser.load_credentials(tmp_path)
-        assert active is not None
-        assert active.bnid_password == "old-verified-password"
-        assert "認証エラー" in capsys.readouterr().err
-
-    def test_CAPTCHA検知時もpendingを破棄しactiveを温存(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """CAPTCHA_DETECTED は pending 破棄 + active 温存 + exit 1。
-
-        pending は「実ログイン成功」の証明が取れていないため、`_ensure_authenticated`
-        から未検証パスワードが unattended に送信される事故を防ぐために破棄する。
-        旧 active credentials は残るので既存アカウントの自動再ログイン能力は保つ。
-        """
-        _install_creds(tmp_path, bnid_password="old-verified-password")
-        _install_pending_creds(tmp_path, bnid_password="new-untested")
-        _install_fake_time(monkeypatch)
-        # CAPTCHA が submit 前 pre-check で検知される
-        fake_page = FakePage(
-            responses=[],
-            counts={'iframe[src*="recaptcha"]': 1},
-        )
-        fake_ctx = FakeBrowserContext()
-
-        code = canvasser.run_login_init_flow(
-            as_context(fake_ctx), as_page(fake_page), tmp_path
-        )
-
-        assert code == 1
-        # pending は破棄
-        assert not (tmp_path / "credentials.json.pending").exists()
-        # 旧 active は温存
-        active = canvasser.load_credentials(tmp_path)
-        assert active is not None
-        assert active.bnid_password == "old-verified-password"
-        assert "自動検証に失敗" in capsys.readouterr().err
-
-    def test_TIMEOUTもpendingを破棄しactiveを温存(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """TIMEOUT でも pending 破棄 + active 温存 + exit 1。"""
-        _install_creds(tmp_path, bnid_password="old-verified-password")
-        _install_pending_creds(tmp_path, bnid_password="new-untested")
-        # step=10.0 で auto_login のポーリングを 5 回に圧縮する
-        _install_fake_time(monkeypatch, step=10.0)
-        fake_page = FakePage(responses=[_is_login_response(is_login=False)] * 10)
-        fake_ctx = FakeBrowserContext()
-
-        code = canvasser.run_login_init_flow(
-            as_context(fake_ctx), as_page(fake_page), tmp_path
-        )
-
-        assert code == 1
-        assert not (tmp_path / "credentials.json.pending").exists()
-        active = canvasser.load_credentials(tmp_path)
-        assert active is not None
-        assert active.bnid_password == "old-verified-password"
-        assert "自動検証に失敗" in capsys.readouterr().err
-
-    def test_goto失敗もpendingを破棄しactiveを温存(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """goto PlaywrightError でも pending を破棄して active を温存する。"""
-        _install_creds(tmp_path, bnid_password="old-verified-password")
-        _install_pending_creds(tmp_path, bnid_password="new-untested")
-        _install_fake_time(monkeypatch)
-        fake_page = FakePage(goto_errors=[PlaywrightError("navigation failed")])
-        fake_ctx = FakeBrowserContext()
-
-        code = canvasser.run_login_init_flow(
-            as_context(fake_ctx), as_page(fake_page), tmp_path
-        )
-
-        assert code == 1
-        assert not (tmp_path / "credentials.json.pending").exists()
-        active = canvasser.load_credentials(tmp_path)
-        assert active is not None
-        assert active.bnid_password == "old-verified-password"
-        assert "BNID ログイン画面への遷移で失敗" in capsys.readouterr().err

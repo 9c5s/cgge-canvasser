@@ -34,7 +34,6 @@ import base64
 import contextlib
 import ctypes
 import functools
-import getpass
 import hashlib
 import json
 import math
@@ -1470,11 +1469,6 @@ def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
 # lat/lng/resume_at を無視する。
 LAST_CHECKIN_SCHEMA_VERSION = 2
 _STATE_FILENAME = "canvasser_state.json"
-_CREDENTIALS_FILENAME = "credentials.json"
-# login-init で「対話入力を保存 → 実ログインで検証」する間、既存の active
-# credentials.json を上書きせずに退避する pending ファイル。SUCCESS を確認できた
-# ときだけ active に昇格させる。
-_CREDENTIALS_PENDING_FILENAME = "credentials.json.pending"
 
 # BNID の連続ログイン失敗をこの回数まで許容し、超えたら disabled_until を書き込んで
 # 一時停止する。BNID 側のアカウントロック閾値を刺激しないための緩めの上限。
@@ -1673,190 +1667,40 @@ def save_account_state(profile_dir: Path, state: dict[str, Any]) -> None:
 
 @dataclass(kw_only=True)
 class Credentials:
-    """BNID の自動再ログインで使う資格情報。
+    """BNID の自動再ログインで使う資格情報 (メモリ内のみ)。
 
-    平文 JSON (`profiles/<account>/credentials.json`) に保存する。ファイル権限は
-    POSIX で 0o600、Windows は icacls でカレントユーザー限定に絞る (best-effort)。
-
-    - `saved_at`: 対話入力で保存した時刻 (JST ISO8601)。デバッグ・監査用で、
-      自動再ログイン成否の書き戻しでは更新しない (資格情報が変わった時のみ更新)。
-    - `failure_count`: 連続失敗回数。成功で 0 にリセットする。
-    - `disabled_until`: `CREDENTIALS_MAX_FAILURES` に達した時に設定する JST
-      ISO8601。この時刻までは自動再ログインをスキップし、BNID アカウントロックを
-      刺激しない。
+    Chrome Login Data から復号した平文を保持する。ファイル永続化はしない。
     """
 
     bnid_email: str
     bnid_password: str
-    saved_at: str
-    failure_count: int = 0
-    disabled_until: str | None = None
-
-
-def _credentials_file(profile_dir: Path) -> Path:
-    """profile_dir 配下の active credentials.json パスを返す。"""
-    return profile_dir / _CREDENTIALS_FILENAME
-
-
-def _pending_credentials_file(profile_dir: Path) -> Path:
-    """profile_dir 配下の pending (未検証) credentials.json.pending パスを返す。"""
-    return profile_dir / _CREDENTIALS_PENDING_FILENAME
-
-
-def _apply_credentials_permissions(path: Path) -> None:
-    """credentials.json のファイル権限を最小限に絞る (best-effort)。
-
-    POSIX は `os.chmod(path, 0o600)`。Windows は `icacls` で継承削除 +
-    カレントユーザー限定に絞る。どちらも失敗しても致命的にはしない
-    (資格情報の平文保存自体が第一の防壁ではないため)。
-    """
-    with contextlib.suppress(OSError):
-        path.chmod(0o600)
-    if os.name != "nt":
-        return
-    icacls = shutil.which("icacls")
-    username = os.environ.get("USERNAME")
-    if icacls is None or not username:
-        return
-    # icacls の失敗は非致命。git check-ignore と同じ例外集合で握り潰す。
-    with contextlib.suppress(*_GIT_CHECK_IGNORE_EXCEPTIONS):
-        subprocess.run(  # noqa: S603
-            [
-                icacls,
-                str(path),
-                "/inheritance:r",
-                "/grant:r",
-                f"{username}:F",
-            ],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-
-
-def _load_credentials_from(path: Path) -> Credentials | None:
-    """指定パスから Credentials を fail-safe に読み込む共通実装。
-
-    ファイル非存在は `None`。JSON パース失敗・型不一致は認証情報を無視するために
-    `None` に丸め、stderr に警告を出す (認証情報そのものはログに出さない)。
-    """
-    if not path.exists():
-        return None
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
-        print(
-            f"[warn] {path} を読めません: {e}。認証情報を無視します。",
-            file=sys.stderr,
-        )
-        return None
-    if not isinstance(raw, dict):
-        print(
-            f"[warn] {path} のトップレベルが dict でありません。認証情報を無視します。",
-            file=sys.stderr,
-        )
-        return None
-    data = cast("dict[str, Any]", raw)
-    email = data.get("bnid_email")
-    password = data.get("bnid_password")
-    if (
-        not isinstance(email, str)
-        or not isinstance(password, str)
-        or not email
-        or not password
-    ):
-        print(
-            f"[warn] {path} に bnid_email / bnid_password が正しく入っていません。"
-            "認証情報を無視します。",
-            file=sys.stderr,
-        )
-        return None
-    saved_at_raw = data.get("saved_at", "")
-    saved_at = saved_at_raw if isinstance(saved_at_raw, str) else ""
-    failure_count_raw = data.get("failure_count", 0)
-    is_valid_int = isinstance(failure_count_raw, int) and not isinstance(
-        failure_count_raw, bool
-    )
-    failure_count = failure_count_raw if is_valid_int else 0
-    disabled_until_raw = data.get("disabled_until")
-    disabled_until = disabled_until_raw if isinstance(disabled_until_raw, str) else None
-    return Credentials(
-        bnid_email=email,
-        bnid_password=password,
-        saved_at=saved_at,
-        failure_count=failure_count,
-        disabled_until=disabled_until,
-    )
-
-
-def _save_credentials_to(path: Path, credentials: Credentials) -> None:
-    """指定パスに Credentials を atomic 書き出し + 権限縮小する共通実装。
-
-    `save_account_state` と同じ「tempfile → fsync → replace」パターン。
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=".credentials-", suffix=".tmp", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(
-                asdict(credentials),
-                f,
-                ensure_ascii=False,
-                indent=2,
-                allow_nan=False,
-            )
-            f.flush()
-            os.fsync(f.fileno())
-        Path(tmp_path).replace(path)
-    except Exception:
-        with contextlib.suppress(OSError):
-            Path(tmp_path).unlink()
-        raise
-    _apply_credentials_permissions(path)
 
 
 def load_credentials(profile_dir: Path) -> Credentials | None:
-    """`profile_dir/credentials.json` (active) を読み込む。"""
-    return _load_credentials_from(_credentials_file(profile_dir))
+    """Chrome Login Data から BNID 資格情報を復号して Credentials を返す。
 
-
-def save_credentials(profile_dir: Path, credentials: Credentials) -> None:
-    """`profile_dir/credentials.json` (active) に atomic に書き出す。"""
-    _save_credentials_to(_credentials_file(profile_dir), credentials)
-
-
-def load_pending_credentials(profile_dir: Path) -> Credentials | None:
-    """`profile_dir/credentials.json.pending` (未検証) を読み込む。"""
-    return _load_credentials_from(_pending_credentials_file(profile_dir))
-
-
-def save_pending_credentials(profile_dir: Path, credentials: Credentials) -> None:
-    """`profile_dir/credentials.json.pending` (未検証) に atomic に書き出す。
-
-    実ログインで検証成功 (SUCCESS) するまで active を上書きしないための退避場所。
-    ここに書いた時点では既存 active credentials は温存される。
+    - Windows 以外 → None + stderr 警告
+    - Local State / Login Data 非存在、DPAPI/AES/UTF-8 失敗、非 v10、bandainamcoid
+      レコード非存在、SQLITE_BUSY は全て None (stderr に理由を出す)
+    - 認証情報値 (email/password) はログに出さない
     """
-    _save_credentials_to(_pending_credentials_file(profile_dir), credentials)
-
-
-def _activate_pending_credentials(profile_dir: Path) -> None:
-    """Pending を active に atomic 置換して有効化する。
-
-    login-init で auto_login が SUCCESS に達したときにのみ呼ぶ。既存 active は
-    ここで pending に置き換わる。
-    """
-    pending = _pending_credentials_file(profile_dir)
-    active = _credentials_file(profile_dir)
-    pending.replace(active)
-    _apply_credentials_permissions(active)
-
-
-def _discard_pending_credentials(profile_dir: Path) -> None:
-    """Pending credentials を破棄する (active は温存)。検証失敗時に呼ぶ。"""
-    with contextlib.suppress(OSError):
-        _pending_credentials_file(profile_dir).unlink()
+    if os.name != "nt":
+        print(
+            "[warn] load_credentials は Windows でのみ動作します。",
+            file=sys.stderr,
+        )
+        return None
+    master_key = _load_chrome_master_key(profile_dir)
+    if master_key is None:
+        return None
+    row = _read_bnid_login_row(profile_dir)
+    if row is None:
+        return None
+    username, password_blob = row
+    password = _decrypt_v10_password(master_key, password_blob)
+    if password is None:
+        return None
+    return Credentials(bnid_email=username, bnid_password=password)
 
 
 def _dpapi_unprotect(blob: bytes) -> bytes | None:
@@ -1911,11 +1755,7 @@ def _decode_dpapi_blob(local_state: Path, encrypted_b64: str) -> bytes | None:
     return encrypted[5:]
 
 
-# NOTE: 以下 3 関数は Task 6 で load_credentials を Chrome Login Data 直読みに
-# 書き換えるまでの間、本ファイル内からは未参照 (テストのみが直接検証する) ため
-# reportUnusedFunction を抑制する。Task 6 で呼び出し元が付き次第、この
-# ignore コメントごと削除する。
-def _load_chrome_master_key(  # pyright: ignore[reportUnusedFunction]
+def _load_chrome_master_key(
     profile_dir: Path,
 ) -> bytes | None:
     """Local State から DPAPI 経由で AES-256 マスタキーを取得する。
@@ -1945,9 +1785,7 @@ def _load_chrome_master_key(  # pyright: ignore[reportUnusedFunction]
     return _dpapi_unprotect(dpapi_payload)
 
 
-def _decrypt_v10_password(  # pyright: ignore[reportUnusedFunction]
-    master_key: bytes, blob: bytes
-) -> str | None:
+def _decrypt_v10_password(master_key: bytes, blob: bytes) -> str | None:
     """v10 プレフィックスを剥がして GCM 復号 → UTF-8。不一致・失敗は None。"""
     if not blob.startswith(b"v10"):
         return None
@@ -1970,7 +1808,7 @@ def _decrypt_v10_password(  # pyright: ignore[reportUnusedFunction]
         return None
 
 
-def _read_bnid_login_row(  # pyright: ignore[reportUnusedFunction]
+def _read_bnid_login_row(
     profile_dir: Path,
 ) -> tuple[str, bytes] | None:
     """Login Data (SQLite) から bandainamcoid の最新 1 行を返す。
@@ -2188,50 +2026,6 @@ def ensure_chromium_installed() -> None:
     _install_chromium()
 
 
-def _prompt_credentials() -> tuple[str, str]:
-    """対話で BNID メールアドレス・パスワードを取得する。
-
-    パスワードは `getpass.getpass()` で echo 無効化する。空文字は
-    `UserInputError` で拒否し、認証情報として使えない状態で保存へ進ませない。
-    """
-    print("BNID の認証情報を入力してください。", file=sys.stderr)
-    email = input("メールアドレス: ").strip()
-    if not email:
-        msg = "メールアドレスが空です。login-init を中止します。"
-        raise UserInputError(msg)
-    password = getpass.getpass("パスワード: ")
-    if not password:
-        msg = "パスワードが空です。login-init を中止します。"
-        raise UserInputError(msg)
-    return email, password
-
-
-def persist_login_init_credentials(profile_dir: Path) -> None:
-    """login-init サブコマンド用: 対話入力 → pending credentials に保存する。
-
-    active credentials.json は上書きしない。実ログインで検証成功 (SUCCESS) した
-    ときにだけ `_activate_pending_credentials` で active に昇格させる。これで
-    新パスワードのタイプミスによって旧 active credentials を失う事故を防ぐ。
-
-    profile_dir は事前に mkdir 済みを前提とする。resume 状態や連続失敗ガードは
-    「認証情報を入れ直した」ことになるため 0 / None にリセットして pending に書く。
-    """
-    email, password = _prompt_credentials()
-    save_pending_credentials(
-        profile_dir,
-        Credentials(
-            bnid_email=email,
-            bnid_password=password,
-            saved_at=datetime.now(JST).isoformat(),
-        ),
-    )
-    print(
-        f"認証情報を {_pending_credentials_file(profile_dir)} に一時保存しました。"
-        "続けてブラウザで検証します (検証成功時のみ active に昇格します)。",
-        file=sys.stderr,
-    )
-
-
 def _login_error_visible(page: Page) -> bool:
     """パスワード誤り等のエラー DOM が可視化されているか。
 
@@ -2383,86 +2177,6 @@ def _poll_login_outcome(
         file=sys.stderr,
     )
     return AutoLoginOutcome.TIMEOUT
-
-
-# NOTE: 以下 3 関数は Task 4 で attempt_auto_relogin の呼び出しを
-# _run_guarded_auto_login (ReloginGuard ベース) 経由に置き換えたため、本ファイル内
-# からは未参照になった (テストのみが直接検証する)。Task 6 でこの 3 関数ごと
-# credentials.json の failure_count/disabled_until フィールドを削除するまでの間
-# だけ reportUnusedFunction を抑制する。
-def _credentials_disabled(  # pyright: ignore[reportUnusedFunction]
-    credentials: Credentials, name: str
-) -> bool:
-    """`disabled_until` が未来なら True (自動再ログインをスキップすべき)。
-
-    非パース文字列や過去時刻は False (=有効) として扱い、fail-safe に倒す。
-    未来ならユーザ向けに残時間を stderr に案内する。
-    """
-    if credentials.disabled_until is None:
-        return False
-    try:
-        deadline = datetime.fromisoformat(credentials.disabled_until)
-    except ValueError:
-        return False
-    deadline = _as_jst_aware(deadline)
-    if datetime.now(JST) >= deadline:
-        return False
-    print(
-        f"[{name}] 自動再ログインは {credentials.disabled_until} まで"
-        "一時停止中です (連続失敗ガード)。",
-        file=sys.stderr,
-    )
-    return True
-
-
-def _reset_credentials_failure(  # pyright: ignore[reportUnusedFunction]
-    profile_dir: Path, credentials: Credentials
-) -> None:
-    """成功時の failure_count / disabled_until クリア。
-
-    変更が無ければ書き込みしない (無駄な I/O と saved_at 保護)。
-    """
-    if credentials.failure_count == 0 and credentials.disabled_until is None:
-        return
-    save_credentials(
-        profile_dir,
-        Credentials(
-            bnid_email=credentials.bnid_email,
-            bnid_password=credentials.bnid_password,
-            saved_at=credentials.saved_at,
-            failure_count=0,
-            disabled_until=None,
-        ),
-    )
-
-
-def _record_credentials_failure(  # pyright: ignore[reportUnusedFunction]
-    profile_dir: Path, credentials: Credentials, *, submissions: int = 1
-) -> None:
-    """失敗時に failure_count へ submissions を加算し、必要なら disabled_until を設定。
-
-    `CREDENTIALS_MAX_FAILURES` に達したら BNID アカウントロックを避けるため
-    `CREDENTIALS_DISABLE_WINDOW_SEC` 秒後まで自動再ログインを停止する。
-
-    submissions は「実際に BNID にパスワードを送信した回数」。TIMEOUT リトライで
-    2 回連続 submit が起きたケースでは 2 を渡し、pre-submit の FORM_ERROR (送信なし)
-    ではそもそもこの関数を呼ばない (呼び出し側で判断する)。
-    """
-    new_count = credentials.failure_count + submissions
-    new_disabled = credentials.disabled_until
-    if new_count >= CREDENTIALS_MAX_FAILURES:
-        window = timedelta(seconds=CREDENTIALS_DISABLE_WINDOW_SEC)
-        new_disabled = (datetime.now(JST) + window).isoformat()
-    save_credentials(
-        profile_dir,
-        Credentials(
-            bnid_email=credentials.bnid_email,
-            bnid_password=credentials.bnid_password,
-            saved_at=credentials.saved_at,
-            failure_count=new_count,
-            disabled_until=new_disabled,
-        ),
-    )
 
 
 def _relogin_disabled(guard: ReloginGuard, name: str) -> bool:
@@ -2753,87 +2467,6 @@ def run_login_flow(
     return 1
 
 
-def run_login_init_flow(ctx: BrowserContext, page: Page, profile_dir: Path) -> int:
-    """login-init 用: pending credentials を実ログインで検証してから active 化する。
-
-    `persist_login_init_credentials` は pending ファイル (credentials.json.pending)
-    に保存する。ここでは pending を読んで auto_login を回し、**SUCCESS のときにだけ**
-    `_activate_pending_credentials` で active credentials.json を置き換える。
-
-    設計理由:
-    - **active を上書きしない**: 新パスワードのタイプミスで PASSWORD_ERROR になっても
-      旧 active credentials は温存されるので、既存アカウントの自動再ログイン能力を
-      失わない。
-    - **未検証 creds を active に置かない**: CAPTCHA / TIMEOUT / FORM_ERROR の
-      いずれも「保存パスワードで実ログインできる」証明になっていないので、
-      `_ensure_authenticated` からの unattended auto-relogin で「間違ったパスワード
-      が BNID にどんどん送信される」事故を防ぐため active に昇格させない。
-
-    - SUCCESS: `_activate_pending_credentials` で置換 → exit 0。
-    - PASSWORD_ERROR: pending 破棄 → exit 1 (active は温存)。
-    - CAPTCHA_DETECTED / TIMEOUT / FORM_ERROR: pending 破棄 → exit 1
-      (active 温存、ユーザに再実行を促す)。
-    - `run_login_flow` フォールバックは **行わない**: ブラウザで別 creds を使った
-      手動ログイン成功を「pending が検証成功」と誤解する事故を防ぐ。
-    """
-    pending = load_pending_credentials(profile_dir)
-    if pending is None:
-        # persist_login_init_credentials 直後なので通常は入っているはずだが、
-        # 手改変等で読めない場合は手動ログインへ回す (検証すべき pending が
-        # 無いので active credentials を汚染するリスクもない)。
-        print("[login-init] pending credentials を読めません。", file=sys.stderr)
-        return run_login_flow(page)
-
-    # pending creds を確実に試すため既存 cookie を破棄する。login-init は
-    # 「認証情報の再登録」で session invalidate はアラインしている。
-    with contextlib.suppress(PlaywrightError):
-        ctx.clear_cookies()
-
-    try:
-        page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
-    except PlaywrightError as e:
-        _discard_pending_credentials(profile_dir)
-        print(
-            f"[login-init] BNID ログイン画面への遷移で失敗: {e}。"
-            "pending は破棄しました。もう一度 login-init を実行してください。",
-            file=sys.stderr,
-        )
-        return 1
-
-    # login-init は failure_count 会計と関係しない (pending は SUCCESS のときだけ
-    # 昇格するので、submit 回数はそのまま捨てる)
-    outcome, _submitted = auto_login(page, pending)
-    if outcome is AutoLoginOutcome.SUCCESS:
-        _activate_pending_credentials(profile_dir)
-        print(
-            "[login-init] pending credentials での実ログインを確認、active に"
-            "昇格しました。",
-            file=sys.stderr,
-        )
-        return 0
-
-    # 以下、いずれの失敗ケースでも pending を破棄して active は温存する。
-    _discard_pending_credentials(profile_dir)
-
-    if outcome is AutoLoginOutcome.PASSWORD_ERROR:
-        print(
-            "[login-init] pending credentials は BNID から認証エラーで拒否"
-            "されました。pending を破棄しました (active は温存)。正しい認証情報で"
-            " `login-init` を再実行してください。",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(
-        f"[login-init] 自動検証に失敗しました (outcome={outcome.value})。"
-        "pending を破棄し active credentials は温存しました。"
-        "`login-init` を再実行するか、"
-        "`uv run canvasser.py login --account NAME` で手動ログインしてください。",
-        file=sys.stderr,
-    )
-    return 1
-
-
 # パストラバーサル (../) や絶対パス指定を排除するため、basename として安全な
 # 文字集合に限定する
 _ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -2974,20 +2607,18 @@ class RunOptions:
 
     mission と checkin は排他のサブコマンドなので、`run_mission` と `run_checkin`
     が同時に True になることはない。デフォルトは「何も実行しない完全ドライラン」で、
-    login / login-init サブコマンドはそれぞれ `login_mode` / `login_init_mode`
-    のみを立てて使う。
+    login サブコマンドは `login_mode` のみを立てて使う。
     """
 
     login_mode: bool = False
-    login_init_mode: bool = False
     run_mission: bool = False
     run_checkin: bool = False
     dry_run: bool = False
     daily_budget: int = 0
     consecutive_failure_limit: int = 1
     out_of_range_limit: int = 3
-    # credentials.json が保存されていれば `check_login()` false 時に auto_login を試す。
-    # `--no-auto-relogin` で明示的に無効化 (手動運用に戻すとき) できる。
+    # Chrome Login Data から BNID 資格情報を復号できれば `check_login()` false
+    # 時に auto_login を試す。`--no-auto-relogin` で明示的に無効化できる。
     auto_relogin: bool = True
 
 
@@ -3004,8 +2635,7 @@ def process_account(
     未ログイン検知時は exit_code=1 を返し、呼び出し側で他アカウントへ進む。
     """
     profile_dir.mkdir(parents=True, exist_ok=True)
-    headed = options.login_mode or options.login_init_mode
-    ctx = open_persistent_context(p, profile_dir, headless=not headed)
+    ctx = open_persistent_context(p, profile_dir, headless=not options.login_mode)
     try:
         page = ctx.new_page()
         page.goto(MISSION_PAGE_URL, wait_until="domcontentloaded")
@@ -3013,10 +2643,6 @@ def process_account(
         # login は headed ブラウザ + is_login ポーリングで手動ログイン成功を検知する。
         if options.login_mode:
             return 0, run_login_flow(page)
-        # login-init は事前 (_main_impl) で credentials を保存済み。ここで cookie を
-        # 破棄してから auto_login で実ログインを検証する (擬似成功抜け防止)。
-        if options.login_init_mode:
-            return 0, run_login_init_flow(ctx, page, profile_dir)
 
         if not _ensure_authenticated(page, name, profile_dir, options):
             return 0, 1
@@ -3071,7 +2697,7 @@ def main() -> int:
 def _build_parser() -> argparse.ArgumentParser:
     """CLI 引数パーサを構築する。
 
-    login / login-init / mission / checkin / mark-completed の 5 サブコマンド。
+    login / mission / checkin / mark-completed の 4 サブコマンド。
     サブコマンドで必須引数と排他 (mission と checkin は同時実行しない) を
     構造的に表現し、フラグの組み合わせ検証を不要にする。
     """
@@ -3117,8 +2743,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-auto-relogin",
         action="store_true",
         help=(
-            "credentials.json が保存されていても自動再ログインを行わない。"
-            "手動運用に戻したいときや、資格情報を一時的に無効化したいときに使う。"
+            "Chrome Login Data から BNID 資格情報を復号できても自動再ログインを"
+            "行わない。手動運用に戻したいときや、資格情報を一時的に無効化したい"
+            "ときに使う。"
         ),
     )
 
@@ -3128,20 +2755,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="初回ログイン。Chromium を可視状態で起動する",
     )
     login.add_argument(
-        "--account",
-        required=True,
-        help="対象アカウント名。profiles-dir 配下のサブディレクトリ名として扱う",
-    )
-
-    login_init = subparsers.add_parser(
-        "login-init",
-        parents=[common, browser],
-        help=(
-            "BNID メール/パスワードを対話入力し credentials.json に保存後、"
-            "既存の対話ログインフローで実ログインを検証する"
-        ),
-    )
-    login_init.add_argument(
         "--account",
         required=True,
         help="対象アカウント名。profiles-dir 配下のサブディレクトリ名として扱う",
@@ -3232,8 +2845,6 @@ def _build_run_options(args: argparse.Namespace) -> RunOptions:
     """
     if args.command == "login":
         return RunOptions(login_mode=True)
-    if args.command == "login-init":
-        return RunOptions(login_init_mode=True)
     if args.command == "mission":
         return RunOptions(
             run_mission=True,
@@ -3307,7 +2918,6 @@ def _main_impl() -> int:
         return _run_mark_completed(args, profiles_dir)
 
     login_mode = args.command == "login"
-    login_init_mode = args.command == "login-init"
     if args.command == "checkin":
         _validate_thresholds(args)
 
@@ -3321,13 +2931,6 @@ def _main_impl() -> int:
         raise UserInputError(msg)
 
     _ensure_profiles_dir_ignored(args, profiles_dir)
-
-    # login-init はブラウザ起動前に対話入力 → credentials.json 保存を行う。
-    # Chromium 取得待ちや playwright 起動より先に対話が済む方がユーザ体験が良い。
-    if login_init_mode:
-        _, target_profile = profiles[0]
-        target_profile.mkdir(parents=True, exist_ok=True)
-        persist_login_init_credentials(target_profile)
 
     options = _build_run_options(args)
 
@@ -3349,8 +2952,8 @@ def _main_impl() -> int:
             results.append((name, gained))
             if code != 0:
                 exit_code = code
-            if login_mode or login_init_mode:
-                # login / login-init は 1 アカウント (--account 必須) のみ処理して抜ける
+            if login_mode:
+                # login は 1 アカウント (--account 必須) のみ処理して抜ける
                 return code
 
     if len(profiles) > 1:
