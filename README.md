@@ -215,7 +215,7 @@ Next.js チャンク解析で判明した仕様。
 - `.env` も Git 管理外に置く (`.gitignore` 設定済み)。
 - `login` / `mission` / `checkin` 実行時に `--profiles-dir` が `.gitignore` 対象になっているかを `git check-ignore` で自動検証する。未 ignore の場合は実行を拒否する (Cookie 誤コミット防止)。回避したい場合は `--allow-unignored-profiles-dir` を明示する。
 - キャンペーン規約に自動化禁止条項がある場合は、自己責任で判断する。
-- Cookie の有効期限が切れた場合は `login --account NAME` で再ログインする (Chrome に BNID の資格情報が自動保存されていれば自動再ログインが試みられる)。
+- Cookie の有効期限が切れた場合は、`mission` / `checkin` 実行時に自動再ログインが試みられる。失敗した場合や手動で再登録する場合は `login --account NAME` を使う (Chrome に BNID の資格情報が自動保存されていれば再ログインに使われる)。
 - 未観測 ecode が 1 件出たら fail closed で即停止する (デフォルト)。BAN シグナル・認証切れ・予期せぬ状態のいずれかとして扱う。
 - BNID の資格情報は Chrome の Login Data (`profiles/{account}/Default/Login Data`) に Windows DPAPI + AES-256-GCM で暗号化されて保存される。復号には同一 Windows ユーザーアカウントでのログインが必要なため、Chrome 本体のパスワード保護と同水準のリスクに留まる。パスワードを変更した場合は、次回 `login` 実行時に Chrome の「パスワードを更新しますか?」プロンプトで更新を選択する。
 - BNID 側が CAPTCHA / 2FA / パスキー強制を導入すると、自動再ログインは失敗するようになり手動 `login` に退化する。`auto_login` は CAPTCHA / 2FA を検知すると即 abort する (詳細は `canvasser.py` の `_LOGIN_CAPTCHA_SELECTORS` を参照)。
