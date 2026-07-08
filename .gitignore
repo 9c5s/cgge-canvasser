@@ -5,3 +5,8 @@ __pycache__/
 profiles/
 .coverage
 htmlcov/
+
+# ユーザーの global gitignore で `superpowers/` が除外されるが、本プロジェクトの
+# 設計 doc と実装計画は docs/superpowers/ に置いており、README から参照している
+# ため、本プロジェクト内では tracked にする。
+!docs/superpowers/

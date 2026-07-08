@@ -199,6 +199,8 @@ def test_load_credentials_end_to_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Local State + Login Data + DPAPI モックで Credentials を組み立てる (正常系)。"""
+    # 非 Windows テストランナーでも load_credentials の Windows path を経由させる
+    monkeypatch.setattr(canvasser.os, "name", "nt")
     fake_key = b"k" * 32
 
     def _fake_dpapi_unprotect(blob: bytes) -> bytes | None:
@@ -236,6 +238,8 @@ def test_load_credentials_no_login_data_returns_none(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """master_key の復号に成功しても Login Data が無ければ None。"""
+    # 非 Windows テストランナーでも load_credentials の Windows path を経由させる
+    monkeypatch.setattr(canvasser.os, "name", "nt")
 
     def _fake_dpapi_unprotect(blob: bytes) -> bytes | None:
         del blob
