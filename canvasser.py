@@ -2539,15 +2539,17 @@ _ASOBI_BRIDGE_SELECTORS: tuple[str, ...] = (
 def _click_asobi_bridge_button(page: Page, name: str) -> None:
     """ASOBI 中間ページのブリッジボタンを、可視な最初の要素だけ click する。
 
-    `.first` で strictness violation を避けつつ、可視要素だけを対象に click を
-    試みる。click が成功した時点で return し、失敗した場合は次候補の
-    selector を試す。全 selector で hidden または click 失敗のときは何もせず
-    抜け、次ポーリングに委ねる。
+    `filter(visible=True).first` で可視要素のみに絞ってから最初を取ることで、
+    hidden 要素が DOM order で先にある場合でも visible な要素を選べる (単に
+    `.first` を使うと DOM order で先頭の hidden 要素が選ばれ通らない)。
+    click が成功した時点で return し、失敗した場合は次候補の selector を試す。
+    全 selector で hidden または click 失敗のときは何もせず抜け、次ポーリングに
+    委ねる。
     """
     for sel in _ASOBI_BRIDGE_SELECTORS:
         clicked = False
         with contextlib.suppress(PlaywrightError):
-            locator = page.locator(sel).first
+            locator = page.locator(sel).filter(visible=True).first
             if locator.is_visible():
                 print(
                     f"[{name}] 中間ページのブリッジボタン ({sel}) をクリック",
