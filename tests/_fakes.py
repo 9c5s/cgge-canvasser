@@ -137,6 +137,9 @@ class FakePage:
             k: list(v) for k, v in (click_errors or {}).items()
         }
         self.goto_errors: list[Exception | None] = list(goto_errors or [])
+        # ASOBI 連携復旧ドライバ (linkages/as/login) のポーリングが参照する現在 URL。
+        # 通常のテストではアクセスされないため空文字のままでよい。
+        self.url: str = ""
 
     def evaluate(self, expression: str, arg: object = None) -> object:
         """呼び出しを記録し、キュー先頭の応答を返す。Exception なら raise する。"""
