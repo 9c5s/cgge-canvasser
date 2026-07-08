@@ -255,6 +255,31 @@ def check_login(page: Page) -> bool:
 _MISSION_TYPES: tuple[tuple[int, str], ...] = ((0, "通常"), (1, "ASOBI STORE"))
 
 
+@dataclass(kw_only=True)
+class MissionOutcome:
+    """1 ミッションの処理結果。`_receive` と `_process_one_mission` で共有する。
+
+    - `gained`: 実獲得または dry-run 見込みの投票券。
+    - `linkage_expired_id`: E1926 (ASOBI 連携トークン切れ) を検知したときの
+      mission_id (達成 POST・受取 PUT のどちらで検知しても格納する)。
+    """
+
+    gained: int = 0
+    linkage_expired_id: int | None = None
+
+
+@dataclass(kw_only=True)
+class MissionRunResult:
+    """ミッション回収 1 回分の集計結果。
+
+    Task 9 で `collect_missions` の集計と ASOBI 連携再認証のリトライ判定に使う
+    (本タスクでは型定義のみで、実際の生成・消費はまだ行わない)。
+    """
+
+    gained: int = 0
+    linkage_expired_ids: set[int] = field(default_factory=set[int])
+
+
 def collect_missions(page: Page, *, dry_run: bool) -> int:
     """API 経由で完了可能なミッションと、外部トリガー達成分の受取をまとめて消化する。
 
@@ -293,20 +318,29 @@ def collect_missions(page: Page, *, dry_run: bool) -> int:
             print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
         print(f"ミッションモード ({label}): {mode_label}")
         for m in cast("list[dict[str, Any]]", payload["missions"]):
-            gained += _process_one_mission(page, m, dry_run=dry_run)
+            # linkage_expired_id (E1926) の集約と ASOBI 連携再ログインへの連携は
+            # Task 9 で実装する。本タスクでは gained のみ合算し、検知した
+            # mission_id はここでは扱わない。
+            outcome = _process_one_mission(page, m, dry_run=dry_run)
+            gained += outcome.gained
 
     result_label = "獲得見込み" if dry_run else "獲得"
     print(f"ミッション {result_label}: {gained}枚")
     return gained
 
 
-def _process_one_mission(page: Page, m: dict[str, Any], *, dry_run: bool) -> int:
-    """1 ミッションの達成 / 受取を行い、獲得票数を返す。
+def _process_one_mission(
+    page: Page, m: dict[str, Any], *, dry_run: bool
+) -> MissionOutcome:
+    """1 ミッションの達成 / 受取を行い、結果を MissionOutcome で返す。
 
     分岐:
       - `completed and not received` → 受取 PUT を送る (flag に関わらず)
       - `flag=True and not completed and remaining>0` → 達成 POST → 受取 PUT
       - `flag=False and not completed` → 何もしない (UI 経由のあいことば等)
+
+    達成 POST・受取 PUT のどちらで E1926 (ASOBI 連携トークン切れ) を検知しても、
+    linkage_expired_id 付きの MissionOutcome をそのまま呼び出し元へ伝搬する。
     """
     mid: int = m["mission_id"]
     name: str = m["mission_name"]
@@ -322,17 +356,47 @@ def _process_one_mission(page: Page, m: dict[str, Any], *, dry_run: bool) -> int
         return _receive(page, mid, name, pts, dry_run=dry_run)
 
     if not api_completable:
-        return 0
+        return MissionOutcome()
 
     if not completed and remaining > 0:
-        outcome = _complete(page, mid, name, dry_run=dry_run)
+        complete_result = _complete(page, mid, name, dry_run=dry_run)
+        if complete_result == "linkage_expired":
+            return MissionOutcome(linkage_expired_id=mid)
         # 累計達成数系ミッション (#100-104) はサーバ側で自動達成されるが、
         # 一覧の completed フラグ更新が遅延する。達成 POST が「既に達成済み」を
         # 返した場合も受取 PUT は通る。
-        if outcome in ("ok", "already_done"):
+        if complete_result in ("ok", "already_done"):
             return _receive(page, mid, name, pts, dry_run=dry_run)
 
-    return 0
+    return MissionOutcome()
+
+
+def _complete_error_result(res: dict[str, Any]) -> str:
+    """`_complete` の失敗応答を ecode 別の結果文字列に写す。
+
+    `_complete` 本体の return 文数を pylint の max-returns 上限内に収めるため、
+    ecode 判定部分だけをここへ切り出している (単一責任の分離でもある)。
+
+    戻り値:
+      - "already_done"   : E1906 既に達成済み (受取 PUT は試すべき)
+      - "linkage_expired": E1926 ASOBI 連携トークン切れ
+      - "condition_unmet": E1924 達成条件未満 (静かにスキップ)
+      - "error"          : その他失敗
+    """
+    ecode = _extract_ecode(res.get("body"))
+    if ecode == "E1906":
+        print("  -> 既に達成済み (受取を試す)")
+        return "already_done"
+    if ecode == "E1926":
+        print("  -> ASOBI 連携トークン切れ (完了 POST)", file=sys.stderr)
+        return "linkage_expired"
+    if ecode == "E1924":
+        print("  -> 条件未達、スキップ")
+        return "condition_unmet"
+
+    err_note = f" err={res.get('error')}" if res.get("error") else ""
+    print(f"  -> 失敗: HTTP {res['status']}{err_note} body={res.get('body')}")
+    return "error"
 
 
 def _complete(page: Page, mid: int, name: str, *, dry_run: bool) -> str:
@@ -345,6 +409,7 @@ def _complete(page: Page, mid: int, name: str, *, dry_run: bool) -> str:
       - "ok"             : 達成成功
       - "already_done"   : E1906 既に達成済み (受取 PUT は試すべき)
       - "condition_unmet": E1924 達成条件未満 (静かにスキップ)
+      - "linkage_expired": E1926 ASOBI 連携トークン切れ
       - "error"          : その他失敗
     """
     print(f"[達成] #{mid} {name}")
@@ -355,39 +420,36 @@ def _complete(page: Page, mid: int, name: str, *, dry_run: bool) -> str:
     if _is_success_response(res):
         print("  -> 成功")
         return "ok"
-
-    ecode = _extract_ecode(res.get("body"))
-    if ecode == "E1906":
-        print("  -> 既に達成済み (受取を試す)")
-        return "already_done"
-    if ecode == "E1924":
-        print("  -> 条件未達、スキップ")
-        return "condition_unmet"
-
-    err_note = f" err={res.get('error')}" if res.get("error") else ""
-    print(f"  -> 失敗: HTTP {res['status']}{err_note} body={res.get('body')}")
-    return "error"
+    return _complete_error_result(res)
 
 
-def _receive(page: Page, mid: int, name: str, pts: int, *, dry_run: bool) -> int:
+def _receive(
+    page: Page, mid: int, name: str, pts: int, *, dry_run: bool
+) -> MissionOutcome:
     """投票券受取の PUT を送る。
 
-    成功時は加算票数、dry-run 時は「実行していれば得た pts」を返す。
+    成功時・dry-run 時は gained=pts の MissionOutcome を返す。E1926 (ASOBI
+    連携トークン切れ) を検知した場合は linkage_expired_id=mid を返し、それ
+    以外の失敗は空の MissionOutcome (gained=0) を返す。
     """
     print(f"[受取] #{mid} {name} (+{pts})")
     if dry_run:
         print("  -> DRY-RUN (PUT送信なし)")
-        return pts
+        return MissionOutcome(gained=pts)
     res = call_api(page, "PUT", f"/mission/{mid}/receive")
     if _is_success_response(res):
         body = cast("dict[str, Any]", res["body"])
         payload = cast("dict[str, Any]", body.get("payload") or {})
         received = payload.get("received_point")
         print(f"  -> 成功 (received_point={received})")
-        return pts
+        return MissionOutcome(gained=pts)
+    ecode = _extract_ecode(res.get("body"))
+    if ecode == "E1926":
+        print("  -> ASOBI 連携トークン切れ (受取 PUT)", file=sys.stderr)
+        return MissionOutcome(linkage_expired_id=mid)
     err_note = f" err={res.get('error')}" if res.get("error") else ""
     print(f"  -> 失敗: HTTP {res['status']}{err_note} body={res.get('body')}")
-    return 0
+    return MissionOutcome()
 
 
 # -------------------- チェックイン (#99) 関連 --------------------

@@ -1,7 +1,9 @@
 """ミッション回収フロー (collect_missions / _complete / _receive) のテスト。
 
 FakePage で API 応答を差し替え、dry-run と本番実行の分岐・ecode 別の
-ハンドリング・獲得票数の集計を検証する。
+ハンドリング・獲得票数の集計を検証する。E1926 (ASOBI 連携トークン切れ) 検知時に
+`_complete`/`_receive`/`_process_one_mission` が `MissionOutcome` で
+`linkage_expired_id` を伝搬することも検証する。
 """
 
 from typing import Any
@@ -254,7 +256,7 @@ class TestReceive:
 
         got = canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=True)
 
-        assert got == 30
+        assert got == canvasser.MissionOutcome(gained=30)
         assert fake.calls == []
 
     def test_成功時はptsを返す(self) -> None:
@@ -262,10 +264,77 @@ class TestReceive:
         response = success_response({"received_point": 30})
         fake = FakePage([response])
 
-        assert canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=False) == 30
+        got = canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=False)
+
+        assert got == canvasser.MissionOutcome(gained=30)
 
     def test_失敗時は0を返す(self) -> None:
         """PUT 失敗では票数に計上しない。"""
         fake = FakePage([_error_response("E9999")])
 
-        assert canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=False) == 0
+        got = canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=False)
+
+        assert got == canvasser.MissionOutcome()
+
+
+def test_receive_returns_gained_on_success() -> None:
+    """`_receive` は PUT 成功時、獲得票数入りの MissionOutcome を返す。"""
+    fake = FakePage([success_response({"received_point": 5})])
+
+    result = canvasser._receive(_as_page(fake), 1, "テスト", 5, dry_run=False)
+
+    assert result == canvasser.MissionOutcome(gained=5)
+
+
+def test_receive_returns_linkage_expired_on_e1926() -> None:
+    """`_receive` は受取 PUT が E1926 を返したら linkage_expired_id を伝搬する。"""
+    fake = FakePage([_error_response("E1926")])
+
+    result = canvasser._receive(_as_page(fake), 21, "ASOBI", 2, dry_run=False)
+
+    assert result == canvasser.MissionOutcome(linkage_expired_id=21)
+
+
+def test_complete_returns_linkage_expired_on_e1926() -> None:
+    """`_complete` は達成 POST が E1926 を返したら "linkage_expired" を返す。"""
+    fake = FakePage([_error_response("E1926")])
+
+    got = canvasser._complete(_as_page(fake), 21, "ASOBI", dry_run=False)
+
+    assert got == "linkage_expired"
+
+
+def test_process_one_mission_propagates_linkage_expired_from_complete() -> None:
+    """達成 POST (`_complete`) が E1926 を返す経路で linkage_expired_id を伝搬する。"""
+    fake = FakePage([_error_response("E1926")])
+    m = {
+        "mission_id": 21,
+        "mission_name": "ASOBI",
+        "mission_point": 2,
+        "action": {"mission_complete_api_call_flag": True},
+        "is_mission_completed": False,
+        "is_mission_received": False,
+        "remaining_completable_count": 1,
+    }
+
+    result = canvasser._process_one_mission(_as_page(fake), m, dry_run=False)
+
+    assert result == canvasser.MissionOutcome(linkage_expired_id=21)
+
+
+def test_process_one_mission_propagates_linkage_expired_from_receive() -> None:
+    """達成済み + 未受取のミッションで受取 PUT (`_receive`) が E1926 を返す経路。"""
+    fake = FakePage([_error_response("E1926")])
+    m = {
+        "mission_id": 21,
+        "mission_name": "ASOBI",
+        "mission_point": 2,
+        "action": {"mission_complete_api_call_flag": False},
+        "is_mission_completed": True,
+        "is_mission_received": False,
+        "remaining_completable_count": 0,
+    }
+
+    result = canvasser._process_one_mission(_as_page(fake), m, dry_run=False)
+
+    assert result == canvasser.MissionOutcome(linkage_expired_id=21)
