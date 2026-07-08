@@ -64,6 +64,15 @@ class FakeLocator:
             if err is not None:
                 raise err
 
+    @property
+    def first(self) -> FakeLocator:
+        """Playwright locator.first 相当。
+
+        テストでは絞り込みは意味を持たず、self を返して strictness violation
+        回避の呼び出しだけを受け止める。
+        """
+        return self
+
     def is_visible(self) -> bool:
         """selector の可視性を FakePage.visibility から取得する (既定 False)。"""
         return self._page.visibility.get(self._selector, False)
