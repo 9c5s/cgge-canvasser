@@ -281,7 +281,64 @@ class MissionRunResult:
     linkage_expired_ids: set[int] = field(default_factory=set[int])
 
 
-def collect_missions(page: Page, *, dry_run: bool) -> int:
+def _fetch_mission_listings(
+    page: Page,
+) -> list[tuple[int, str, dict[str, Any]]]:
+    """通常 (0) と ASOBI STORE (1) の 2 listing GET を集約する。
+
+    前段の受取 PUT が成功済みでも後段 fetch が失敗すると集計から欠落するため、
+    両 listing を先に fetch し終えてから POST/PUT に進めるよう、呼び出し側
+    (`collect_missions`) は 1 attempt につきこの関数を 1 回だけ呼ぶ。
+    """
+    listings: list[tuple[int, str, dict[str, Any]]] = []
+    for mt, label in _MISSION_TYPES:
+        listing = call_api(page, "GET", f"/missions?mission_type={mt}&limit=300")
+        payload = _success_payload_or_raise(
+            listing, f"ミッション一覧 ({label}) の取得に失敗"
+        )
+        listings.append((mt, label, payload))
+    return listings
+
+
+def _process_all_missions(
+    page: Page,
+    listings: list[tuple[int, str, dict[str, Any]]],
+    *,
+    dry_run: bool,
+) -> MissionRunResult:
+    """全 listing を回し、gained 累積と linkage_expired_id 集合を返す。"""
+    result = MissionRunResult()
+    for mt, label, payload in listings:
+        if mt == 0:
+            print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
+        mode_label = "本番" if not dry_run else "DRY-RUN (POST/PUT送信なし)"
+        print(f"ミッションモード ({label}): {mode_label}")
+        for m in cast("list[dict[str, Any]]", payload["missions"]):
+            outcome = _process_one_mission(page, m, dry_run=dry_run)
+            result.gained += outcome.gained
+            if outcome.linkage_expired_id is not None:
+                result.linkage_expired_ids.add(outcome.linkage_expired_id)
+    return result
+
+
+def _filter_listings(
+    listings: list[tuple[int, str, dict[str, Any]]],
+    keep_ids: set[int],
+) -> list[tuple[int, str, dict[str, Any]]]:
+    """Listing 内の missions を keep_ids に絞る (payload は copy して mutate)。"""
+    filtered: list[tuple[int, str, dict[str, Any]]] = []
+    for mt, label, payload in listings:
+        new_payload = dict(payload)
+        new_payload["missions"] = [
+            m
+            for m in cast("list[dict[str, Any]]", payload.get("missions", []))
+            if m.get("mission_id") in keep_ids
+        ]
+        filtered.append((mt, label, new_payload))
+    return filtered
+
+
+def collect_missions(page: Page, profile_dir: Path, name: str, *, dry_run: bool) -> int:
     """API 経由で完了可能なミッションと、外部トリガー達成分の受取をまとめて消化する。
 
     通常 (`mission_type=0`) と ASOBI STORE 系 (`mission_type=1`) の両方を fetch する。
@@ -295,39 +352,35 @@ def collect_missions(page: Page, *, dry_run: bool) -> int:
       を防ぐため。
     - あいことばなど、達成条件が UI 経由のみのミッションは flag=False かつ未達成の
       ままなので、達成 POST も受取 PUT も送らない。
-    - `dry_run=True` は完全ドライラン。GET のみ実行し、POST/PUT は送らない。
+    - `dry_run=True` は完全ドライラン。GET のみ実行し、POST/PUT は送らない (ASOBI
+      連携復旧 driver も起動しない)。
+
+    ASOBI 連携トークン切れ (E1926) を検知した場合、`_run_asobi_linkage_recovery`
+    で連携を再確立し、該当ミッションだけに絞って 1 回だけ再走する。listings の
+    GET は attempt 1 でのみ行い、attempt 2 では `_filter_listings` で絞り込んだ
+    ものを使い回す (2 回目の GET は行わない)。driver 自体も 1 回のみ起動し、
+    それでも残った linkage_expired は諦める (現行同様スキップ扱い)。
 
     戻り値は今回獲得した投票券数の合計 (dry-run 時は実行した場合の見込み)。
     """
-    mode_label = "本番" if not dry_run else "DRY-RUN (POST/PUT送信なし)"
-
-    # 両 listing を先に fetch してから POST/PUT を送る。前段で PUT (受取) を送った
-    # 後に後段 fetch が失敗すると、run summary で「そのアカウント 0 gained」と誤記録
-    # になり、サーバ側に反映済みの投票券が集計から欠落する。fetch 失敗はここで
-    # まとめて fail-closed する。
-    listings: list[tuple[int, str, dict[str, Any]]] = []
-    for mt, label in _MISSION_TYPES:
-        listing = call_api(page, "GET", f"/missions?mission_type={mt}&limit=300")
-        payload = _success_payload_or_raise(
-            listing, f"ミッション一覧 ({label}) の取得に失敗"
-        )
-        listings.append((mt, label, payload))
-
-    gained = 0
-    for mt, label, payload in listings:
-        if mt == 0:
-            print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
-        print(f"ミッションモード ({label}): {mode_label}")
-        for m in cast("list[dict[str, Any]]", payload["missions"]):
-            # linkage_expired_id (E1926) の集約と ASOBI 連携再ログインへの連携は
-            # Task 9 で実装する。本タスクでは gained のみ合算し、検知した
-            # mission_id はここでは扱わない。
-            outcome = _process_one_mission(page, m, dry_run=dry_run)
-            gained += outcome.gained
+    listings = _fetch_mission_listings(page)
+    total_gained = 0
+    for attempt in (1, 2):
+        result = _process_all_missions(page, listings, dry_run=dry_run)
+        total_gained += result.gained
+        if not result.linkage_expired_ids or dry_run:
+            # dry_run では副作用ゼロの契約を守るため復旧 driver を起動しない
+            break
+        if attempt == 2:
+            # driver は 1 回のみ。2 回目でも残っていれば諦める
+            break
+        if not _run_asobi_linkage_recovery(page, profile_dir, name):
+            break  # 復旧失敗 → 現行同様スキップ扱いで終了
+        listings = _filter_listings(listings, keep_ids=result.linkage_expired_ids)
 
     result_label = "獲得見込み" if dry_run else "獲得"
-    print(f"ミッション {result_label}: {gained}枚")
-    return gained
+    print(f"ミッション {result_label}: {total_gained}枚")
+    return total_gained
 
 
 def _process_one_mission(
@@ -2476,12 +2529,7 @@ _ASOBI_BRIDGE_SELECTORS: tuple[str, ...] = (
 )
 
 
-# NOTE: この関数は Task 9 で E1926 (ASOBI 連携切れ) 検知後の復旧経路から
-# 呼び出すまで本ファイル内からは未参照になる (テストのみが直接検証する)。
-# その間だけ reportUnusedFunction を抑制する。
-def _run_asobi_linkage_recovery(  # pyright: ignore[reportUnusedFunction]
-    page: Page, profile_dir: Path, name: str
-) -> bool:
+def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> bool:
     """linkages/as/login を踏んで ASOBI 連携を再確立する。成功なら True。
 
     - BNID セッション生存: 自動通過して backto (mission page) に着地 → True
@@ -2810,7 +2858,9 @@ def process_account(
         exit_code = 0
         if options.run_mission:
             # dry-run の見込み枚数は集計に混ぜず、アカウント総計を汚さない
-            mission_gain = collect_missions(page, dry_run=options.dry_run)
+            mission_gain = collect_missions(
+                page, profile_dir, name, dry_run=options.dry_run
+            )
             if not options.dry_run:
                 gained += mission_gain
         if options.run_checkin:
