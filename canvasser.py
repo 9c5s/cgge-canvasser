@@ -52,6 +52,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import googlemaps
@@ -2460,6 +2461,102 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
         return True
 
     return _run_guarded_auto_login(page, profile_dir, name)
+
+
+LINKAGE_ENTRY_URL = (
+    f"{API_HOST}/api/v1_1_0/linkages/as/login?backto={quote(MISSION_PAGE_URL, safe='')}"
+)
+
+# 中間ページ (legacy-login.asobistore.jp) の「バンダイナムコIDでログイン」候補
+# セレクタ。実装後に headless で確認して 1 本に絞る (現時点は複数候補で試す)。
+_ASOBI_BRIDGE_SELECTORS: tuple[str, ...] = (
+    'a[href*="idsvc"]',
+    'a:has-text("バンダイナムコID")',
+    'button:has-text("バンダイナムコID")',
+)
+
+
+# NOTE: この関数は Task 9 で E1926 (ASOBI 連携切れ) 検知後の復旧経路から
+# 呼び出すまで本ファイル内からは未参照になる (テストのみが直接検証する)。
+# その間だけ reportUnusedFunction を抑制する。
+def _run_asobi_linkage_recovery(  # pyright: ignore[reportUnusedFunction]
+    page: Page, profile_dir: Path, name: str
+) -> bool:
+    """linkages/as/login を踏んで ASOBI 連携を再確立する。成功なら True。
+
+    - BNID セッション生存: 自動通過して backto (mission page) に着地 → True
+    - 中間ページの「バンダイナムコIDでログイン」が可視 → click して継続
+    - BNID フォームが可視 → `_run_guarded_auto_login` で突破
+    - CAPTCHA / タイムアウト → False (呼び出し側は現状同様スキップに退行)
+
+    成功後は cookie 保存事故対策で 10 秒 wait してから mission page に戻す。
+    """
+    try:
+        page.goto(LINKAGE_ENTRY_URL, wait_until="domcontentloaded")
+    except PlaywrightError as e:
+        print(
+            f"[{name}] ASOBI 連携 URL への遷移で失敗: {e}",
+            file=sys.stderr,
+        )
+        return False
+
+    timeout_sec = 60
+    interval_sec = 1.0
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        try:
+            current_url = page.url
+            # (a) backto (mission page) 到達
+            if current_url.startswith(MISSION_PAGE_URL):
+                print(
+                    f"[{name}] ASOBI 連携復旧: backto 到達を確認しました。",
+                    file=sys.stderr,
+                )
+                # cookie 保存事故対策の wait (project-asobi-linkage メモリ参照)
+                time.sleep(10)
+                # SSO 途中 URL で観測された場合でも確実に mission page に
+                # 着地させるため、明示的に goto し直す (idempotent)
+                with contextlib.suppress(PlaywrightError):
+                    page.goto(MISSION_PAGE_URL, wait_until="domcontentloaded")
+                return True
+            # (b) 中間ページの「バンダイナムコIDでログイン」ボタン
+            for sel in _ASOBI_BRIDGE_SELECTORS:
+                with contextlib.suppress(PlaywrightError):
+                    if page.locator(sel).count() > 0:
+                        print(
+                            f"[{name}] 中間ページのブリッジボタン ({sel}) をクリック",
+                            file=sys.stderr,
+                        )
+                        with contextlib.suppress(PlaywrightError):
+                            page.locator(sel).click()
+                        break
+            # (c) BNID フォームが可視 → guarded auto_login
+            with contextlib.suppress(PlaywrightError):
+                if page.locator(_LOGIN_MAIL_SEL).is_visible():
+                    if not _run_guarded_auto_login(page, profile_dir, name):
+                        return False
+                    # 成功後の続きは次ポーリングで backto 到達を待つ
+                    continue
+            # (d) CAPTCHA/2FA 検知 → 復旧失敗
+            if _detect_login_captcha(page):
+                print(
+                    f"[{name}] ASOBI 連携復旧中に CAPTCHA/2FA を検知、abort",
+                    file=sys.stderr,
+                )
+                return False
+        except PlaywrightError as e:
+            print(
+                f"[{name}] ASOBI 連携復旧ポーリング中に PlaywrightError: {e}",
+                file=sys.stderr,
+            )
+            # 次ポーリングに委ねる
+        time.sleep(interval_sec)
+
+    print(
+        f"[{name}] ASOBI 連携復旧タイムアウト",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _ensure_authenticated(
