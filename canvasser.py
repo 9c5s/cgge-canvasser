@@ -1829,6 +1829,14 @@ def _dpapi_unprotect(blob: bytes) -> bytes | None:
     class _DataBlob(ctypes.Structure):
         _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.c_void_p)]
 
+    # ctypes は既定で戻り値・引数を C int として扱う。64-bit Windows では
+    # HLOCAL などのポインタ引数がそのままだと下位 32bit に truncate され、
+    # LocalFree に不正 handle を渡して不定挙動になる。ここで argtypes /
+    # restype を明示し、pbData が void* として渡されることを保証する。
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
     in_blob = _DataBlob(len(blob), ctypes.cast(ctypes.c_char_p(blob), ctypes.c_void_p))
     out_blob = _DataBlob()
     try:
@@ -1850,7 +1858,7 @@ def _dpapi_unprotect(blob: bytes) -> bytes | None:
     try:
         buf = ctypes.string_at(out_blob.pbData, out_blob.cbData)
     finally:
-        ctypes.windll.kernel32.LocalFree(out_blob.pbData)  # type: ignore[attr-defined]
+        kernel32.LocalFree(out_blob.pbData)
     return buf
 
 
@@ -2528,6 +2536,29 @@ _ASOBI_BRIDGE_SELECTORS: tuple[str, ...] = (
 )
 
 
+def _click_asobi_bridge_button(page: Page, name: str) -> None:
+    """ASOBI 中間ページのブリッジボタンを、可視な最初の要素だけ click する。
+
+    `.first` で strictness violation を避けつつ、可視要素だけを対象に click を
+    試みる。click が成功した時点で return し、失敗した場合は次候補の
+    selector を試す。全 selector で hidden または click 失敗のときは何もせず
+    抜け、次ポーリングに委ねる。
+    """
+    for sel in _ASOBI_BRIDGE_SELECTORS:
+        clicked = False
+        with contextlib.suppress(PlaywrightError):
+            locator = page.locator(sel).first
+            if locator.is_visible():
+                print(
+                    f"[{name}] 中間ページのブリッジボタン ({sel}) をクリック",
+                    file=sys.stderr,
+                )
+                locator.click()
+                clicked = True
+        if clicked:
+            return
+
+
 def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> bool:
     """linkages/as/login を踏んで ASOBI 連携を再確立する。成功なら True。
 
@@ -2567,16 +2598,7 @@ def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> boo
                     page.goto(MISSION_PAGE_URL, wait_until="domcontentloaded")
                 return True
             # (b) 中間ページの「バンダイナムコIDでログイン」ボタン
-            for sel in _ASOBI_BRIDGE_SELECTORS:
-                with contextlib.suppress(PlaywrightError):
-                    if page.locator(sel).count() > 0:
-                        print(
-                            f"[{name}] 中間ページのブリッジボタン ({sel}) をクリック",
-                            file=sys.stderr,
-                        )
-                        with contextlib.suppress(PlaywrightError):
-                            page.locator(sel).click()
-                        break
+            _click_asobi_bridge_button(page, name)
             # (c) BNID フォームが可視 → guarded auto_login
             with contextlib.suppress(PlaywrightError):
                 if page.locator(_LOGIN_MAIL_SEL).is_visible():
@@ -2971,13 +2993,13 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "mission",
         parents=[common, browser, collect],
-        help="ミッションを回収する (デフォルトはドライラン)",
+        help="ミッションを回収する (無指定=本番、--dry-run でドライラン)",
     )
 
     checkin = subparsers.add_parser(
         "checkin",
         parents=[common, browser, collect],
-        help="チェックインを処理する (デフォルトはドライラン)",
+        help="チェックインを処理する (無指定=本番、--dry-run でドライラン)",
     )
     checkin.add_argument(
         "--daily-budget",
