@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit の設定。デフォルト設定に対する差分だけを記述する。
+reviews:
+  auto_review:
+    # 短時間に多数の commit が積まれた場合の自動 pause を無効化する。
+    # デフォルト 5 だと SDD などで毎 task ごとに push する運用と噛み合わず、
+    # 「Reviews paused」で walkthrough が確定せず終了判定を出せなくなるため。
+    # 0 = 常に review、pause しない。
+    auto_pause_after_reviewed_commits: 0
