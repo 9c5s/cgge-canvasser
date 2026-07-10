@@ -2203,18 +2203,23 @@ def sync_completed_spots(
 
     Args:
         profile_dir: アカウントのプロファイルディレクトリ。
-        server_completed: サーバ側で「済み」と判定された slug 集合。呼び出し側で
-            slug 形式が検証済み (`Spot.from_api` 経由) であることを前提とする。
+        server_completed: サーバ側で「済み」と判定された slug 集合。`Spot.from_api`
+            は slug の形式検証を行わないため、本関数側で `_SPOT_SLUG_RE` に合致
+            しない slug は silent に除外する (境界での防御)。
 
     Returns:
         (added, local_only) の 2 要素タプル。added は今回新規追加した slug の
         昇順リスト、local_only はローカル済みだがサーバ未確認の slug の昇順
         リスト (削除はせず警告表示用に呼び出し側へ渡す)。
     """
+    # サーバ由来 slug は Spot.from_api で形式検証されていないため、ここで弾く。
+    # 不正 slug を state に持ち込むと次回 strict load が StateFileCorruptedError で
+    # 拒否し、以降 run 全体が状態破損扱いで止まる (fail closed)。
+    validated = {s for s in server_completed if _SPOT_SLUG_RE.fullmatch(s)}
     state = load_account_state(profile_dir, strict=True)
     local_completed = set(state.get("completed_spots") or [])
-    added = server_completed - local_completed
-    local_only = local_completed - server_completed
+    added = validated - local_completed
+    local_only = local_completed - validated
     if added:
         merged = local_completed | added
         state["completed_spots"] = sorted(merged)
@@ -3276,6 +3281,11 @@ def _run_sync_one(
         page.goto(CHECKIN_PAGE_URL, wait_until="domcontentloaded")
         if not _ensure_authenticated(page, name, profile_dir, options):
             return 1
+        # auto_relogin 経由の認証は LOGIN_ENTRY_URL の backurl=mission へ飛ばされる
+        # ため、fetch の直前に referer を checkin page へ戻す。既存の checkin 経路
+        # (process_account) も認証後に CHECKIN_PAGE_URL へ再遷移しており、それと
+        # 挙動を揃える。認証済みで既に checkin page にいる場合の再 goto は無害。
+        page.goto(CHECKIN_PAGE_URL, wait_until="domcontentloaded")
         all_spots = _fetch_checkin_spots(page)
         server_completed = {s.slug for s in all_spots if s.is_checkedin}
         added, local_only = sync_completed_spots(profile_dir, server_completed)

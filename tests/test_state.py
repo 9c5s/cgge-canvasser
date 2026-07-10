@@ -398,6 +398,28 @@ class TestSyncCompletedSpots:
 
         assert _state_file(tmp_path).read_text(encoding="utf-8") == "{{{"
 
+    def test_不正な形式のslugは黙って除外する(self, tmp_path: Path) -> None:
+        """サーバ由来の malformed slug は state に持ち込まない (境界での防御)。
+
+        持ち込んでしまうと次回の strict load で `StateFileCorruptedError` に
+        なり、以降 run 全体が状態破損扱いで止まる (fail closed)。
+        """
+        added, local_only = canvasser.sync_completed_spots(
+            tmp_path,
+            {
+                "cg_vote2026_1",
+                "cg_vote2026_9999999",
+                "evil/../path",
+                "future_format_2027_1",
+            },
+        )
+
+        assert added == ["cg_vote2026_1"]
+        assert local_only == []
+        # strict load でも読み戻せる形で保存されている
+        state = canvasser.load_account_state(tmp_path, strict=True)
+        assert state["completed_spots"] == ["cg_vote2026_1"]
+
 
 class TestPrintSyncSummary:
     """_print_sync_summary の表示分岐。"""
