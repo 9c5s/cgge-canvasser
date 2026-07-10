@@ -94,7 +94,7 @@ uv run canvasser.py sync                    # 全アカウント
 uv run canvasser.py sync --account main
 ```
 
-- 副作用は GET のみ (POST/PUT を送らない、ドライラン概念なし)。
+- チェックイン API への副作用は GET のみ (POST/PUT を送らない、ドライラン概念なし)。ただし BNID セッション切れ検知時は自動再ログイン (`--no-auto-relogin` で無効化可能) が動くため、ログイン用 POST は発生し得る。
 - サーバ側「済み」かつローカル未登録の slug を `completed_spots` に**追加のみ**する。ローカル済み・サーバ未確認の slug は削除せず警告表示にとどめる (削除すると再 POST 停止のリスクがあるため)。
 - `checkin` サブコマンドは実行前に同じ判定を自動で行うため、通常は `sync` を単独で叩く必要はない。別デバイス済みの state 反映を先行して確認したいとき、または全アカウント一括で state を揃えたいときに使う。
 

@@ -262,6 +262,20 @@ class TestSpotFromApi:
 
         assert canvasser.Spot.from_api(raw).is_checkedin is False
 
+    def test_is_checkedinがTrueは未達成扱いになる(self) -> None:
+        """`True == 1` を偶発的に真にせず int の 1 のみ「済み」と扱う (厳密比較)。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_status"] = {"is_checkedin": True}
+
+        assert canvasser.Spot.from_api(raw).is_checkedin is False
+
+    def test_is_checkedinが文字列1は未達成扱いになる(self) -> None:
+        """`"1"` のような文字列値も未知値として未達成側に倒す。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_status"] = {"is_checkedin": "1"}
+
+        assert canvasser.Spot.from_api(raw).is_checkedin is False
+
 
 class TestFetchCheckinSpots:
     """_fetch_checkin_spots の応答ハンドリング。"""
