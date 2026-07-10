@@ -169,7 +169,7 @@ class TestUpdateCheckinState:
         """legacy キー付きの state から成功 POST しても、保存結果から消える。
 
         save 側で pop していないと、load → 変更なし → save で残り続けてしまう。
-        silent 無視の契約 (load 側では素通し、save 側で落とす) を保存経路でも
+        silent 無視の契約 (load 側では素通し、save 側で除外する) を保存経路でも
         担保する。
         """
         canvasser.save_account_state(
@@ -217,7 +217,7 @@ class TestResumeContext:
 
         assert got == (None, None, None)
 
-    def test_不正な時刻文字列はresume_atだけ落とす(self, tmp_path: Path) -> None:
+    def test_不正な時刻文字列はresume_atだけ捨てる(self, tmp_path: Path) -> None:
         """virtual_completed_at が読めなくても位置情報は復元する。"""
         canvasser.save_account_state(
             tmp_path,
@@ -255,7 +255,7 @@ class TestResumeContext:
         assert resume_at == datetime(2026, 7, 3, 12, 30, tzinfo=JST)
 
     def test_数値でない座標は非strictでNoneに丸める(self, tmp_path: Path) -> None:
-        """手改変で座標が文字列でも ValueError にせず resume 情報なしに落とす。"""
+        """手改変で座標が文字列でも ValueError にせず resume 情報なしとして扱う。"""
         canvasser.save_account_state(
             tmp_path,
             {

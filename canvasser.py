@@ -154,8 +154,9 @@ def call_api(page: Page, method: str, path: str) -> dict[str, Any]:
 def _as_str_dict(value: object) -> dict[str, Any] | None:
     """与えられた値が dict なら dict[str, Any] とみなして返す。それ以外は None。
 
-    API 応答の body や payload は isinstance で dict に絞ると型引数が Unknown に
-    落ちて pyright strict を通らないため、この関数で絞り込みと cast を束ねる。
+    API 応答の body や payload は isinstance で dict に絞ると型引数が Unknown
+    に推論されて pyright strict を通らないため、この関数で絞り込みと cast を
+    束ねる。
     """
     if isinstance(value, dict):
         return cast("dict[str, Any]", value)
@@ -672,7 +673,7 @@ def _finite_float_in_range_or_none(v: object, lo: float, hi: float) -> float | N
     """有限かつ [lo, hi] 内なら float、それ以外 (bool 含む) は None を返す。
 
     resume 用の緩い経路。手改変で入り込んだ NaN/Infinity/文字列/超巨大 int も
-    安全に落とす。int が float に収まらない (10**400 相当) 場合は
+    安全に除外する。int が float に収まらない (10**400 相当) 場合は
     OverflowError を捕捉して None に丸める。
     """
     if isinstance(v, bool) or not isinstance(v, int | float):
@@ -737,7 +738,7 @@ class Spot:
             raise ValueError(msg)
         # checkin_status は完了スポットにのみ現れ、未達成では dict そのものが
         # 欠落する。API は int の 1 で「済み」を示すため、bool の True や文字列
-        # "1"、その他の型は将来の未知値として未達成側 (False) に倒す
+        # "1"、その他の型は将来の未知値として未達成側 (False) として扱う
         # (type(x) is int は bool を除外する)。
         raw_checkin_status = raw.get("checkin_status")
         raw_is_checkedin = (
@@ -1066,7 +1067,7 @@ class _CheckinRunner:
         ここで skip / fail-closed に落とせば、travel estimation (gmaps API
         呼び出し含む) も実 sleep も避けられる。純粋判定に近い副作用 (print) のみ。
 
-        パース不能 (deadline=None) は本番 (dry_run=False) では fail closed に落として、
+        パース不能 (deadline=None) は本番 (dry_run=False) では fail closed で停止させ、
         サーバ形式変更を早期検知する (個別 skip では気付きにくい)。
         """
         slug = spot.slug
@@ -1599,7 +1600,7 @@ def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
 #
 # 完了済みスポットの判定はサーバ側 `checkin_status.is_checkedin` に一本化されて
 # いる。旧スキーマの `completed_spots` は `load_account_state` が読み込み時に
-# in-memory から落とすため、以降の resume / save 経路には現れない。
+# in-memory から除外するため、以降の resume / save 経路には現れない。
 #
 # 旧版の dry-run 経路も state を書いていたため、last_checkin の中身だけでは実 POST 由来
 # かどうか判別できない。LAST_CHECKIN_SCHEMA_VERSION は「実 POST 成功でだけ
@@ -1724,7 +1725,7 @@ def _reject_json_constant(name: str) -> float:
 
     Python の `json` は既定でこの 3 定数を float に変換する
     (https://docs.python.org/3.14/library/json.html) が、座標として意味を
-    成さないため境界で `ValueError` に落として保存側と併せて閉じる。
+    成さないため境界で `ValueError` を送出して保存側と併せて閉じる。
     """
     msg = f"JSON に非有限値 {name} が含まれる"
     raise ValueError(msg)
@@ -1757,7 +1758,7 @@ def load_account_state(profile_dir: Path, *, strict: bool = False) -> dict[str, 
         return {}
     state = cast("dict[str, Any]", data)
     # 旧スキーマの `completed_spots` は完了判定がサーバ側 `is_checkedin` に
-    # 移った時点で不要になった。読み込み時に in-memory から落とすことで、
+    # 移った時点で不要になった。読み込み時に in-memory から除外することで、
     # 以降 in-memory の state を触る全経路 (resume / save) が自動的に legacy-free
     # になる。dry-run はそもそも save しないためファイル上の残骸はそのまま。
     state.pop("completed_spots", None)
@@ -1770,7 +1771,7 @@ def _atomic_write_json(path: Path, data: object, *, tmp_prefix: str) -> None:
     """`path` に JSON を atomic に書き出す。
 
     一時ファイルへ書いて fsync してから `os.replace` で置換する。書き込み中に
-    クラッシュしても既存ファイルは壊れない。`allow_nan=False` で NaN/Infinity
+    途中で異常終了しても既存ファイルは破損しない。`allow_nan=False` で NaN/Infinity
     の書き出しを ValueError にする (JSON 標準外の拡張出力を state に載せない)。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1911,7 +1912,7 @@ def _load_chrome_master_key(
     except (json.JSONDecodeError, OSError) as e:
         print(f"[warn] {local_state} を読めません: {e}", file=sys.stderr)
         return None
-    # dict の isinstance 絞り込みだけだと型引数が Unknown に落ちるため、
+    # dict の isinstance 絞り込みだけだと型引数が Unknown に推論されるため、
     # 既存の _as_str_dict (dict[str, Any] への絞り込み + cast の共通化) に乗せる。
     raw_dict = _as_str_dict(raw) or {}
     os_crypt = _as_str_dict(raw_dict.get("os_crypt")) or {}
@@ -1958,7 +1959,7 @@ def _read_bnid_login_row(
     空文字、または password_value が bytes 以外なら None を返す (古い有効行
     への fallback はしない)。Chrome は idle 時に Login Data のロックを保持
     しないため通常は即読める。SQLITE_BUSY は timeout 内に解消しない場合のみ
-    発生し、その時も None に倒す。
+    発生し、その時も None を返す。
     """
     login_data = profile_dir / "Default" / "Login Data"
     if not login_data.exists():
@@ -2223,8 +2224,8 @@ def auto_login(
         return AutoLoginOutcome.FORM_ERROR, 0
 
     # click は別 try に分離する。click が起こす navigation を Playwright が待って
-    # timeout した場合、パスワードは既に送信済みの可能性が高い。ここで FORM_ERROR に
-    # 落とすと submit=0 で failure_count が加算されず、無限に BNID にパスワードを
+    # timeout した場合、パスワードは既に送信済みの可能性が高い。ここで FORM_ERROR を
+    # 返すと submit=0 で failure_count が加算されず、無限に BNID にパスワードを
     # 投げ続ける事故になる。`no_wait_after=True` で navigation 待機をそもそも切り、
     # それでも raise した場合は polling に進んで実結果 (SUCCESS/PASSWORD_ERROR/
     # CAPTCHA_DETECTED/TIMEOUT) で分類する (submit=1 で計上)。
@@ -2279,7 +2280,7 @@ def _poll_login_outcome(
 def _relogin_disabled(guard: ReloginGuard, name: str) -> bool:
     """`guard.disabled_until` が未来なら True (自動再ログインをスキップすべき)。
 
-    パース不能や過去時刻は False (=有効) として扱い、fail-safe に倒す。
+    パース不能や過去時刻は False (=有効) として扱い、fail-safe 側で処理する。
     未来なら残時間を stderr に案内する。
     """
     if guard.disabled_until is None:
@@ -2490,7 +2491,8 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
 
     # 初回 check_login が false negative だった場合の救済。cookie が実は有効なら
     # LOGIN_ENTRY_URL は mission page へ戻され、そのまま auto_login すると
-    # #mail が無く FORM_ERROR に落ちて有効 session を潰す。ここで検知して短絡する。
+    # #mail が無く FORM_ERROR に至り、有効 session を無効化してしまう。ここで
+    # 検知して短絡する。
     # check_login は redirect 中に PlaywrightError を投げうるので suppress する
     # (例外が escape すると failure_count 更新前に process_account に飛んでしまう)。
     session_valid = False
@@ -2749,7 +2751,7 @@ def _profiles_dir_is_gitignored(profiles_dir: Path) -> bool:
     match しない。
 
     git repo 外や git 自体が使えない環境では False を返す (誤コミット経路を判定
-    できないため拒否側に倒す)。`git check-ignore --quiet` の exit は 0=ignored、
+    できないため拒否側として扱う)。`git check-ignore --quiet` の exit は 0=ignored、
     1=not ignored、128=error (repo 外)。
     """
     # PATH から git 実体を解決する。S607 対策で partial path を渡さない。
