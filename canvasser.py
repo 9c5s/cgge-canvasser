@@ -738,12 +738,16 @@ class Spot:
             msg = f"checkin_radius が正の値でない: {radius}"
             raise ValueError(msg)
         # checkin_status は完了スポットにのみ現れ、未達成では dict そのものが
-        # 欠落する。将来 is_checkedin=0 の中間状態が来ても未達成と扱う。
+        # 欠落する。API は int の 1 で「済み」を示すため、bool の True や文字列
+        # "1"、その他の型は将来の未知値として未達成側 (False) に倒す
+        # (type(x) is int は bool を除外する)。
         raw_checkin_status = raw.get("checkin_status")
-        is_checkedin = (
-            isinstance(raw_checkin_status, dict)
-            and cast("dict[str, Any]", raw_checkin_status).get("is_checkedin") == 1
+        raw_is_checkedin = (
+            cast("dict[str, Any]", raw_checkin_status).get("is_checkedin")
+            if isinstance(raw_checkin_status, dict)
+            else None
         )
+        is_checkedin = type(raw_is_checkedin) is int and raw_is_checkedin == 1
         return cls(
             slug=str(raw["slug"]),
             name=str(raw.get("name") or ""),
