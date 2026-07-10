@@ -38,8 +38,8 @@ uv run canvasser.py login --account sub
 - Chromium が可視状態で立ち上がる。BNID でログインしてミッションページが表示されると、自動でログインを検知して終了する。
 
 初回ログイン時に BNID フォームでパスワードを入力する際、Chrome の「パスワードを保存しますか?」プロンプトで**保存を選択**する。
-この保存された資格情報は Playwright プロファイル内 (`profiles/{account}/Default/Login Data`) に Windows DPAPI + AES-256-GCM で暗号化されて格納される。
-以降 BNID セッション切れが検知されたときに、自動再ログインの供給源として使われる。
+この保存された資格情報は Playwright プロファイル内 (`profiles/{account}/Default/Login Data`) に暗号化されて格納され、以降 BNID セッション切れが検知されたときに、自動再ログインの供給源として使われる。
+自動再ログインの復号経路は Windows 専用 (`ctypes.windll.crypt32.CryptUnprotectData` 経由の DPAPI + AES-256-GCM) で、macOS / Linux では Chrome 側の暗号化スキームが異なるため利用できない。
 
 ### 日次実行 (ミッション回収、全アカウント)
 
@@ -144,7 +144,7 @@ BNID フォームが出た場合は、Chrome 自動保存の資格情報で突�
 | 未観測 ecode | `consecutive_failures` を加算。`--consecutive-failure-limit` (デフォルト 1) 到達で FailClosedError を送出し全体中断 (fail closed) |
 
 既達成スポットは `checkin` サブコマンドの実行前に `checkin_status.is_checkedin == 1` で検出して事前 skip するため、通常運用では未観測 ecode に突入しない。
-未観測 ecode で止まった場合は、`ECODES_ALREADY_DONE` にその ecode を追加してコミットする (恒常対応)。
+未観測 ecode で止まった場合は、認証切れ・BAN・API 仕様変更・実装不一致などの重大シグナルとして扱う。API 仕様または実レスポンスで「既達成」を意味すると確認できた ecode に限り `ECODES_ALREADY_DONE` に追加し、それ以外は根本原因を調査して直す (無条件で `ECODES_ALREADY_DONE` に足すと本物の障害を「既達成」として恒久的に隠すことになる)。
 
 FailClosedError は `process_account` で捕捉され、`exit_code=1` として返る。
 タスクスケジューラや運用ログ上でも正常終了に見えないよう、nonzero で抜けるようにしている。
