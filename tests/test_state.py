@@ -397,3 +397,52 @@ class TestSyncCompletedSpots:
             canvasser.sync_completed_spots(tmp_path, {"cg_vote2026_1"})
 
         assert _state_file(tmp_path).read_text(encoding="utf-8") == "{{{"
+
+
+class TestPrintSyncSummary:
+    """_print_sync_summary の表示分岐。"""
+
+    def test_追加ありlocal_onlyなしは取り込みメッセージのみ(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """通常の同期成功時は stdout に取り込み件数、stderr は空。"""
+        canvasser._print_sync_summary("main", ["cg_vote2026_1"], [])
+
+        captured = capsys.readouterr()
+        assert "サーバ済みを取り込みました (1件)" in captured.out
+        assert "cg_vote2026_1" in captured.out
+        assert captured.err == ""
+
+    def test_差分なしは一致メッセージを付ける(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """added も local_only も空なら state はサーバと完全一致。"""
+        canvasser._print_sync_summary("main", [], [])
+
+        captured = capsys.readouterr()
+        assert "追加なし (state はサーバと一致)" in captured.out
+        assert captured.err == ""
+
+    def test_追加なしlocal_onlyありは一致メッセージを付けない(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """乖離があるので「一致」とは表示せず、警告を stderr に出す。"""
+        canvasser._print_sync_summary("main", [], ["cg_vote2026_5"])
+
+        captured = capsys.readouterr()
+        assert "追加なし" in captured.out
+        assert "(state はサーバと一致)" not in captured.out
+        assert "ローカル済みだがサーバ未確認 (1件)" in captured.err
+        assert "cg_vote2026_5" in captured.err
+
+    def test_追加ありlocal_onlyありは両方出力する(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """取り込み成功と警告を独立に出せる (どちらも起こりうる)。"""
+        canvasser._print_sync_summary("main", ["cg_vote2026_2"], ["cg_vote2026_5"])
+
+        captured = capsys.readouterr()
+        assert "サーバ済みを取り込みました (1件)" in captured.out
+        assert "cg_vote2026_2" in captured.out
+        assert "ローカル済みだがサーバ未確認 (1件)" in captured.err
+        assert "cg_vote2026_5" in captured.err
