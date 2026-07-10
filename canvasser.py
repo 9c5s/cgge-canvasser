@@ -671,12 +671,17 @@ def _coerce_finite_float(v: object, *, name: str) -> float:
 def _finite_float_in_range_or_none(v: object, lo: float, hi: float) -> float | None:
     """有限かつ [lo, hi] 内なら float、それ以外 (bool 含む) は None を返す。
 
-    resume 用の緩い経路。手改変で入り込んだ NaN/Infinity/文字列も安全に落とす。
+    resume 用の緩い経路。手改変で入り込んだ NaN/Infinity/文字列/超巨大 int も
+    安全に落とす。int が float に収まらない (10**400 相当) 場合は
+    OverflowError を捕捉して None に丸める。
     """
-    if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v):
+    if isinstance(v, bool) or not isinstance(v, int | float):
         return None
-    f = float(v)
-    return f if lo <= f <= hi else None
+    try:
+        f = float(v)
+    except OverflowError:
+        return None
+    return f if math.isfinite(f) and lo <= f <= hi else None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
