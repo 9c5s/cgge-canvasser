@@ -327,67 +327,23 @@ class TestBuildParser:
         assert args.command == "login"
         assert args.account == "main"
 
-    def test_mark_completedはslug位置引数を受け取る(self) -> None:
-        """slug は複数の位置引数として受け取る (カンマ区切りではない)。"""
-        args = canvasser._build_parser().parse_args([
-            "mark-completed",
-            "--account",
-            "syota",
-            "cg_vote2026_17",
-            "cg_vote2026_19",
-        ])
-
-        assert args.command == "mark-completed"
-        assert args.slugs == ["cg_vote2026_17", "cg_vote2026_19"]
-
-    @pytest.mark.parametrize(
-        "argv",
-        [
-            ["mark-completed", "cg_vote2026_17"],
-            ["mark-completed", "--account", "syota"],
-        ],
-    )
-    def test_mark_completedはaccountとslugが必須(self, argv: list[str]) -> None:
-        """--account と slug のどちらが欠けても usage エラーになる。"""
-        with pytest.raises(SystemExit):
-            canvasser._build_parser().parse_args(argv)
-
     def test_サブコマンド無しはSystemExit(self) -> None:
         """サブコマンド必須のため引数なしは usage エラーになる。"""
         with pytest.raises(SystemExit):
             canvasser._build_parser().parse_args([])
 
-    def test_syncの既定引数はaccount未指定でauto_relogin有効(self) -> None:
-        """sync 単独では全アカウント対象・自動再ログイン有効の既定値になる。"""
-        args = canvasser._build_parser().parse_args(["sync"])
+    def test_mark_completedサブコマンドは廃止済みでSystemExit(self) -> None:
+        """旧 CLI の mark-completed は argparse のサブコマンド未定義で拒否される。
 
-        assert args.command == "sync"
-        assert args.account is None
-        assert args.no_auto_relogin is False
-        assert args.profiles_dir == "./profiles"
-
-    def test_syncに_account_を指定できる(self) -> None:
-        """--account を渡すと単一プロファイルに絞れる。"""
-        args = canvasser._build_parser().parse_args(["sync", "--account", "main"])
-
-        assert args.command == "sync"
-        assert args.account == "main"
-
-    def test_syncに_no_auto_relogin_フラグを指定できる(self) -> None:
-        """--no-auto-relogin で auto-relogin をオプトアウトできる。"""
-        args = canvasser._build_parser().parse_args(["sync", "--no-auto-relogin"])
-
-        assert args.no_auto_relogin is True
-
-    def test_syncには_dry_run_フラグは無い(self) -> None:
-        """sync は GET のみで書き込みは追加マージのみのため dry-run 概念を持たない。"""
+        argparse のエラーメッセージ文言 (invalid choice など) には依存しない。
+        """
         with pytest.raises(SystemExit):
-            canvasser._build_parser().parse_args(["sync", "--dry-run"])
+            canvasser._build_parser().parse_args(["mark-completed"])
 
-    def test_syncにはチェックイン専用の安全弁は無い(self) -> None:
-        """--daily-budget などチェックイン専用オプションは sync に載せない。"""
+    def test_syncサブコマンドは廃止済みでSystemExit(self) -> None:
+        """旧 CLI の sync は argparse のサブコマンド未定義で拒否される。"""
         with pytest.raises(SystemExit):
-            canvasser._build_parser().parse_args(["sync", "--daily-budget", "3"])
+            canvasser._build_parser().parse_args(["sync"])
 
 
 class TestBuildRunOptions:
@@ -471,133 +427,3 @@ class TestBuildRunOptions:
         assert options.out_of_range_limit == 5
 
 
-class _FakePlaywrightCtx:
-    """`with sync_playwright() as p:` を通す最小のダミー context manager。"""
-
-    def __enter__(self) -> object:
-        return object()
-
-    def __exit__(self, *_args: object) -> None:
-        return
-
-
-class TestRunSyncAll:
-    """_run_sync_all のアカウント単位エラー分離と exit_code 集約。"""
-
-    def _patch_playwright(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """sync_playwright() を no-op context manager に差し替える。"""
-        monkeypatch.setattr(canvasser, "sync_playwright", _FakePlaywrightCtx)
-
-    def test_全アカウント成功でexit_code_0(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """全アカウントで _run_sync_one が 0 を返すなら exit_code は 0。"""
-        self._patch_playwright(monkeypatch)
-        calls: list[str] = []
-
-        def fake_run_sync_one(
-            _p: object,
-            name: str,
-            _profile_dir: Path,
-            _options: canvasser.RunOptions,
-        ) -> int:
-            calls.append(name)
-            return 0
-
-        monkeypatch.setattr(canvasser, "_run_sync_one", fake_run_sync_one)
-        args = argparse.Namespace(no_auto_relogin=False)
-        profiles = [("alice", tmp_path / "alice"), ("bob", tmp_path / "bob")]
-
-        exit_code = canvasser._run_sync_all(args, profiles)
-
-        assert exit_code == 0
-        assert calls == ["alice", "bob"]
-
-    def test_破損stateアカウントは他アカウントを止めない(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """1 アカウントで StateFileCorruptedError が出ても残りは処理する。"""
-        self._patch_playwright(monkeypatch)
-        calls: list[str] = []
-
-        def fake_run_sync_one(
-            _p: object,
-            name: str,
-            _profile_dir: Path,
-            _options: canvasser.RunOptions,
-        ) -> int:
-            calls.append(name)
-            if name == "alice":
-                raise canvasser.StateFileCorruptedError("test corruption")
-            return 0
-
-        monkeypatch.setattr(canvasser, "_run_sync_one", fake_run_sync_one)
-        args = argparse.Namespace(no_auto_relogin=False)
-        profiles = [("alice", tmp_path / "alice"), ("bob", tmp_path / "bob")]
-
-        exit_code = canvasser._run_sync_all(args, profiles)
-
-        assert exit_code == 1
-        assert calls == ["alice", "bob"]
-        err = capsys.readouterr().err
-        assert "alice" in err
-        assert "破損" in err
-
-    def test_一般例外アカウントも他アカウントを止めない(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """StateFileCorruptedError 以外の Exception でも残りアカウントは継続する。"""
-        self._patch_playwright(monkeypatch)
-        calls: list[str] = []
-
-        def fake_run_sync_one(
-            _p: object,
-            name: str,
-            _profile_dir: Path,
-            _options: canvasser.RunOptions,
-        ) -> int:
-            calls.append(name)
-            if name == "alice":
-                msg = "network down"
-                raise RuntimeError(msg)
-            return 0
-
-        monkeypatch.setattr(canvasser, "_run_sync_one", fake_run_sync_one)
-        args = argparse.Namespace(no_auto_relogin=False)
-        profiles = [("alice", tmp_path / "alice"), ("bob", tmp_path / "bob")]
-
-        exit_code = canvasser._run_sync_all(args, profiles)
-
-        assert exit_code == 1
-        assert calls == ["alice", "bob"]
-        err = capsys.readouterr().err
-        assert "alice" in err
-        assert "network down" in err
-
-    def test_単一per_exit失敗でも全体はexit_code_1(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """_run_sync_one が per_exit=1 を返しただけで全体 exit_code も 1 になる。"""
-        self._patch_playwright(monkeypatch)
-
-        def fake_run_sync_one(
-            _p: object,
-            name: str,
-            _profile_dir: Path,
-            _options: canvasser.RunOptions,
-        ) -> int:
-            return 0 if name == "alice" else 1
-
-        monkeypatch.setattr(canvasser, "_run_sync_one", fake_run_sync_one)
-        args = argparse.Namespace(no_auto_relogin=False)
-        profiles = [("alice", tmp_path / "alice"), ("bob", tmp_path / "bob")]
-
-        exit_code = canvasser._run_sync_all(args, profiles)
-
-        assert exit_code == 1

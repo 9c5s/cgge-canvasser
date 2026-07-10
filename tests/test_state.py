@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import canvasser
-from canvasser import JST, StateFileCorruptedError, UserInputError
+from canvasser import JST, StateFileCorruptedError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -35,7 +35,17 @@ class TestLoadAccountState:
 
     def test_保存した内容をそのまま読み戻せる(self, tmp_path: Path) -> None:
         """save → load のラウンドトリップが成立する。"""
-        state = {"completed_spots": ["cg_vote2026_1"]}
+        state = {
+            "last_checkin": {
+                "schema_version": 2,
+                "spot_slug": "cg_vote2026_1",
+                "spot_name": "テスト",
+                "location_latitude": 35.0,
+                "location_longitude": 135.0,
+                "virtual_completed_at": "2026-07-03T12:30:00+09:00",
+                "real_completed_at": "2026-07-03T03:30:00+00:00",
+            }
+        }
 
         canvasser.save_account_state(tmp_path, state)
 
@@ -70,8 +80,6 @@ class TestLoadAccountState:
     @pytest.mark.parametrize(
         "content, message",
         [
-            ('{"completed_spots": "x"}', "list ではなく"),
-            ('{"completed_spots": ["evil/../path"]}', "不正な slug"),
             ('{"last_checkin": []}', "dict でない"),
             ('{"last_checkin": {"spot_slug": 1}}', "型が不正"),
             ('{"last_checkin": {"spot_slug": "bad_slug"}}', "形式でない"),
@@ -114,7 +122,7 @@ class TestSaveAccountState:
 
     def test_一時ファイルを残さない(self, tmp_path: Path) -> None:
         """書き込み成功後は state ファイル以外の残骸が無い。"""
-        canvasser.save_account_state(tmp_path, {"completed_spots": []})
+        canvasser.save_account_state(tmp_path, {})
 
         names = [p.name for p in tmp_path.iterdir()]
         assert names == ["canvasser_state.json"]
@@ -145,20 +153,30 @@ class TestUpdateCheckinState:
         assert last["location_longitude"] == 135.0
         assert last["virtual_completed_at"] == vnow.isoformat()
 
-    def test_mark_completedで完了リストに追加する(self, tmp_path: Path) -> None:
-        """既定 (mark_completed=True) では completed_spots に slug が入る。"""
+    def test_成功記録はcompleted_spotsを書き出さない(self, tmp_path: Path) -> None:
+        """save 後の state に legacy な completed_spots キーが現れないこと。"""
         vnow = datetime(2026, 7, 3, 12, 30, tzinfo=JST)
 
         canvasser.update_checkin_state(tmp_path, _spot(), vnow)
 
         state = canvasser.load_account_state(tmp_path)
-        assert state["completed_spots"] == ["cg_vote2026_7"]
+        assert "completed_spots" not in state
 
-    def test_mark_completed_Falseは完了リストに触れない(self, tmp_path: Path) -> None:
-        """mark_completed=False では completed_spots を追加しない。"""
+    def test_既存のcompleted_spotsキーは成功保存で消える(
+        self, tmp_path: Path
+    ) -> None:
+        """legacy キー付きの state から成功 POST しても、保存結果から消える。
+
+        save 側で pop していないと、load → 変更なし → save で残り続けてしまう。
+        silent 無視の契約 (load 側では素通し、save 側で落とす) を保存経路でも
+        担保する。
+        """
+        canvasser.save_account_state(
+            tmp_path, {"completed_spots": ["cg_vote2026_1"]}
+        )
         vnow = datetime(2026, 7, 3, 12, 30, tzinfo=JST)
 
-        canvasser.update_checkin_state(tmp_path, _spot(), vnow, mark_completed=False)
+        canvasser.update_checkin_state(tmp_path, _spot(), vnow)
 
         state = canvasser.load_account_state(tmp_path)
         assert "completed_spots" not in state
@@ -174,11 +192,10 @@ class TestResumeContext:
         vnow = datetime(2026, 7, 3, 12, 30, tzinfo=JST)
         canvasser.update_checkin_state(tmp_path, _spot(), vnow)
 
-        lat, lng, resume_at, completed = canvasser.resume_context(tmp_path)
+        lat, lng, resume_at = canvasser.resume_context(tmp_path)
 
         assert (lat, lng) == (35.0, 135.0)
         assert resume_at == vnow
-        assert completed == {"cg_vote2026_7"}
 
     def test_schema_version不一致の記録はresumeに使わない(self, tmp_path: Path) -> None:
         """旧 schema (dry-run 由来の疑い) は位置・時刻とも無視する。"""
@@ -192,14 +209,12 @@ class TestResumeContext:
                     "location_longitude": 135.0,
                     "virtual_completed_at": "2026-07-03T12:30:00+09:00",
                 },
-                "completed_spots": ["cg_vote2026_2"],
             },
         )
 
-        lat, lng, resume_at, completed = canvasser.resume_context(tmp_path)
+        got = canvasser.resume_context(tmp_path)
 
-        assert (lat, lng, resume_at) == (None, None, None)
-        assert completed == {"cg_vote2026_2"}
+        assert got == (None, None, None)
 
     def test_不正な時刻文字列はresume_atだけ落とす(self, tmp_path: Path) -> None:
         """virtual_completed_at が読めなくても位置情報は復元する。"""
@@ -215,11 +230,10 @@ class TestResumeContext:
             },
         )
 
-        lat, lng, resume_at, completed = canvasser.resume_context(tmp_path)
+        lat, lng, resume_at = canvasser.resume_context(tmp_path)
 
         assert (lat, lng) == (35.0, 135.0)
         assert resume_at is None
-        assert completed == set()
 
     def test_naiveな時刻文字列はJSTとして復元する(self, tmp_path: Path) -> None:
         """virtual_completed_at に tz が無ければ JST を付与して読み込む。"""
@@ -235,7 +249,7 @@ class TestResumeContext:
             },
         )
 
-        _lat, _lng, resume_at, _completed = canvasser.resume_context(tmp_path)
+        _lat, _lng, resume_at = canvasser.resume_context(tmp_path)
 
         assert resume_at == datetime(2026, 7, 3, 12, 30, tzinfo=JST)
 
@@ -253,7 +267,7 @@ class TestResumeContext:
             },
         )
 
-        lat, lng, _resume_at, _completed = canvasser.resume_context(tmp_path)
+        lat, lng, _resume_at = canvasser.resume_context(tmp_path)
 
         assert lat is None
         assert lng == 135.0
@@ -272,15 +286,15 @@ class TestResumeContext:
             },
         )
 
-        lat, lng, _resume_at, _completed = canvasser.resume_context(tmp_path)
+        lat, lng, _resume_at = canvasser.resume_context(tmp_path)
 
         assert lat is None
         assert lng is None
 
     def test_stateが無ければ全て空(self, tmp_path: Path) -> None:
-        """初回実行相当では位置・時刻・完了集合すべて空になる。"""
+        """初回実行相当では位置・時刻ともに空になる。"""
         got = canvasser.resume_context(tmp_path)
-        assert got == (None, None, None, set())
+        assert got == (None, None, None)
 
     def test_strictでは破損stateの例外が伝播する(self, tmp_path: Path) -> None:
         """本番経路相当の strict=True では破損を丸めず例外を上げる。"""
@@ -289,190 +303,31 @@ class TestResumeContext:
         with pytest.raises(StateFileCorruptedError, match="canvasser_state"):
             canvasser.resume_context(tmp_path, strict=True)
 
+    def test_legacy_completed_spotsはstrict_loadを通す(self, tmp_path: Path) -> None:
+        """旧スキーマの completed_spots (不正 slug 含む) を silent 無視して load する。
 
-class TestMarkSpotsCompleted:
-    """mark_spots_completed の手動登録。"""
-
-    def test_slugを辞書順で追記する(self, tmp_path: Path) -> None:
-        """既存の completed_spots とマージして辞書順 (文字列順) で保存する。
-
-        ソートは差分の読みやすさのための決定的順序であり、数値としての昇順
-        (3 → 5 → 10) は仕様ではない。
+        `_validate_completed_spots` を廃止しても strict load が通ることを担保する。
+        値の内容は resume には使わないので、後続の走行対象にも影響しない。
         """
-        canvasser.save_account_state(tmp_path, {"completed_spots": ["cg_vote2026_5"]})
-
-        canvasser.mark_spots_completed(tmp_path, ["cg_vote2026_3", "cg_vote2026_10"])
-
-        state = canvasser.load_account_state(tmp_path)
-        assert state["completed_spots"] == [
-            "cg_vote2026_10",
-            "cg_vote2026_3",
-            "cg_vote2026_5",
-        ]
-
-    def test_不正なslugはUserInputError(self, tmp_path: Path) -> None:
-        """slug 形式違反は state を書かずに UserInputError で拒否する。"""
-        with pytest.raises(UserInputError, match="不正な spot_slug"):
-            canvasser.mark_spots_completed(tmp_path, ["../../etc/passwd"])
-
-        assert not _state_file(tmp_path).exists()
-
-    def test_破損stateには追記しない(self, tmp_path: Path) -> None:
-        """既存 state が破損していれば上書きせず例外を伝播する。"""
-        _state_file(tmp_path).write_text("{{{", encoding="utf-8")
-
-        with pytest.raises(StateFileCorruptedError, match="canvasser_state"):
-            canvasser.mark_spots_completed(tmp_path, ["cg_vote2026_1"])
-
-        assert _state_file(tmp_path).read_text(encoding="utf-8") == "{{{"
-
-
-class TestSyncCompletedSpots:
-    """sync_completed_spots のサーバ完了状態マージ。"""
-
-    def test_サーバ側新規は追加され差分が返る(self, tmp_path: Path) -> None:
-        """サーバ済み・ローカル未登録の slug が completed_spots に足される。"""
-        canvasser.save_account_state(tmp_path, {"completed_spots": ["cg_vote2026_1"]})
-
-        added, local_only = canvasser.sync_completed_spots(
-            tmp_path, {"cg_vote2026_1", "cg_vote2026_2"}
-        )
-
-        assert added == ["cg_vote2026_2"]
-        assert local_only == []
-        state = canvasser.load_account_state(tmp_path)
-        assert state["completed_spots"] == ["cg_vote2026_1", "cg_vote2026_2"]
-
-    def test_ローカル済みサーバ未確認は削除せず警告として返す(
-        self, tmp_path: Path
-    ) -> None:
-        """乖離は削除ではなく警告に留める (再 POST → 未観測 ecode 停止を避ける)。"""
         canvasser.save_account_state(
-            tmp_path, {"completed_spots": ["cg_vote2026_1", "cg_vote2026_5"]}
-        )
-
-        added, local_only = canvasser.sync_completed_spots(tmp_path, {"cg_vote2026_1"})
-
-        assert added == []
-        assert local_only == ["cg_vote2026_5"]
-        state = canvasser.load_account_state(tmp_path)
-        assert state["completed_spots"] == ["cg_vote2026_1", "cg_vote2026_5"]
-
-    def test_一致していれば書き込みしない(self, tmp_path: Path) -> None:
-        """サーバとローカルが完全一致なら state ファイルを触らない。"""
-        canvasser.save_account_state(tmp_path, {"completed_spots": ["cg_vote2026_1"]})
-        before = _state_file(tmp_path).stat().st_mtime_ns
-
-        added, local_only = canvasser.sync_completed_spots(tmp_path, {"cg_vote2026_1"})
-
-        assert added == []
-        assert local_only == []
-        assert _state_file(tmp_path).stat().st_mtime_ns == before
-
-    def test_state未作成でも新規に取り込める(self, tmp_path: Path) -> None:
-        """初回同期でも空 state からサーバ済み集合を書き起こせる。"""
-        added, local_only = canvasser.sync_completed_spots(
-            tmp_path, {"cg_vote2026_1", "cg_vote2026_3"}
-        )
-
-        assert added == ["cg_vote2026_1", "cg_vote2026_3"]
-        assert local_only == []
-        state = canvasser.load_account_state(tmp_path)
-        assert state["completed_spots"] == ["cg_vote2026_1", "cg_vote2026_3"]
-
-    def test_サーバ空集合はローカルのみ警告になる(self, tmp_path: Path) -> None:
-        """サーバから何も帰らない状態でもローカル済みは削除しない。"""
-        canvasser.save_account_state(tmp_path, {"completed_spots": ["cg_vote2026_2"]})
-
-        added, local_only = canvasser.sync_completed_spots(tmp_path, set())
-
-        assert added == []
-        assert local_only == ["cg_vote2026_2"]
-
-    def test_破損stateには書き込まず例外を伝播する(self, tmp_path: Path) -> None:
-        """破損 state を空 dict で上書きしない (mark_spots_completed と同じ扱い)。"""
-        _state_file(tmp_path).write_text("{{{", encoding="utf-8")
-
-        with pytest.raises(StateFileCorruptedError, match="canvasser_state"):
-            canvasser.sync_completed_spots(tmp_path, {"cg_vote2026_1"})
-
-        assert _state_file(tmp_path).read_text(encoding="utf-8") == "{{{"
-
-    def test_不正な形式のslugは警告付きで除外する(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """サーバ由来の malformed slug は state に持ち込まない (境界での防御)。
-
-        持ち込んでしまうと次回の strict load で `StateFileCorruptedError` に
-        なり、以降 run 全体が状態破損扱いで止まる (fail closed)。schema drift
-        の観測性を確保するため stderr にも警告を出す。
-        """
-        added, local_only = canvasser.sync_completed_spots(
             tmp_path,
             {
-                "cg_vote2026_1",
-                "cg_vote2026_9999999",
-                "evil/../path",
-                "future_format_2027_1",
+                "last_checkin": {
+                    "schema_version": 2,
+                    "spot_slug": "cg_vote2026_1",
+                    "spot_name": "テスト",
+                    "location_latitude": 35.0,
+                    "location_longitude": 135.0,
+                    "virtual_completed_at": "2026-07-03T12:30:00+09:00",
+                    "real_completed_at": "2026-07-03T03:30:00+00:00",
+                },
+                "completed_spots": ["evil/../path", "cg_vote2026_1"],
             },
         )
 
-        assert added == ["cg_vote2026_1"]
-        assert local_only == []
-        # strict load でも読み戻せる形で保存されている
-        state = canvasser.load_account_state(tmp_path, strict=True)
-        assert state["completed_spots"] == ["cg_vote2026_1"]
-        # stderr に不正 slug の警告が出る (schema drift の観測性)
-        err = capsys.readouterr().err
-        assert "不正な slug 形式" in err
-        assert "evil/../path" in err
-        assert "future_format_2027_1" in err
+        lat, lng, resume_at = canvasser.resume_context(tmp_path, strict=True)
+
+        assert (lat, lng) == (35.0, 135.0)
+        assert resume_at == datetime(2026, 7, 3, 12, 30, tzinfo=JST)
 
 
-class TestPrintSyncSummary:
-    """_print_sync_summary の表示分岐。"""
-
-    def test_追加ありlocal_onlyなしは取り込みメッセージのみ(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """通常の同期成功時は stdout に取り込み件数、stderr は空。"""
-        canvasser._print_sync_summary("main", ["cg_vote2026_1"], [])
-
-        captured = capsys.readouterr()
-        assert "サーバ済みを取り込みました (1件)" in captured.out
-        assert "cg_vote2026_1" in captured.out
-        assert captured.err == ""
-
-    def test_差分なしは一致メッセージを付ける(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """added も local_only も空なら state はサーバと完全一致。"""
-        canvasser._print_sync_summary("main", [], [])
-
-        captured = capsys.readouterr()
-        assert "追加なし (state はサーバと一致)" in captured.out
-        assert captured.err == ""
-
-    def test_追加なしlocal_onlyありは一致メッセージを付けない(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """乖離があるので「一致」とは表示せず、警告を stderr に出す。"""
-        canvasser._print_sync_summary("main", [], ["cg_vote2026_5"])
-
-        captured = capsys.readouterr()
-        assert "追加なし" in captured.out
-        assert "(state はサーバと一致)" not in captured.out
-        assert "ローカル済みだがサーバ未確認 (1件)" in captured.err
-        assert "cg_vote2026_5" in captured.err
-
-    def test_追加ありlocal_onlyありは両方出力する(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """取り込み成功と警告を独立に出せる (どちらも起こりうる)。"""
-        canvasser._print_sync_summary("main", ["cg_vote2026_2"], ["cg_vote2026_5"])
-
-        captured = capsys.readouterr()
-        assert "サーバ済みを取り込みました (1件)" in captured.out
-        assert "cg_vote2026_2" in captured.out
-        assert "ローカル済みだがサーバ未確認 (1件)" in captured.err
-        assert "cg_vote2026_5" in captured.err
