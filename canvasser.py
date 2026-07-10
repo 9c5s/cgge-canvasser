@@ -3248,7 +3248,11 @@ def _print_sync_summary(name: str, added: list[str], local_only: list[str]) -> N
     if added:
         print(f"[{name}] サーバ済みを取り込みました ({len(added)}件): {added}")
     else:
-        print(f"[{name}] 追加なし (state はサーバと一致)")
+        # local_only があると「サーバ側で未確認の slug が残っている乖離状態」なので
+        # 「サーバと一致」とは言えない。乖離時はサフィックスを付けずに「追加なし」だけ
+        # 出し、詳細は下の警告出力に委ねる。
+        match_suffix = " (state はサーバと一致)" if not local_only else ""
+        print(f"[{name}] 追加なし{match_suffix}")
     if local_only:
         print(
             f"[{name}] 警告: ローカル済みだがサーバ未確認 ({len(local_only)}件): "
