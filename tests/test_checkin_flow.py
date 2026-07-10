@@ -55,6 +55,22 @@ def _typed(
     return canvasser.Spot.from_api(_spot(num, lat, lng, deadline))
 
 
+def _spot_done(
+    num: int,
+    lat: float,
+    lng: float,
+    deadline: str = "2026-12-31 23:59:59",
+) -> dict[str, Any]:
+    """サーバ側で checkin_status.is_checkedin==1 の spot dict を組み立てる。"""
+    raw = _spot(num, lat, lng, deadline)
+    raw["checkin_status"] = {
+        "is_checkedin": 1,
+        "checkedin_count": 1,
+        "checkedin_at": [f"2026-07-01 12:0{num % 10}:00"],
+    }
+    return raw
+
+
 def _listing(spots: list[dict[str, Any]]) -> dict[str, Any]:
     """スポット一覧 GET の成功応答を組み立てる。"""
     return success_response({"spots": spots})
@@ -215,6 +231,37 @@ class TestSpotFromApi:
 
         assert canvasser.Spot.from_api(raw).radius == 500.0
 
+    def test_checkin_status_is_checkedin_1で済み扱いになる(self) -> None:
+        """完了スポットに付く checkin_status.is_checkedin==1 を Spot に集約する。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_status"] = {
+            "is_checkedin": 1,
+            "checkedin_count": 1,
+            "checkedin_at": ["2026-07-02 16:31:14"],
+        }
+
+        assert canvasser.Spot.from_api(raw).is_checkedin is True
+
+    def test_checkin_status欠落は未達成扱いになる(self) -> None:
+        """未チェックインでは checkin_status キーごと欠落する API 実装に合わせる。"""
+        raw = _spot(1, 35.0, 135.0)
+
+        assert canvasser.Spot.from_api(raw).is_checkedin is False
+
+    def test_checkin_status_is_checkedin_0は未達成扱いになる(self) -> None:
+        """将来 is_checkedin=0 の中間状態が来ても未達成側に倒す (防御)。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_status"] = {"is_checkedin": 0}
+
+        assert canvasser.Spot.from_api(raw).is_checkedin is False
+
+    def test_checkin_statusがdict以外なら未達成扱いになる(self) -> None:
+        """checkin_status に null や真偽値が入っても型で拒否して未達成扱いにする。"""
+        raw = _spot(1, 35.0, 135.0)
+        raw["checkin_status"] = None
+
+        assert canvasser.Spot.from_api(raw).is_checkedin is False
+
 
 class TestFetchCheckinSpots:
     """_fetch_checkin_spots の応答ハンドリング。"""
@@ -256,6 +303,65 @@ class TestPartitionSpots:
 
         assert remaining == spots
         assert skipped == 0
+
+
+class TestMergeServerCompleted:
+    """_merge_server_completed のサーバ完了状態マージ。"""
+
+    def test_サーバ済みなしならstateも集合も触らない(self, tmp_path: Path) -> None:
+        """全 spot が未達成なら state を書かず入力の completed_spots をそのまま返す。"""
+        spots = [_typed(1, 35.0, 135.0), _typed(2, 35.1, 135.0)]
+
+        got = canvasser._merge_server_completed(
+            _settings(dry_run=False, profile_dir=tmp_path),
+            spots,
+            {"cg_vote2026_5"},
+        )
+
+        assert got == {"cg_vote2026_5"}
+        assert not (tmp_path / "canvasser_state.json").exists()
+
+    def test_本番はサーバ済みをstateにも書きunion集合を返す(
+        self, tmp_path: Path
+    ) -> None:
+        """本番経路ではサーバ済みが sync_completed_spots で state に反映される。"""
+        server_done = canvasser.Spot.from_api(_spot_done(1, 35.0, 135.0))
+        pending = _typed(2, 35.1, 135.0)
+
+        got = canvasser._merge_server_completed(
+            _settings(dry_run=False, profile_dir=tmp_path),
+            [server_done, pending],
+            set(),
+        )
+
+        assert got == {"cg_vote2026_1"}
+        state = canvasser.load_account_state(tmp_path)
+        assert state["completed_spots"] == ["cg_vote2026_1"]
+
+    def test_dryrunはstateを書かずunion集合だけを返す(self, tmp_path: Path) -> None:
+        """dry-run では state を書かず skip 集合にのみ server_completed を反映する。"""
+        server_done = canvasser.Spot.from_api(_spot_done(1, 35.0, 135.0))
+
+        got = canvasser._merge_server_completed(
+            _settings(dry_run=True, profile_dir=tmp_path),
+            [server_done],
+            set(),
+        )
+
+        assert got == {"cg_vote2026_1"}
+        assert not (tmp_path / "canvasser_state.json").exists()
+
+    def test_profile_dir_Noneでもunion集合は返す(self) -> None:
+        """state 未設定 (テスト用途) でも skip 集合には server_completed を反映する。"""
+        server_done = canvasser.Spot.from_api(_spot_done(1, 35.0, 135.0))
+
+        got = canvasser._merge_server_completed(
+            _settings(dry_run=False, profile_dir=None),
+            [server_done],
+            set(),
+        )
+
+        assert got == {"cg_vote2026_1"}
 
 
 class TestInitialVirtualNow:
@@ -658,6 +764,23 @@ class TestCollectCheckinsDryRun:
                 _as_page(fake), _settings(dry_run=False, profile_dir=tmp_path)
             )
 
+    def test_dryrunでもサーバ済みspotは事前skipするがstateは触らない(
+        self, tmp_path: Path
+    ) -> None:
+        """dry-run で is_checkedin の spot が skip され、state ファイルは作られない。"""
+        random.seed(0)
+        # spot1 は既にサーバで済み、spot2 のみ dry-run で見込み計上する
+        fake = FakePage([
+            _listing([_spot_done(1, 35.00, 135.0), _spot(2, 35.01, 135.0)])
+        ])
+
+        gained = canvasser.collect_checkins(
+            _as_page(fake), _settings(dry_run=True, profile_dir=tmp_path)
+        )
+
+        assert gained == 10
+        assert not (tmp_path / "canvasser_state.json").exists()
+
 
 _POST_OK: dict[str, Any] = success_response()
 
@@ -688,6 +811,26 @@ class TestCollectCheckinsProduction:
         # 1 件目の滞在と 2 件目への移動で実待機が発生している
         assert len(sleeps) == 2
         assert all(s > 0 for s in sleeps)
+
+    def test_サーバ済みspotは事前skipしstateにも取り込む(self, tmp_path: Path) -> None:
+        """is_checkedin の spot は事前 skip され state.completed_spots にも入る。"""
+        random.seed(0)
+        # spot1 は既にサーバで済み、spot2 のみ実 POST する
+        fake = FakePage([
+            _listing([_spot_done(1, 35.00, 135.0), _spot(2, 35.01, 135.0)]),
+            _POST_OK,
+        ])
+
+        gained = canvasser.collect_checkins(
+            _as_page(fake), _settings(dry_run=False, profile_dir=tmp_path)
+        )
+
+        # spot2 の 1 件のみ実 POST 成功 = 10 票
+        assert gained == 10
+        # listing GET + POST 1 件で、spot1 への再 POST は発生しない
+        assert len(fake.calls) == 2
+        state = canvasser.load_account_state(tmp_path)
+        assert state["completed_spots"] == ["cg_vote2026_1", "cg_vote2026_2"]
 
     def test_daily_budgetが実POST試行を打ち切る(self, tmp_path: Path) -> None:
         """daily_budget=1 では実 POST を 1 件だけ送って停止する。"""

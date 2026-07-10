@@ -357,6 +357,38 @@ class TestBuildParser:
         with pytest.raises(SystemExit):
             canvasser._build_parser().parse_args([])
 
+    def test_syncの既定引数はaccount未指定でauto_relogin有効(self) -> None:
+        """sync 単独では全アカウント対象・自動再ログイン有効の既定値になる。"""
+        args = canvasser._build_parser().parse_args(["sync"])
+
+        assert args.command == "sync"
+        assert args.account is None
+        assert args.no_auto_relogin is False
+        assert args.profiles_dir == "./profiles"
+
+    def test_syncに_account_を指定できる(self) -> None:
+        """--account を渡すと単一プロファイルに絞れる。"""
+        args = canvasser._build_parser().parse_args(["sync", "--account", "main"])
+
+        assert args.command == "sync"
+        assert args.account == "main"
+
+    def test_syncに_no_auto_relogin_フラグを指定できる(self) -> None:
+        """--no-auto-relogin で auto-relogin をオプトアウトできる。"""
+        args = canvasser._build_parser().parse_args(["sync", "--no-auto-relogin"])
+
+        assert args.no_auto_relogin is True
+
+    def test_syncには_dry_run_フラグは無い(self) -> None:
+        """sync は GET のみで書き込みは追加マージのみのため dry-run 概念を持たない。"""
+        with pytest.raises(SystemExit):
+            canvasser._build_parser().parse_args(["sync", "--dry-run"])
+
+    def test_syncにはチェックイン専用の安全弁は無い(self) -> None:
+        """--daily-budget などチェックイン専用オプションは sync に載せない。"""
+        with pytest.raises(SystemExit):
+            canvasser._build_parser().parse_args(["sync", "--daily-budget", "3"])
+
 
 class TestBuildRunOptions:
     """_build_run_options の RunOptions への写像。"""

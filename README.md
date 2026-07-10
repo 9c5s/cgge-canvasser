@@ -85,9 +85,22 @@ mission と checkin にのみ効く自動再ログイン制御:
 
 - `--no-auto-relogin`：Chrome 自動保存の BNID 資格情報が読める場合でも自動再ログインを行わない。手動運用に戻したいときや、疑わしいログイン失敗を追跡したいときにだけ使う。
 
-### 既に消化済みスポットを state に手動登録
+### サーバ側チェックイン状況を state に取り込む (sync)
 
-state.json の `completed_spots` に外部で成功済みのスポットを追加できる。実 POST 前に既知の消化分を入れておくと、初回起動で未観測 ecode に突入して停止する事故を避けられる。
+別デバイスや手動 UI 操作で先にチェックインした分をローカル `state.json` に自動反映する。既達成スポットへの無駄な再 POST → 未観測 ecode → fail closed 停止を防ぐ。
+
+```powershell
+uv run canvasser.py sync                    # 全アカウント
+uv run canvasser.py sync --account main
+```
+
+- 副作用は GET のみ (POST/PUT を送らない、ドライラン概念なし)。
+- サーバ側「済み」かつローカル未登録の slug を `completed_spots` に**追加のみ**する。ローカル済み・サーバ未確認の slug は削除せず警告表示にとどめる (削除すると再 POST 停止のリスクがあるため)。
+- `checkin` サブコマンドは実行前に同じ判定を自動で行うため、通常は `sync` を単独で叩く必要はない。別デバイス済みの state 反映を先行して確認したいとき、または全アカウント一括で state を揃えたいときに使う。
+
+### 既に消化済みスポットを state に手動登録 (mark-completed)
+
+サーバから読み取れないケース (`sync` の読み取り実装が壊れた、API スキーマ変更で判定が効かないなど) の手動エスケープハッチとして残している。通常運用では `sync` (または `checkin` の自動同期) を使う。
 
 ```powershell
 uv run canvasser.py mark-completed --account syota cg_vote2026_17 cg_vote2026_19
@@ -123,15 +136,16 @@ Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trig
 
 `GET /checkins/event/cg_vote2026` で全 51 スポットの座標を取得し、次の順で処理する。
 
-1. **前回位置から再開**：`state.json` に保存された位置に最も近い未達成スポットを起点にする。state がなければランダム。
-2. **最近傍法で巡回順を決定**：現在地から Haversine 距離が最小の未達成スポットへ順次移動する (greedy TSP 近似)。
-3. **移動時間を反映**：
+1. **サーバ済みを事前 skip**：応答中の `checkin_status.is_checkedin == 1` を持つスポットは既達成として skip する。本番実行時は `state.completed_spots` にも自動反映される (`sync` サブコマンドと同じ経路)。
+2. **前回位置から再開**：`state.json` に保存された位置に最も近い未達成スポットを起点にする。state がなければランダム。
+3. **最近傍法で巡回順を決定**：現在地から Haversine 距離が最小の未達成スポットへ順次移動する (greedy TSP 近似)。
+4. **移動時間を反映**：
    - `GMAPS_KEY` があれば Google Maps Directions API を呼び、`departure_time` に仮想現在時刻を渡す。`mode=transit` は始発待ちを含む実運行時刻ベースの duration が返る。経路が無い場合 (深夜帯や公共交通が届かない場所) は `mode=driving` にフォールバックし、`duration_in_traffic` が取れれば交通量反映の所要時間、無ければ `duration` の距離ベース所要時間を採用する。
    - なければ Haversine と距離レンジ別平均速度で下限を推定する。
-4. **深夜帯 (24:00-06:00) は移動不可**：`next_arrival_time` で「今日中に到着できない旅は翌朝 06:00 発へ押し戻す」を強制する。ただし `gmaps-transit` の結果には運行時刻が含まれているので押し戻しは行わない。稼働枠 (06:00-24:00 の 18 時間) を超える長旅も夜行便等の連続移動として押し戻さずそのまま加算する。
-5. **スポットで滞在**：10〜30 分をランダムに滞在してから次スポットへ移る (最終スポットや `daily-budget` 到達時は滞在を省く)。
-6. **座標を自然化**：スポット中心から `checkin_radius * 0.85` 内の円内ランダム点を選ぶ。accuracy は正規分布 μ=18m σ=6m に 15% の外れ値を混ぜ、altitude は 20% の確率で 5〜80m を割り当てる。
-7. **AES 暗号化して POST**：`AES-CBC(PBKDF2(API_KEY, salt=r16, iter=500, sha1, keySize=32B), iv=r16)` で座標 JSON を暗号化し、`Content-Type: application/x-www-form-urlencoded` で `{salt_hex},{iv_hex},{ct_base64}` 形式を送信する。
+5. **深夜帯 (24:00-06:00) は移動不可**：`next_arrival_time` で「今日中に到着できない旅は翌朝 06:00 発へ押し戻す」を強制する。ただし `gmaps-transit` の結果には運行時刻が含まれているので押し戻しは行わない。稼働枠 (06:00-24:00 の 18 時間) を超える長旅も夜行便等の連続移動として押し戻さずそのまま加算する。
+6. **スポットで滞在**：10〜30 分をランダムに滞在してから次スポットへ移る (最終スポットや `daily-budget` 到達時は滞在を省く)。
+7. **座標を自然化**：スポット中心から `checkin_radius * 0.85` 内の円内ランダム点を選ぶ。accuracy は正規分布 μ=18m σ=6m に 15% の外れ値を混ぜ、altitude は 20% の確率で 5〜80m を割り当てる。
+8. **AES 暗号化して POST**：`AES-CBC(PBKDF2(API_KEY, salt=r16, iter=500, sha1, keySize=32B), iv=r16)` で座標 JSON を暗号化し、`Content-Type: application/x-www-form-urlencoded` で `{salt_hex},{iv_hex},{ct_base64}` 形式を送信する。
 
 ### エラー分類 (チェックイン POST)
 
@@ -142,10 +156,11 @@ Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trig
 | `ECODES_ALREADY_DONE` (初期値は空 tuple) | 実観測で意味を確定した ecode のみを追加する。追加後は既達成扱いで skip |
 | 未観測 ecode | `consecutive_failures` を加算。`--consecutive-failure-limit` (デフォルト 1) 到達で FailClosedError を送出し全体中断 (fail closed) |
 
-初回実行時は既達成に相当する ecode をまだ観測できていないため、既達成スポットを踏むと未観測 ecode として即停止する。停止時のログで ecode・body・UI 表示を確認し、意味が「サーバ側では成功済み (次回以降は skip してよい)」だと判断できた場合の対応は次のとおり。
+既達成スポットは `checkin` サブコマンドの実行前に `checkin_status.is_checkedin == 1` で検出して事前 skip するため、通常運用では未観測 ecode に突入しない。もし別デバイスや UI 経由での消化が state に反映されずに未観測 ecode で止まった場合の対応は次のとおり。
 
-1. `mark-completed --account NAME cg_vote2026_19` (実 slug 形式) で state に流し込んで再実行する (単発対応)。
-2. `ECODES_ALREADY_DONE` にその ecode を追加してコミットする (恒常対応)。
+1. `sync --account NAME` を走らせてサーバの実状況を state に取り込んでから再実行する (自動同期、通常はこれで解決)。
+2. `mark-completed --account NAME cg_vote2026_19` (実 slug 形式) で手動流し込みして再実行する (`sync` の読み取り実装が壊れているときのエスケープハッチ)。
+3. `ECODES_ALREADY_DONE` にその ecode を追加してコミットする (恒常対応、`sync` を経由せずに走らせたい場面向け)。
 
 FailClosedError は `process_account` で捕捉され、`exit_code=1` として返る。タスクスケジューラや運用ログ上でも正常終了に見えないよう nonzero で抜ける仕様になっている。
 

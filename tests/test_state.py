@@ -325,3 +325,75 @@ class TestMarkSpotsCompleted:
             canvasser.mark_spots_completed(tmp_path, ["cg_vote2026_1"])
 
         assert _state_file(tmp_path).read_text(encoding="utf-8") == "{{{"
+
+
+class TestSyncCompletedSpots:
+    """sync_completed_spots のサーバ完了状態マージ。"""
+
+    def test_サーバ側新規は追加され差分が返る(self, tmp_path: Path) -> None:
+        """サーバ済み・ローカル未登録の slug が completed_spots に足される。"""
+        canvasser.save_account_state(tmp_path, {"completed_spots": ["cg_vote2026_1"]})
+
+        added, local_only = canvasser.sync_completed_spots(
+            tmp_path, {"cg_vote2026_1", "cg_vote2026_2"}
+        )
+
+        assert added == ["cg_vote2026_2"]
+        assert local_only == []
+        state = canvasser.load_account_state(tmp_path)
+        assert state["completed_spots"] == ["cg_vote2026_1", "cg_vote2026_2"]
+
+    def test_ローカル済みサーバ未確認は削除せず警告として返す(
+        self, tmp_path: Path
+    ) -> None:
+        """乖離は削除ではなく警告に留める (再 POST → 未観測 ecode 停止を避ける)。"""
+        canvasser.save_account_state(
+            tmp_path, {"completed_spots": ["cg_vote2026_1", "cg_vote2026_5"]}
+        )
+
+        added, local_only = canvasser.sync_completed_spots(tmp_path, {"cg_vote2026_1"})
+
+        assert added == []
+        assert local_only == ["cg_vote2026_5"]
+        state = canvasser.load_account_state(tmp_path)
+        assert state["completed_spots"] == ["cg_vote2026_1", "cg_vote2026_5"]
+
+    def test_一致していれば書き込みしない(self, tmp_path: Path) -> None:
+        """サーバとローカルが完全一致なら state ファイルを触らない。"""
+        canvasser.save_account_state(tmp_path, {"completed_spots": ["cg_vote2026_1"]})
+        before = _state_file(tmp_path).stat().st_mtime_ns
+
+        added, local_only = canvasser.sync_completed_spots(tmp_path, {"cg_vote2026_1"})
+
+        assert added == []
+        assert local_only == []
+        assert _state_file(tmp_path).stat().st_mtime_ns == before
+
+    def test_state未作成でも新規に取り込める(self, tmp_path: Path) -> None:
+        """初回同期でも空 state からサーバ済み集合を書き起こせる。"""
+        added, local_only = canvasser.sync_completed_spots(
+            tmp_path, {"cg_vote2026_1", "cg_vote2026_3"}
+        )
+
+        assert added == ["cg_vote2026_1", "cg_vote2026_3"]
+        assert local_only == []
+        state = canvasser.load_account_state(tmp_path)
+        assert state["completed_spots"] == ["cg_vote2026_1", "cg_vote2026_3"]
+
+    def test_サーバ空集合はローカルのみ警告になる(self, tmp_path: Path) -> None:
+        """サーバから何も帰らない状態でもローカル済みは削除しない。"""
+        canvasser.save_account_state(tmp_path, {"completed_spots": ["cg_vote2026_2"]})
+
+        added, local_only = canvasser.sync_completed_spots(tmp_path, set())
+
+        assert added == []
+        assert local_only == ["cg_vote2026_2"]
+
+    def test_破損stateには書き込まず例外を伝播する(self, tmp_path: Path) -> None:
+        """破損 state を空 dict で上書きしない (mark_spots_completed と同じ扱い)。"""
+        _state_file(tmp_path).write_text("{{{", encoding="utf-8")
+
+        with pytest.raises(StateFileCorruptedError, match="canvasser_state"):
+            canvasser.sync_completed_spots(tmp_path, {"cg_vote2026_1"})
+
+        assert _state_file(tmp_path).read_text(encoding="utf-8") == "{{{"
