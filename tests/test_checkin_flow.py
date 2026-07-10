@@ -6,7 +6,7 @@ FakePage と now_fn 注入で外部依存を断ち、dry-run 経路のフロー�
 
 import random
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -298,84 +298,26 @@ class TestFetchCheckinSpots:
 
 
 class TestPartitionSpots:
-    """_partition_spots の完了済み除外。"""
+    """_partition_spots のサーバ完了 (`is_checkedin=1`) 除外。"""
 
-    def test_完了済みslugを除外して件数を返す(self) -> None:
-        """completed_spots にある slug は除外され skip 件数に計上される。"""
-        spots = [_typed(1, 35.0, 135.0), _typed(2, 35.1, 135.0)]
+    def test_is_checkedinのspotを除外して件数を返す(self) -> None:
+        """サーバ側で is_checkedin==1 の spot は除外され skip 件数に計上される。"""
+        done = canvasser.Spot.from_api(_spot_done(1, 35.0, 135.0))
+        pending = _typed(2, 35.1, 135.0)
 
-        remaining, skipped = canvasser._partition_spots(spots, {"cg_vote2026_1"})
+        remaining, skipped = canvasser._partition_spots([done, pending])
 
         assert [s.slug for s in remaining] == ["cg_vote2026_2"]
         assert skipped == 1
 
     def test_完了なしなら全件そのまま(self) -> None:
-        """completed_spots が空なら除外は発生しない。"""
+        """is_checkedin=1 の spot が無ければ除外は発生しない。"""
         spots = [_typed(1, 35.0, 135.0)]
 
-        remaining, skipped = canvasser._partition_spots(spots, set())
+        remaining, skipped = canvasser._partition_spots(spots)
 
         assert remaining == spots
         assert skipped == 0
-
-
-class TestMergeServerCompleted:
-    """_merge_server_completed のサーバ完了状態マージ。"""
-
-    def test_サーバ済みなしならstateも集合も触らない(self, tmp_path: Path) -> None:
-        """全 spot が未達成なら state を書かず入力の completed_spots をそのまま返す。"""
-        spots = [_typed(1, 35.0, 135.0), _typed(2, 35.1, 135.0)]
-
-        got = canvasser._merge_server_completed(
-            _settings(dry_run=False, profile_dir=tmp_path),
-            spots,
-            {"cg_vote2026_5"},
-        )
-
-        assert got == {"cg_vote2026_5"}
-        assert not (tmp_path / "canvasser_state.json").exists()
-
-    def test_本番はサーバ済みをstateにも書きunion集合を返す(
-        self, tmp_path: Path
-    ) -> None:
-        """本番経路ではサーバ済みが sync_completed_spots で state に反映される。"""
-        server_done = canvasser.Spot.from_api(_spot_done(1, 35.0, 135.0))
-        pending = _typed(2, 35.1, 135.0)
-
-        got = canvasser._merge_server_completed(
-            _settings(dry_run=False, profile_dir=tmp_path),
-            [server_done, pending],
-            set(),
-        )
-
-        assert got == {"cg_vote2026_1"}
-        state = canvasser.load_account_state(tmp_path)
-        assert state["completed_spots"] == ["cg_vote2026_1"]
-
-    def test_dryrunはstateを書かずunion集合だけを返す(self, tmp_path: Path) -> None:
-        """dry-run では state を書かず skip 集合にのみ server_completed を反映する。"""
-        server_done = canvasser.Spot.from_api(_spot_done(1, 35.0, 135.0))
-
-        got = canvasser._merge_server_completed(
-            _settings(dry_run=True, profile_dir=tmp_path),
-            [server_done],
-            set(),
-        )
-
-        assert got == {"cg_vote2026_1"}
-        assert not (tmp_path / "canvasser_state.json").exists()
-
-    def test_profile_dir_Noneでもunion集合は返す(self) -> None:
-        """state 未設定 (テスト用途) でも skip 集合には server_completed を反映する。"""
-        server_done = canvasser.Spot.from_api(_spot_done(1, 35.0, 135.0))
-
-        got = canvasser._merge_server_completed(
-            _settings(dry_run=False, profile_dir=None),
-            [server_done],
-            set(),
-        )
-
-        assert got == {"cg_vote2026_1"}
 
 
 class TestInitialVirtualNow:
@@ -723,15 +665,12 @@ class TestCollectCheckinsDryRun:
         assert gained == 0
         assert "空でした" in capsys.readouterr().out
 
-    def test_全件完了済みなら0(
+    def test_全件is_checkedinなら0(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """completed_spots に全 slug があれば走行せず 0 を返す。"""
-        spots = [_spot(1, 35.00, 135.0), _spot(2, 35.01, 135.0)]
+        """listing 上で全 spot が is_checkedin=1 なら走行せず 0 を返す。"""
+        spots = [_spot_done(1, 35.00, 135.0), _spot_done(2, 35.01, 135.0)]
         fake = FakePage([_listing(spots)])
-        canvasser.save_account_state(
-            tmp_path, {"completed_spots": ["cg_vote2026_1", "cg_vote2026_2"]}
-        )
 
         gained = canvasser.collect_checkins(
             _as_page(fake), _settings(profile_dir=tmp_path)
@@ -781,7 +720,12 @@ class TestCollectCheckinsDryRun:
     def test_dryrunでもサーバ済みspotは事前skipするがstateは触らない(
         self, tmp_path: Path
     ) -> None:
-        """dry-run で is_checkedin の spot が skip され、state ファイルは作られない。"""
+        """dry-run で is_checkedin の spot が skip され、state ファイルは作られない。
+
+        判定源はサーバのみ (`checkin_status.is_checkedin`) で、ローカル state は
+        書き換えない。dry-run 経路はもとより state を触らないので、実行後の
+        profile_dir に state ファイルが生成されていないことを維持する。
+        """
         random.seed(0)
         # spot1 は既にサーバで済み、spot2 のみ dry-run で見込み計上する
         fake = FakePage([
@@ -806,7 +750,7 @@ class TestCollectCheckinsProduction:
     """
 
     def test_成功POSTで票と状態を確定する(self, tmp_path: Path) -> None:
-        """2 スポット成功で 20 票獲得し completed_spots に両 slug が入る。"""
+        """2 スポット成功で 20 票獲得し last_checkin が最新 spot で書かれる。"""
         random.seed(0)
         sleeps: list[float] = []
         spots = [_spot(1, 35.00, 135.0), _spot(2, 35.01, 135.0)]
@@ -820,14 +764,19 @@ class TestCollectCheckinsProduction:
         assert gained == 20
         assert len(fake.calls) == 3
         state = canvasser.load_account_state(tmp_path)
-        assert state["completed_spots"] == ["cg_vote2026_1", "cg_vote2026_2"]
-        assert state["last_checkin"]["schema_version"] == 2
+        last = state["last_checkin"]
+        assert last["schema_version"] == 2
+        assert last["spot_slug"] in {"cg_vote2026_1", "cg_vote2026_2"}
+        # completed 集合はサーバの is_checkedin に一本化されており state に書かない
+        assert "completed_spots" not in state
         # 1 件目の滞在と 2 件目への移動で実待機が発生している
         assert len(sleeps) == 2
         assert all(s > 0 for s in sleeps)
 
-    def test_サーバ済みspotは事前skipしstateにも取り込む(self, tmp_path: Path) -> None:
-        """is_checkedin の spot は事前 skip され state.completed_spots にも入る。"""
+    def test_サーバ済みspotは事前skipしstateには書き込まない(
+        self, tmp_path: Path
+    ) -> None:
+        """is_checkedin の spot は事前 skip され、その slug は state に現れない。"""
         random.seed(0)
         # spot1 は既にサーバで済み、spot2 のみ実 POST する
         fake = FakePage([
@@ -843,8 +792,15 @@ class TestCollectCheckinsProduction:
         assert gained == 10
         # listing GET + POST 1 件で、spot1 への再 POST は発生しない
         assert len(fake.calls) == 2
+        # POST 対象 slug は spot2 のみ (spot1 の再 POST が飛んでいないことを担保)
+        _expr, post_arg = fake.calls[1]
+        post_url = cast("list[Any]", post_arg)[0]
+        assert "cg_vote2026_2" in post_url
+        assert "cg_vote2026_1" not in post_url
         state = canvasser.load_account_state(tmp_path)
-        assert state["completed_spots"] == ["cg_vote2026_1", "cg_vote2026_2"]
+        # 事前 skip 分も含めて state には完了集合を持たない
+        assert "completed_spots" not in state
+        assert state["last_checkin"]["spot_slug"] == "cg_vote2026_2"
 
     def test_daily_budgetが実POST試行を打ち切る(self, tmp_path: Path) -> None:
         """daily_budget=1 では実 POST を 1 件だけ送って停止する。"""
@@ -861,7 +817,7 @@ class TestCollectCheckinsProduction:
         # listing GET + POST 1 件のみで、2 件目の POST は送られない
         assert len(fake.calls) == 2
         state = canvasser.load_account_state(tmp_path)
-        assert len(state["completed_spots"]) == 1
+        assert state["last_checkin"]["schema_version"] == 2
 
     def test_未知ecodeは1件目で中断し獲得分を保持する(self, tmp_path: Path) -> None:
         """成功 1 件の後の未知 ecode で partial_gained=10 の fail closed になる。"""
@@ -875,9 +831,9 @@ class TestCollectCheckinsProduction:
             )
 
         assert ei.value.partial_gained == 10
-        # 成功済み 1 件分の state は中断後も残っている
+        # 成功済み 1 件分の last_checkin は中断後も残っている
         state = canvasser.load_account_state(tmp_path)
-        assert len(state["completed_spots"]) == 1
+        assert state["last_checkin"]["schema_version"] == 2
 
     def _prime_resume_at(self, profile_dir: Path, lat: float) -> None:
         """既知位置 (lat, 135.0) を起点にする state を書き込む。

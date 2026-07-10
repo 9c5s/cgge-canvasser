@@ -19,7 +19,6 @@ Playwright の persistent context でブラウザセッションを保持し、�
   uv run canvasser.py mission --dry-run            # ミッション ドライラン
   uv run canvasser.py checkin                      # チェックイン本番
   uv run canvasser.py checkin --dry-run            # チェックイン ドライラン
-  uv run canvasser.py mark-completed --account main cg_vote2026_17  # 手動完了登録
 
 mission と checkin は独立したサブコマンドで、同時実行はしない。無指定なら本番、
 `--dry-run` を付けた場合のみ GET のみのドライランとなり、POST/PUT は一切送らない。
@@ -835,10 +834,10 @@ def _fetch_checkin_spots(page: Page) -> list[Spot]:
 
 def _load_resume_context(
     settings: CheckinSettings,
-) -> tuple[float | None, float | None, datetime | None, set[str]]:
+) -> tuple[float | None, float | None, datetime | None]:
     """state.json から resume 情報を読む。破損時は本番実行なら fail closed する。"""
     if settings.profile_dir is None:
-        return None, None, None, set()
+        return None, None, None
     try:
         return resume_context(settings.profile_dir, strict=not settings.dry_run)
     except StateFileCorruptedError as e:
@@ -849,46 +848,19 @@ def _load_resume_context(
             raise FailClosedError(msg) from e
         # dry-run は空 state のまま継続してスポット取得後の検証を回す
         print(msg, file=sys.stderr)
-        return None, None, None, set()
+        return None, None, None
 
 
-def _partition_spots(
-    all_spots: list[Spot], completed_spots: set[str]
-) -> tuple[list[Spot], int]:
-    """完了済みを除外した spot リストと、事前 skip した件数を返す。"""
-    skipped = [s for s in all_spots if s.slug in completed_spots]
+def _partition_spots(all_spots: list[Spot]) -> tuple[list[Spot], int]:
+    """事前 skip 後の走行対象スポットと skip 件数を返す。
+
+    `checkin_status.is_checkedin=1` の spot は既達成としてサーバ側で判定済み
+    のため走行対象から外す。判定源はサーバのみでローカル state は参照しない。
+    """
+    skipped = [s for s in all_spots if s.is_checkedin]
     if skipped:
         print(f"事前 skip (完了済み): {len(skipped)}件")
-    return [s for s in all_spots if s.slug not in completed_spots], len(skipped)
-
-
-def _merge_server_completed(
-    settings: CheckinSettings,
-    all_spots: list[Spot],
-    completed_spots: set[str],
-) -> set[str]:
-    """サーバ側「済み」spot を completed_spots に取り込んだ集合を返す。
-
-    本番 (`dry_run=False` かつ `profile_dir` 有) では state.completed_spots にも
-    `sync_completed_spots` のアトミック経路でマージし、既達成スポットへの再 POST
-    → 未観測 ecode → fail closed 停止を防ぐ。dry-run または `profile_dir` 未設定
-    では state を書き換えず、返り値の集合にだけ union する (副作用ゼロを維持しつつ
-    事前 skip 判定を一貫させるため)。
-    """
-    server_completed = {s.slug for s in all_spots if s.is_checkedin}
-    if not server_completed:
-        return completed_spots
-    if not settings.dry_run and settings.profile_dir is not None:
-        added, local_only = sync_completed_spots(settings.profile_dir, server_completed)
-        if added:
-            print(f"サーバ済みを取り込みました ({len(added)}件): {added}")
-        if local_only:
-            print(
-                f"警告: ローカル済みだがサーバ未確認 ({len(local_only)}件): "
-                f"{local_only}",
-                file=sys.stderr,
-            )
-    return completed_spots | server_completed
+    return [s for s in all_spots if not s.is_checkedin], len(skipped)
 
 
 def _announce_checkin_plan(
@@ -1214,8 +1186,9 @@ class _CheckinRunner:
         self.consecutive_failures = 0
         self._move_origin_to(spot)
         self.virtual_now = _as_jst_aware(self.settings.now_fn())
-        # sleep 中に中断されても completed_spots に slug が残るよう、成功直後に
-        # 一次 state を保存する。
+        # sleep 中に中断されても再開位置と時刻を失わないよう、成功直後に
+        # last_checkin を保存する。既達成の重複回避はサーバ側 is_checkedin に
+        # 一本化しているので、ここで local に completed 集合を持つ必要はない。
         if self.settings.profile_dir is not None:
             update_checkin_state(self.settings.profile_dir, spot, self.virtual_now)
         if self._will_continue_after():
@@ -1251,19 +1224,16 @@ class _CheckinRunner:
         self._move_origin_to(spot)
 
     def _on_already_done(self, spot: Spot, ecode: str | None) -> None:
-        """既達成 ecode の後処理。サーバ側成功済みなので完了扱いで state に反映する。
+        """既達成 ecode の後処理。サーバ側は成功済みなので単に skip する。
 
         ECODES_ALREADY_DONE が空 tuple の間は到達しない拡張点。実観測で意味が
-        確定した ecode を追加した時点から有効になる。
+        確定した ecode を追加した時点から有効になる。次回起動時の事前 skip は
+        サーバ側 `checkin_status.is_checkedin` によって行われるため、ここで
+        state を書き換える必要はない。
         """
         print(f"       -> 既達成 ({ecode})、スキップ")
         self.consecutive_failures = 0
         self._move_origin_to(spot)
-        # サーバ側で成功済みなので state に反映しておくと次回以降 skip される
-        if self.settings.profile_dir is not None:
-            update_checkin_state(
-                self.settings.profile_dir, spot, self.virtual_now, mark_completed=True
-            )
 
     def _on_unknown_ecode(self, spot: Spot, res: dict[str, Any]) -> None:
         """未観測 ecode = unknown の後処理。閾値到達で fail closed に中断する。
@@ -1305,7 +1275,7 @@ def collect_checkins(page: Page, settings: CheckinSettings) -> int:
     セーフティ:
       - `settings.dry_run=True` は完全ドライラン (POST を送らず、sleep もなく、
         state も書き換えない)。デフォルト (`dry_run=False`) は本番実行。
-      - `state.completed_spots` にある slug は事前に skip する。
+      - サーバ側 `checkin_status.is_checkedin=1` の spot は事前に skip する。
       - 未観測 ecode (SUCCESS と E5005 以外) は fail closed で即停止する。
         BAN シグナル・認証切れ・予期せぬ状態のいずれかとして扱う。
       - `consecutive_failure_limit` の未知エラーが連続したら全体中断する
@@ -1327,10 +1297,9 @@ def collect_checkins(page: Page, settings: CheckinSettings) -> int:
         print("チェックイン対象スポットが空でした。")
         return 0
 
-    resume_lat, resume_lng, resume_at, completed_spots = _load_resume_context(settings)
-    completed_spots = _merge_server_completed(settings, all_spots, completed_spots)
+    resume_lat, resume_lng, resume_at = _load_resume_context(settings)
 
-    spots, skipped = _partition_spots(all_spots, completed_spots)
+    spots, skipped = _partition_spots(all_spots)
     if not spots:
         print("全スポット完了済みです。")
         return 0
@@ -1635,9 +1604,12 @@ def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
 #       schema_version: 2,                          # 実 POST 成功時のみ書かれるマーカー
 #       spot_slug, spot_name, location_latitude, location_longitude,
 #       virtual_completed_at (ISO8601 JST-aware), real_completed_at (ISO8601 UTC)
-#     },
-#     "completed_spots": ["cg_vote2026_XX", ...]
+#     }
 #   }
+#
+# 完了済みスポットの判定はサーバ側 `checkin_status.is_checkedin` に一本化されて
+# いる。旧スキーマの `completed_spots` は互換のため strict load でも silent に
+# 無視し、成功 POST 直後の `update_checkin_state` で state から落とす。
 #
 # 旧版の dry-run 経路も state を書いていたため、last_checkin の中身だけでは実 POST 由来
 # かどうか判別できない。LAST_CHECKIN_SCHEMA_VERSION は「実 POST 成功でだけ
@@ -1686,20 +1658,6 @@ class UserInputError(Exception):
 
 
 _SPOT_SLUG_RE = re.compile(r"^cg_vote2026_[0-9]{1,6}$")
-
-
-def _validate_completed_spots(state: dict[str, Any], source: Path) -> None:
-    """completed_spots の型と slug 形式を検証する。"""
-    completed = state.get("completed_spots")
-    if completed is None:
-        return
-    if not isinstance(completed, list):
-        msg = f"{source}: completed_spots が list ではなく {type(completed).__name__}"
-        raise StateFileCorruptedError(msg)
-    for slug in cast("list[Any]", completed):
-        if not isinstance(slug, str) or not _SPOT_SLUG_RE.fullmatch(slug):
-            msg = f"{source}: completed_spots に不正な slug {slug!r}"
-            raise StateFileCorruptedError(msg)
 
 
 def _matches_last_checkin_kind(v: object, kind: str) -> bool:
@@ -1768,8 +1726,8 @@ def _validate_state_schema(state: dict[str, Any], source: Path) -> None:
     """読み込み時にスキーマを検証する。壊れていれば StateFileCorruptedError を送出する。
 
     strict モード専用のガード。dry-run では緩めに扱うため呼ばれない。
+    legacy な `completed_spots` キーは検証対象外 (silent に無視して load を通す)。
     """
-    _validate_completed_spots(state, source)
     _validate_last_checkin(state, source)
 
 
@@ -2109,14 +2067,17 @@ def update_checkin_state(
     profile_dir: Path,
     spot: Spot,
     virtual_now: datetime,
-    *,
-    mark_completed: bool = True,
 ) -> None:
     """1 件チェックイン成功時に state を更新する。
 
-    `mark_completed=True` の場合、`spot.slug` を `completed_spots` へ追加して
-    次回起動時の事前 skip 対象にする。実行中の破損 state を空 dict で上書き
+    `last_checkin` のみを書き換える。既達成の重複回避はサーバ側
+    `checkin_status.is_checkedin` に一本化されているため、ローカルに
+    completed 集合を持たない。実行中の破損 state を空 dict で上書き
     してしまわないよう、読み込みは strict にする (本番経路からのみ呼ばれる)。
+
+    既存 state.json に legacy な `completed_spots` キーが残っていた場合は、
+    load → save で無変更のまま残り続けるため、保存前に明示的に落とす
+    (silent 無視の契約を保存経路でも一貫させる)。
     """
     state = load_account_state(profile_dir, strict=True)
     state["last_checkin"] = {
@@ -2128,22 +2089,17 @@ def update_checkin_state(
         "virtual_completed_at": virtual_now.isoformat(),
         "real_completed_at": datetime.now(UTC).isoformat(),
     }
-    if mark_completed:
-        completed = set(state.get("completed_spots") or [])
-        completed.add(spot.slug)
-        state["completed_spots"] = sorted(completed)
+    state.pop("completed_spots", None)
     save_account_state(profile_dir, state)
 
 
 def resume_context(
     profile_dir: Path, *, strict: bool = False
-) -> tuple[float | None, float | None, datetime | None, set[str]]:
-    """state.json から前回位置・仮想終了時刻・完了済みスポット集合を復元する。
+) -> tuple[float | None, float | None, datetime | None]:
+    """state.json から前回位置と仮想終了時刻を復元する。
 
-    旧版の dry-run 経路も `update_checkin_state` を叩いていたため、`last_checkin` から
-    「実 POST 成功済み」を後方推定する手段がない。誤って dry-run 由来の slug を完了扱い
-    すると次回のチェックイン実 POST で reward を落とすので、自動移行はしない。
-    旧 state の補完が必要なら `mark-completed` を明示的に使う。
+    完了済みスポットの判定はサーバ側 `checkin_status.is_checkedin` に一本化されて
+    いるため、ここではローカル state から取り込まない。
     """
     state = load_account_state(profile_dir, strict=strict)
     last = cast("dict[str, Any]", state.get("last_checkin") or {})
@@ -2159,7 +2115,6 @@ def resume_context(
     if raw:
         with contextlib.suppress(ValueError):
             resume_at = _as_jst_aware(datetime.fromisoformat(raw))
-    completed = set(state.get("completed_spots") or [])
     # 非 strict (dry-run) はスキーマ検証を通らないため、手改変で数値以外や
     # NaN/Infinity/範囲外の座標が入っていても ValueError にせず None
     # (resume 情報なし) に丸める。strict 経路とは違い、破損 dry-run 起動を
@@ -2168,70 +2123,7 @@ def resume_context(
         _finite_float_in_range_or_none(lat, _LAT_MIN, _LAT_MAX),
         _finite_float_in_range_or_none(lng, _LNG_MIN, _LNG_MAX),
         resume_at,
-        completed,
     )
-
-
-def mark_spots_completed(profile_dir: Path, slugs: list[str]) -> None:
-    """外部から手動で成功済みスポットを state に登録する CLI 用ヘルパー。
-
-    別デバイスや UI キャプチャで既に checkin 済みの分を流し込むために使う。
-    既存 state.json が破損している場合は `StateFileCorruptedError` を上げて、
-    破損 state を空 dict で上書きしてしまうのを防ぐ。
-    """
-    invalid = [s for s in slugs if not _SPOT_SLUG_RE.fullmatch(s)]
-    if invalid:
-        msg = f"不正な spot_slug: {invalid}"
-        raise UserInputError(msg)
-    state = load_account_state(profile_dir, strict=True)
-    completed = set(state.get("completed_spots") or [])
-    completed.update(slugs)
-    state["completed_spots"] = sorted(completed)
-    save_account_state(profile_dir, state)
-    print(f"[{profile_dir.name}] completed_spots に追加: {sorted(slugs)}")
-
-
-def sync_completed_spots(
-    profile_dir: Path, server_completed: set[str]
-) -> tuple[list[str], list[str]]:
-    """サーバ側「済み」slug 集合を state.completed_spots へ追加のみでマージする。
-
-    サーバ済みかつローカル未登録の slug を追加する。ローカル済みでサーバ未確認の
-    slug は削除せず警告扱いで返す (削除すると再 POST → 未観測 ecode 停止のリスクが
-    あるため)。既存 state.json が破損している場合は `StateFileCorruptedError` を
-    上げて、破損 state を空 dict で上書きしてしまうのを防ぐ。
-
-    Args:
-        profile_dir: アカウントのプロファイルディレクトリ。
-        server_completed: サーバ側で「済み」と判定された slug 集合。`Spot.from_api`
-            は slug の形式検証を行わないため、本関数側で `_SPOT_SLUG_RE` に合致
-            しない slug は silent に除外する (境界での防御)。
-
-    Returns:
-        (added, local_only) の 2 要素タプル。added は今回新規追加した slug の
-        昇順リスト、local_only はローカル済みだがサーバ未確認の slug の昇順
-        リスト (削除はせず警告表示用に呼び出し側へ渡す)。
-    """
-    # サーバ由来 slug は Spot.from_api で形式検証されていないため、ここで弾く。
-    # 不正 slug を state に持ち込むと次回 strict load が StateFileCorruptedError で
-    # 拒否し、以降 run 全体が状態破損扱いで止まる (fail closed)。silent 除外にせず
-    # stderr に警告を出して schema drift の観測性を確保する。
-    invalid = {s for s in server_completed if not _SPOT_SLUG_RE.fullmatch(s)}
-    if invalid:
-        print(
-            f"警告: サーバから不正な slug 形式を受信、無視します: {sorted(invalid)}",
-            file=sys.stderr,
-        )
-    validated = server_completed - invalid
-    state = load_account_state(profile_dir, strict=True)
-    local_completed = set(state.get("completed_spots") or [])
-    added = validated - local_completed
-    local_only = local_completed - validated
-    if added:
-        merged = local_completed | added
-        state["completed_spots"] = sorted(merged)
-        save_account_state(profile_dir, state)
-    return sorted(added), sorted(local_only)
 
 
 def _install_chromium() -> None:
@@ -3052,7 +2944,7 @@ def main() -> int:
 def _build_parser() -> argparse.ArgumentParser:
     """CLI 引数パーサを構築する。
 
-    login / mission / checkin / mark-completed の 4 サブコマンド。
+    login / mission / checkin の 3 サブコマンド。
     サブコマンドで必須引数と排他 (mission と checkin は同時実行しない) を
     構造的に表現し、フラグの組み合わせ検証を不要にする。
     """
@@ -3155,44 +3047,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    mark = subparsers.add_parser(
-        "mark-completed",
-        parents=[common],
-        help="実 POST 済みスポットを state.completed_spots に手動追加して終了する",
-    )
-    mark.add_argument(
-        "--account",
-        required=True,
-        help="対象アカウント名。profiles-dir 配下のサブディレクトリ名として扱う",
-    )
-    mark.add_argument(
-        "slugs",
-        nargs="+",
-        metavar="SLUG",
-        help="登録する spot_slug (例: cg_vote2026_17)",
-    )
-
-    sync = subparsers.add_parser(
-        "sync",
-        parents=[common, browser],
-        help=(
-            "サーバ側のチェックイン済みスポットを state.completed_spots に取り込む"
-            " (GET のみ、追加マージ、ローカル乖離は警告のみ)"
-        ),
-    )
-    sync.add_argument(
-        "--account",
-        help="対象アカウント名。未指定なら profiles-dir 内のすべてのアカウントを"
-        "順次処理する",
-    )
-    sync.add_argument(
-        "--no-auto-relogin",
-        action="store_true",
-        help=(
-            "Chrome Login Data から BNID 資格情報を復号できても自動再ログインを"
-            "行わない。手動運用に戻したいときにだけ使う。"
-        ),
-    )
     return parser
 
 
@@ -3238,98 +3092,6 @@ def _build_run_options(args: argparse.Namespace) -> RunOptions:
     )
 
 
-def _run_mark_completed(args: argparse.Namespace, profiles_dir: Path) -> int:
-    """mark-completed の処理。state を編集して即終了する (ブラウザ起動なし)。"""
-    _validate_account_name(args.account)
-    target_dir = (profiles_dir / args.account).resolve()
-    _ensure_within(profiles_dir, target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        mark_spots_completed(target_dir, args.slugs)
-    except StateFileCorruptedError as e:
-        print(
-            f"state.json が破損しているため mark-completed で上書きできません: {e}",
-            file=sys.stderr,
-        )
-        return 1
-    return 0
-
-
-def _print_sync_summary(name: str, added: list[str], local_only: list[str]) -> None:
-    """Sync 1 アカウント分の結果 (追加件数と警告) を標準出力に整形する。"""
-    if added:
-        print(f"[{name}] サーバ済みを取り込みました ({len(added)}件): {added}")
-    else:
-        # local_only があると「サーバ側で未確認の slug が残っている乖離状態」なので
-        # 「サーバと一致」とは言えない。乖離時はサフィックスを付けずに「追加なし」だけ
-        # 出し、詳細は下の警告出力に委ねる。
-        match_suffix = " (state はサーバと一致)" if not local_only else ""
-        print(f"[{name}] 追加なし{match_suffix}")
-    if local_only:
-        print(
-            f"[{name}] 警告: ローカル済みだがサーバ未確認 ({len(local_only)}件): "
-            f"{local_only}",
-            file=sys.stderr,
-        )
-
-
-def _run_sync_one(
-    p: Playwright, name: str, profile_dir: Path, options: RunOptions
-) -> int:
-    """Sync の 1 アカウント分。認証済みブラウザでサーバ完了状態を state にマージする。
-
-    副作用は GET のみ (POST/PUT を送らない)。state 書き込みは
-    `sync_completed_spots` のアトミック経路に限定する。
-    """
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    ctx = open_persistent_context(p, profile_dir, headless=True)
-    try:
-        page = ctx.new_page()
-        page.goto(CHECKIN_PAGE_URL, wait_until="domcontentloaded")
-        if not _ensure_authenticated(page, name, profile_dir, options):
-            return 1
-        # auto_relogin 経由の認証は LOGIN_ENTRY_URL の backurl=mission へ飛ばされる
-        # ため、fetch の直前に referer を checkin page へ戻す。既存の checkin 経路
-        # (process_account) も認証後に CHECKIN_PAGE_URL へ再遷移しており、それと
-        # 挙動を揃える。認証済みで既に checkin page にいる場合の再 goto は無害。
-        page.goto(CHECKIN_PAGE_URL, wait_until="domcontentloaded")
-        all_spots = _fetch_checkin_spots(page)
-        server_completed = {s.slug for s in all_spots if s.is_checkedin}
-        added, local_only = sync_completed_spots(profile_dir, server_completed)
-        _print_sync_summary(name, added, local_only)
-    finally:
-        ctx.close()
-    return 0
-
-
-def _run_sync_all(args: argparse.Namespace, profiles: list[tuple[str, Path]]) -> int:
-    """Sync サブコマンドの各アカウント処理をまとめて実行する。
-
-    アカウント単位のエラー (未ログイン・state 破損・API 応答不正など) は握って
-    残りのアカウントの処理を続行する。1 件でもエラーがあれば exit_code=1 を返す。
-    """
-    options = RunOptions(auto_relogin=not args.no_auto_relogin, dry_run=False)
-    exit_code = 0
-    with sync_playwright() as p:
-        for name, profile_dir in profiles:
-            print(f"\n=== アカウント: {name} ({profile_dir}) ===")
-            try:
-                per_exit = _run_sync_one(p, name, profile_dir, options)
-            except StateFileCorruptedError as e:
-                print(
-                    f"[{name}] state.json が破損しているため sync できません: {e}",
-                    file=sys.stderr,
-                )
-                per_exit = 1
-            # 1 アカウントの失敗で全体を止めないため、意図して広く握る
-            except Exception as e:  # noqa: BLE001
-                print(f"[{name}] sync 実行中に例外: {e}", file=sys.stderr)
-                per_exit = 1
-            if per_exit != 0:
-                exit_code = 1
-    return exit_code
-
-
 def _ensure_profiles_dir_ignored(args: argparse.Namespace, profiles_dir: Path) -> None:
     """profiles_dir が git ignore されていることを確認する。
 
@@ -3365,10 +3127,6 @@ def _main_impl() -> int:
 
     profiles_dir = Path(args.profiles_dir).resolve()
 
-    # mark-completed は state を編集して即終了する (ブラウザ起動なし)
-    if args.command == "mark-completed":
-        return _run_mark_completed(args, profiles_dir)
-
     login_mode = args.command == "login"
     if args.command == "checkin":
         _validate_thresholds(args)
@@ -3385,11 +3143,6 @@ def _main_impl() -> int:
     _ensure_profiles_dir_ignored(args, profiles_dir)
 
     ensure_chromium_installed()
-
-    # sync は mission/checkin と大きく別ルートなので早期分岐で処理する
-    # (副作用は GET のみ、state 書き込みは sync_completed_spots のアトミック経路)
-    if args.command == "sync":
-        return _run_sync_all(args, profiles)
 
     options = _build_run_options(args)
 
