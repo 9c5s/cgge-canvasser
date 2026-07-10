@@ -1224,12 +1224,10 @@ class _CheckinRunner:
         self._move_origin_to(spot)
 
     def _on_already_done(self, spot: Spot, ecode: str | None) -> None:
-        """既達成 ecode の後処理。サーバ側は成功済みなので単に skip する。
+        """既達成 ecode の後処理として skip 扱いにする拡張点。
 
-        ECODES_ALREADY_DONE が空 tuple の間は到達しない拡張点。実観測で意味が
-        確定した ecode を追加した時点から有効になる。次回起動時の事前 skip は
-        サーバ側 `checkin_status.is_checkedin` によって行われるため、ここで
-        state を書き換える必要はない。
+        ECODES_ALREADY_DONE が空 tuple の間は到達しない。実観測で意味が
+        確定した ecode を追加した時点から有効になる。
         """
         print(f"       -> 既達成 ({ecode})、スキップ")
         self.consecutive_failures = 0
@@ -1608,8 +1606,8 @@ def parse_checkin_deadline(spot: dict[str, Any]) -> datetime | None:
 #   }
 #
 # 完了済みスポットの判定はサーバ側 `checkin_status.is_checkedin` に一本化されて
-# いる。旧スキーマの `completed_spots` は互換のため strict load でも silent に
-# 無視し、成功 POST 直後の `update_checkin_state` で state から落とす。
+# いる。旧スキーマの `completed_spots` は `load_account_state` が読み込み時に
+# in-memory から落とすため、以降の resume / save 経路には現れない。
 #
 # 旧版の dry-run 経路も state を書いていたため、last_checkin の中身だけでは実 POST 由来
 # かどうか判別できない。LAST_CHECKIN_SCHEMA_VERSION は「実 POST 成功でだけ
@@ -1726,7 +1724,6 @@ def _validate_state_schema(state: dict[str, Any], source: Path) -> None:
     """読み込み時にスキーマを検証する。壊れていれば StateFileCorruptedError を送出する。
 
     strict モード専用のガード。dry-run では緩めに扱うため呼ばれない。
-    legacy な `completed_spots` キーは検証対象外 (silent に無視して load を通す)。
     """
     _validate_last_checkin(state, source)
 
@@ -1768,6 +1765,11 @@ def load_account_state(profile_dir: Path, *, strict: bool = False) -> dict[str, 
             raise StateFileCorruptedError(msg)
         return {}
     state = cast("dict[str, Any]", data)
+    # 旧スキーマの `completed_spots` は完了判定がサーバ側 `is_checkedin` に
+    # 移った時点で不要になった。読み込み時に in-memory から落とすことで、
+    # 以降 in-memory の state を触る全経路 (resume / save) が自動的に legacy-free
+    # になる。dry-run はそもそも save しないためファイル上の残骸はそのまま。
+    state.pop("completed_spots", None)
     if strict:
         _validate_state_schema(state, state_file)
     return state
@@ -2068,16 +2070,11 @@ def update_checkin_state(
     spot: Spot,
     virtual_now: datetime,
 ) -> None:
-    """1 件チェックイン成功時に state を更新する。
+    """1 件チェックイン成功時に `last_checkin` を更新する。
 
-    `last_checkin` のみを書き換える。既達成の重複回避はサーバ側
-    `checkin_status.is_checkedin` に一本化されているため、ローカルに
-    completed 集合を持たない。実行中の破損 state を空 dict で上書き
-    してしまわないよう、読み込みは strict にする (本番経路からのみ呼ばれる)。
-
-    既存 state.json に legacy な `completed_spots` キーが残っていた場合は、
-    load → save で無変更のまま残り続けるため、保存前に明示的に落とす
-    (silent 無視の契約を保存経路でも一貫させる)。
+    実行中の破損 state を空 dict で上書きしてしまわないよう、読み込みは
+    strict にする (本番経路からのみ呼ばれる)。legacy キーの除去は
+    `load_account_state` に一本化しているため、ここでは扱わない。
     """
     state = load_account_state(profile_dir, strict=True)
     state["last_checkin"] = {
@@ -2089,18 +2086,13 @@ def update_checkin_state(
         "virtual_completed_at": virtual_now.isoformat(),
         "real_completed_at": datetime.now(UTC).isoformat(),
     }
-    state.pop("completed_spots", None)
     save_account_state(profile_dir, state)
 
 
 def resume_context(
     profile_dir: Path, *, strict: bool = False
 ) -> tuple[float | None, float | None, datetime | None]:
-    """state.json から前回位置と仮想終了時刻を復元する。
-
-    完了済みスポットの判定はサーバ側 `checkin_status.is_checkedin` に一本化されて
-    いるため、ここではローカル state から取り込まない。
-    """
+    """state.json から前回位置と仮想終了時刻を復元する。"""
     state = load_account_state(profile_dir, strict=strict)
     last = cast("dict[str, Any]", state.get("last_checkin") or {})
     # schema_version が一致しない last_checkin は「実 POST 成功由来か」を保証

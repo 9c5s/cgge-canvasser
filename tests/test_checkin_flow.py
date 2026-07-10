@@ -766,7 +766,9 @@ class TestCollectCheckinsProduction:
         state = canvasser.load_account_state(tmp_path)
         last = state["last_checkin"]
         assert last["schema_version"] == 2
-        assert last["spot_slug"] in {"cg_vote2026_1", "cg_vote2026_2"}
+        # seed 0 では order_spots_by_proximity が 2 → 1 の順に並べるため、
+        # 最終 last_checkin は 2 件目に POST した spot1 になる。
+        assert last["spot_slug"] == "cg_vote2026_1"
         # completed 集合はサーバの is_checkedin に一本化されており state に書かない
         assert "completed_spots" not in state
         # 1 件目の滞在と 2 件目への移動で実待機が発生している
