@@ -2214,8 +2214,15 @@ def sync_completed_spots(
     """
     # サーバ由来 slug は Spot.from_api で形式検証されていないため、ここで弾く。
     # 不正 slug を state に持ち込むと次回 strict load が StateFileCorruptedError で
-    # 拒否し、以降 run 全体が状態破損扱いで止まる (fail closed)。
-    validated = {s for s in server_completed if _SPOT_SLUG_RE.fullmatch(s)}
+    # 拒否し、以降 run 全体が状態破損扱いで止まる (fail closed)。silent 除外にせず
+    # stderr に警告を出して schema drift の観測性を確保する。
+    invalid = {s for s in server_completed if not _SPOT_SLUG_RE.fullmatch(s)}
+    if invalid:
+        print(
+            f"警告: サーバから不正な slug 形式を受信、無視します: {sorted(invalid)}",
+            file=sys.stderr,
+        )
+    validated = server_completed - invalid
     state = load_account_state(profile_dir, strict=True)
     local_completed = set(state.get("completed_spots") or [])
     added = validated - local_completed

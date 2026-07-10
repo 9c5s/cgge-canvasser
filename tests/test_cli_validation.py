@@ -469,3 +469,135 @@ class TestBuildRunOptions:
         assert options.daily_budget == 3
         assert options.consecutive_failure_limit == 2
         assert options.out_of_range_limit == 5
+
+
+class _FakePlaywrightCtx:
+    """`with sync_playwright() as p:` を通す最小のダミー context manager。"""
+
+    def __enter__(self) -> object:
+        return object()
+
+    def __exit__(self, *_args: object) -> None:
+        return
+
+
+class TestRunSyncAll:
+    """_run_sync_all のアカウント単位エラー分離と exit_code 集約。"""
+
+    def _patch_playwright(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """sync_playwright() を no-op context manager に差し替える。"""
+        monkeypatch.setattr(canvasser, "sync_playwright", _FakePlaywrightCtx)
+
+    def test_全アカウント成功でexit_code_0(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """全アカウントで _run_sync_one が 0 を返すなら exit_code は 0。"""
+        self._patch_playwright(monkeypatch)
+        calls: list[str] = []
+
+        def fake_run_sync_one(
+            _p: object,
+            name: str,
+            _profile_dir: Path,
+            _options: canvasser.RunOptions,
+        ) -> int:
+            calls.append(name)
+            return 0
+
+        monkeypatch.setattr(canvasser, "_run_sync_one", fake_run_sync_one)
+        args = argparse.Namespace(no_auto_relogin=False)
+        profiles = [("alice", tmp_path / "alice"), ("bob", tmp_path / "bob")]
+
+        exit_code = canvasser._run_sync_all(args, profiles)
+
+        assert exit_code == 0
+        assert calls == ["alice", "bob"]
+
+    def test_破損stateアカウントは他アカウントを止めない(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """1 アカウントで StateFileCorruptedError が出ても残りは処理する。"""
+        self._patch_playwright(monkeypatch)
+        calls: list[str] = []
+
+        def fake_run_sync_one(
+            _p: object,
+            name: str,
+            _profile_dir: Path,
+            _options: canvasser.RunOptions,
+        ) -> int:
+            calls.append(name)
+            if name == "alice":
+                raise canvasser.StateFileCorruptedError("test corruption")
+            return 0
+
+        monkeypatch.setattr(canvasser, "_run_sync_one", fake_run_sync_one)
+        args = argparse.Namespace(no_auto_relogin=False)
+        profiles = [("alice", tmp_path / "alice"), ("bob", tmp_path / "bob")]
+
+        exit_code = canvasser._run_sync_all(args, profiles)
+
+        assert exit_code == 1
+        assert calls == ["alice", "bob"]
+        err = capsys.readouterr().err
+        assert "alice" in err
+        assert "破損" in err
+
+    def test_一般例外アカウントも他アカウントを止めない(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """StateFileCorruptedError 以外の Exception でも残りアカウントは継続する。"""
+        self._patch_playwright(monkeypatch)
+        calls: list[str] = []
+
+        def fake_run_sync_one(
+            _p: object,
+            name: str,
+            _profile_dir: Path,
+            _options: canvasser.RunOptions,
+        ) -> int:
+            calls.append(name)
+            if name == "alice":
+                msg = "network down"
+                raise RuntimeError(msg)
+            return 0
+
+        monkeypatch.setattr(canvasser, "_run_sync_one", fake_run_sync_one)
+        args = argparse.Namespace(no_auto_relogin=False)
+        profiles = [("alice", tmp_path / "alice"), ("bob", tmp_path / "bob")]
+
+        exit_code = canvasser._run_sync_all(args, profiles)
+
+        assert exit_code == 1
+        assert calls == ["alice", "bob"]
+        err = capsys.readouterr().err
+        assert "alice" in err
+        assert "network down" in err
+
+    def test_単一per_exit失敗でも全体はexit_code_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_run_sync_one が per_exit=1 を返しただけで全体 exit_code も 1 になる。"""
+        self._patch_playwright(monkeypatch)
+
+        def fake_run_sync_one(
+            _p: object,
+            name: str,
+            _profile_dir: Path,
+            _options: canvasser.RunOptions,
+        ) -> int:
+            return 0 if name == "alice" else 1
+
+        monkeypatch.setattr(canvasser, "_run_sync_one", fake_run_sync_one)
+        args = argparse.Namespace(no_auto_relogin=False)
+        profiles = [("alice", tmp_path / "alice"), ("bob", tmp_path / "bob")]
+
+        exit_code = canvasser._run_sync_all(args, profiles)
+
+        assert exit_code == 1

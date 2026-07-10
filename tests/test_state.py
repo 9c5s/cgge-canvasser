@@ -398,11 +398,14 @@ class TestSyncCompletedSpots:
 
         assert _state_file(tmp_path).read_text(encoding="utf-8") == "{{{"
 
-    def test_不正な形式のslugは黙って除外する(self, tmp_path: Path) -> None:
+    def test_不正な形式のslugは警告付きで除外する(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         """サーバ由来の malformed slug は state に持ち込まない (境界での防御)。
 
         持ち込んでしまうと次回の strict load で `StateFileCorruptedError` に
-        なり、以降 run 全体が状態破損扱いで止まる (fail closed)。
+        なり、以降 run 全体が状態破損扱いで止まる (fail closed)。schema drift
+        の観測性を確保するため stderr にも警告を出す。
         """
         added, local_only = canvasser.sync_completed_spots(
             tmp_path,
@@ -419,6 +422,11 @@ class TestSyncCompletedSpots:
         # strict load でも読み戻せる形で保存されている
         state = canvasser.load_account_state(tmp_path, strict=True)
         assert state["completed_spots"] == ["cg_vote2026_1"]
+        # stderr に不正 slug の警告が出る (schema drift の観測性)
+        err = capsys.readouterr().err
+        assert "不正な slug 形式" in err
+        assert "evil/../path" in err
+        assert "future_format_2027_1" in err
 
 
 class TestPrintSyncSummary:
