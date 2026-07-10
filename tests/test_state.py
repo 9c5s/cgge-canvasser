@@ -236,6 +236,35 @@ class TestResumeContext:
         assert (lat, lng) == (35.0, 135.0)
         assert resume_at is None
 
+    def test_文字列でない時刻は非strictでNoneに丸める(self, tmp_path: Path) -> None:
+        """手改変で int が入っても TypeError を送出せず resume_at=None に丸める。
+
+        `resume_context` の non-strict 経路は緩い契約 (不正値 → None) を持つが、
+        `contextlib.suppress(ValueError)` は `TypeError` を拾わないため、`if raw:`
+        だけでは int 値が truthy 側の分岐に入り、`datetime.fromisoformat(int)` が
+        送出する `TypeError` が escape する。`isinstance(str)` ガードで str 以外
+        を先に除外することを担保する。
+        """
+        _state_file(tmp_path).write_text(
+            json.dumps(
+                {
+                    "last_checkin": {
+                        "schema_version": 2,
+                        "location_latitude": 35.0,
+                        "location_longitude": 135.0,
+                        "virtual_completed_at": 12345,
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        lat, lng, resume_at = canvasser.resume_context(tmp_path)
+
+        assert (lat, lng) == (35.0, 135.0)
+        assert resume_at is None
+
     def test_naiveな時刻文字列はJSTとして復元する(self, tmp_path: Path) -> None:
         """virtual_completed_at に tz が無ければ JST を付与して読み込む。"""
         canvasser.save_account_state(

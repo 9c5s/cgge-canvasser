@@ -2089,7 +2089,10 @@ def resume_context(
         return None, None, None
     resume_at: datetime | None = None
     raw = last.get("virtual_completed_at")
-    if raw:
+    # 手改変で int / list など str 以外が入ると `datetime.fromisoformat` は
+    # `TypeError` を送出する。`contextlib.suppress(ValueError)` では拾えないため、
+    # 先に `isinstance(str)` で絞って str 以外は resume_at=None として扱う。
+    if isinstance(raw, str):
         with contextlib.suppress(ValueError):
             resume_at = _as_jst_aware(datetime.fromisoformat(raw))
     # 非 strict (dry-run) はスキーマ検証を通らないため、手改変で数値以外や
