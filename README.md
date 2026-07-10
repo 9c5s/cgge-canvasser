@@ -159,7 +159,7 @@ FailClosedError は `process_account` で捕捉され、`exit_code=1` として�
 
 `schema_version` は resume で位置と時刻を引き継ぐ際の互換性チェックに使う。実 POST 由来と保証できる version のみを resume 起点として採用する (現状は `2`)。
 
-- 完了済みスポットの判定はサーバ側 `checkin_status.is_checkedin` に一本化しており、state にローカルコピーを持たない。旧スキーマの `completed_spots` キーが残っていても strict load は通り、次の成功 POST 時に落とす。
+- 完了済みスポットの判定はサーバ側 `checkin_status.is_checkedin` に一本化しており、state にローカルコピーを持たない。
 - `spot_slug` は正規表現 `^cg_vote2026_[0-9]{1,6}$` にマッチする形式が必須 (schema 検証で strict チェック)。手動編集する場合は `cg_vote2026_19` のような実 slug 形式を守る。
 - state.json の JSON パース失敗や schema 不整合は、チェックイン実 POST (`checkin`、`--dry-run` 未指定) 時に fail closed として即停止する。手動で確認・修復してから再実行する。
 - ドライランでは破損した state を空 dict として扱い、そのまま続行する。
