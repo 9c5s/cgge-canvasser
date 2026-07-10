@@ -12,7 +12,8 @@ Playwright の persistent context でブラウザセッションを保持し、�
 - BNID (バンダイナムコID) の着信認証を設定済みであること。
 - アイドルマスター ポータルにログイン可能であること。
 
-依存関係は `pyproject.toml` (開発・リポジトリ運用向け) と `canvasser.py` の PEP 723 inline script metadata (スクリプト単体を任意のディレクトリで `uv run` する用) の両方で管理する。両者は同じ依存を宣言する。事前セットアップなしで `uv run canvasser.py` を実行できる。
+依存関係は `pyproject.toml` (開発・リポジトリ運用向け) と `canvasser.py` の PEP 723 inline script metadata (スクリプト単体を任意のディレクトリで `uv run` する用) の両方で管理する。
+両者は同じ依存を宣言するので、事前セットアップなしで `uv run canvasser.py` を実行できる。
 
 ## セットアップ
 
@@ -36,7 +37,9 @@ uv run canvasser.py login --account sub
 - `--account NAME` は必須。`./profiles/NAME/` にプロファイルが作られる。
 - Chromium が可視状態で立ち上がる。BNID でログインしてミッションページが表示されると、自動でログインを検知して終了する。
 
-初回ログイン時に BNID フォームでパスワードを入力する際、Chrome の「パスワードを保存しますか?」プロンプトで **保存を選択** すること。この保存された資格情報は Playwright プロファイル内 (`profiles/{account}/Default/Login Data`) に Windows DPAPI + AES-256-GCM で暗号化されて格納され、以降 BNID セッション切れが検知されたときに自動再ログインの供給源として使われる。
+初回ログイン時に BNID フォームでパスワードを入力する際、Chrome の「パスワードを保存しますか?」プロンプトで**保存を選択**する。
+この保存された資格情報は Playwright プロファイル内 (`profiles/{account}/Default/Login Data`) に Windows DPAPI + AES-256-GCM で暗号化されて格納される。
+以降 BNID セッション切れが検知されたときに、自動再ログインの供給源として使われる。
 
 ### 日次実行 (ミッション回収、全アカウント)
 
@@ -105,18 +108,23 @@ Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trig
 
 ### ASOBI STORE 連携の自動復旧
 
-`mission_type=1` のミッション (ASOBI STORE 系、プレミアム会員ログボ #21 など) で `E1926` (ASOBISTORE への再ログインが必要) が返ったら、`linkages/as/login` を踏んで自動復旧する。途中の中間ページ (legacy-login.asobistore.jp) は「バンダイナムコIDでログイン」を自動クリック、BNID フォームが出た場合は Chrome 自動保存の資格情報で自動突破する。復旧に失敗した場合はミッションはスキップされ、翌日に再試行される。
+`mission_type=1` のミッション (ASOBI STORE 系、プレミアム会員ログボ #21 など) で `E1926` (ASOBISTORE への再ログインが必要) が返ったら、`linkages/as/login` を踏んで自動復旧する。
+途中の中間ページ (legacy-login.asobistore.jp) では「バンダイナムコIDでログイン」を自動でクリックする。
+BNID フォームが出た場合は、Chrome 自動保存の資格情報で突破する。
+復旧に失敗した場合、そのミッションはスキップして翌日に再試行する。
 
 ### ミッション回収 (`collect_missions`)
 
-`GET /mileage_vote/cinderellagirls_vote_2026/missions` を叩いて、`action.mission_complete_api_call_flag: true` のミッションだけを処理対象にする。未達成なら達成 POST → 受取 PUT。達成済み未受取なら受取 PUT のみ。
+`GET /mileage_vote/cinderellagirls_vote_2026/missions` を叩いて、`action.mission_complete_api_call_flag: true` のミッションだけを処理対象にする。
+未達成なら達成 POST の後に受取 PUT。
+達成済み未受取なら受取 PUT のみ。
 
 ### チェックイン (`collect_checkins`)
 
 `GET /checkins/event/cg_vote2026` で全 51 スポットの座標を取得し、次の順で処理する。
 
 1. **サーバ済みを事前 skip**：応答中の `checkin_status.is_checkedin == 1` を持つスポットは既達成として skip する。ローカル state には書き込まない (判定源はサーバのみ)。
-2. **前回位置から再開**：`state.json` に保存された位置に最も近い未達成スポットを起点にする。state がなければランダム。
+2. **前回位置から再開**：`state.json` に保存された位置に最も近い未達成スポットを起点にする。state.json がなければランダムに選ぶ。
 3. **最近傍法で巡回順を決定**：現在地から Haversine 距離が最小の未達成スポットへ順次移動する (greedy TSP 近似)。
 4. **移動時間を反映**：
    - `GMAPS_KEY` があれば Google Maps Directions API を呼び、`departure_time` に仮想現在時刻を渡す。`mode=transit` は始発待ちを含む実運行時刻ベースの duration が返る。経路が無い場合 (深夜帯や公共交通が届かない場所) は `mode=driving` にフォールバックし、`duration_in_traffic` が取れれば交通量反映の所要時間、無ければ `duration` の距離ベース所要時間を採用する。
@@ -135,13 +143,17 @@ Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trig
 | `ECODES_ALREADY_DONE` (初期値は空 tuple) | 実観測で意味を確定した ecode のみを追加する。追加後は既達成扱いで skip |
 | 未観測 ecode | `consecutive_failures` を加算。`--consecutive-failure-limit` (デフォルト 1) 到達で FailClosedError を送出し全体中断 (fail closed) |
 
-既達成スポットは `checkin` サブコマンドの実行前に `checkin_status.is_checkedin == 1` で検出して事前 skip するため、通常運用では未観測 ecode に突入しない。もし未観測 ecode で止まった場合は、`ECODES_ALREADY_DONE` にその ecode を追加してコミットする (恒常対応)。
+既達成スポットは `checkin` サブコマンドの実行前に `checkin_status.is_checkedin == 1` で検出して事前 skip するため、通常運用では未観測 ecode に突入しない。
+未観測 ecode で止まった場合は、`ECODES_ALREADY_DONE` にその ecode を追加してコミットする (恒常対応)。
 
-FailClosedError は `process_account` で捕捉され、`exit_code=1` として返る。タスクスケジューラや運用ログ上でも正常終了に見えないよう nonzero で抜ける仕様になっている。
+FailClosedError は `process_account` で捕捉され、`exit_code=1` として返る。
+タスクスケジューラや運用ログ上でも正常終了に見えないよう、nonzero で抜けるようにしている。
 
 ### 状態永続化
 
-`./profiles/{account}/canvasser_state.json` に、実 POST が成功した場合に限り atomic (`os.replace`) で書き出す。ドライランでは state を書き換えない。スキーマは次のとおり。
+`./profiles/{account}/canvasser_state.json` に、実 POST が成功した場合に限り atomic (`os.replace`) で書き出す。
+ドライランでは state を書き換えない。
+スキーマは次のとおり。
 
 ```json
 {
@@ -157,7 +169,8 @@ FailClosedError は `process_account` で捕捉され、`exit_code=1` として�
 }
 ```
 
-`schema_version` は resume で位置と時刻を引き継ぐ際の互換性チェックに使う。実 POST 由来と保証できる version のみを resume 起点として採用する (現状は `2`)。
+`schema_version` は resume で位置と時刻を引き継ぐ際の互換性チェックに使う。
+実 POST 由来と保証できる version のみを resume 起点として採用する (現状は `2`)。
 
 - 完了済みスポットの判定はサーバ側 `checkin_status.is_checkedin` に一本化しており、state にローカルコピーを持たない。
 - `spot_slug` は正規表現 `^cg_vote2026_[0-9]{1,6}$` にマッチする形式が必須 (schema 検証で strict チェック)。手動編集する場合は `cg_vote2026_19` のような実 slug 形式を守る。
@@ -189,7 +202,7 @@ Next.js チャンク解析で判明した仕様。
 
 ### AES 暗号化
 
-チェックイン POST の body は、位置情報 JSON を crypto-js 互換で暗号化した文字列を送る。
+チェックイン POST の body は、位置情報 JSON を crypto-js 互換で暗号化した文字列である。
 
 - password：`x-api-key` の値を流用する。
 - key derivation：`PBKDF2(password, salt=random16, iterations=500, keySize=8 words=32B, hasher=SHA1)`。
