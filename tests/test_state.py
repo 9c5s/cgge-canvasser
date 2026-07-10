@@ -4,6 +4,7 @@
 外部サービスには依存しない。
 """
 
+import json
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -265,6 +266,34 @@ class TestResumeContext:
                     "virtual_completed_at": "2026-07-03T12:30:00+09:00",
                 }
             },
+        )
+
+        lat, lng, _resume_at = canvasser.resume_context(tmp_path)
+
+        assert lat is None
+        assert lng == 135.0
+
+    def test_巨大intは非strictでNoneに丸める(self, tmp_path: Path) -> None:
+        """`10**400` 相当の巨大 int は `float(v)` で OverflowError を起こす。
+
+        resume 経路の緩い契約 (不正値 → None) から見て OverflowError の crash は
+        契約違反にあたるため、except で拾って None に丸めることを担保する。
+        手改変で state.json に巨大 int が入るシナリオを再現するため、
+        `save_account_state` 経由ではなくファイルに直接書き込む。
+        """
+        _state_file(tmp_path).write_text(
+            json.dumps(
+                {
+                    "last_checkin": {
+                        "schema_version": 2,
+                        "location_latitude": 10**400,
+                        "location_longitude": 135.0,
+                        "virtual_completed_at": "2026-07-03T12:30:00+09:00",
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
         )
 
         lat, lng, _resume_at = canvasser.resume_context(tmp_path)
