@@ -18,6 +18,10 @@ def as_page(fake: FakePage) -> Page:
     return cast("Page", fake)
 
 
+def noop_sleep(_seconds: float) -> None:
+    """テストで実待機を無効化する共通 sleep_fn 代替。"""
+
+
 class FakeLocator:
     """`page.locator(sel)` の戻り値を模したテストダブル。
 

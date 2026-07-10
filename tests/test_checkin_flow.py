@@ -19,6 +19,7 @@ from tests._fakes import (
     FakePage,
     as_page as _as_page,
     error_response,
+    noop_sleep as _no_sleep,
     success_response,
 )
 
@@ -74,10 +75,6 @@ def _spot_done(
 def _listing(spots: list[dict[str, Any]]) -> dict[str, Any]:
     """スポット一覧 GET の成功応答を組み立てる。"""
     return success_response({"spots": spots})
-
-
-def _no_sleep(_seconds: float) -> None:
-    """実待機を無効化する sleep_fn 代替。"""
 
 
 def _settings(
@@ -696,7 +693,7 @@ class TestCollectCheckinsDryRun:
         ゼロの初回相当として走る。
         """
         random.seed(0)
-        (tmp_path / "canvasser_state.json").write_text("{{{", encoding="utf-8")
+        (tmp_path / canvasser._STATE_FILENAME).write_text("{{{", encoding="utf-8")
         spots = [_spot(1, 35.00, 135.0)]
         fake = FakePage([_listing(spots)])
 
@@ -708,7 +705,7 @@ class TestCollectCheckinsDryRun:
 
     def test_破損stateは本番ならfail_closed(self, tmp_path: Path) -> None:
         """本番 (dry_run=False) では state 破損を FailClosedError で即停止する。"""
-        (tmp_path / "canvasser_state.json").write_text("{{{", encoding="utf-8")
+        (tmp_path / canvasser._STATE_FILENAME).write_text("{{{", encoding="utf-8")
         spots = [_spot(1, 35.00, 135.0)]
         fake = FakePage([_listing(spots)])
 
@@ -737,7 +734,7 @@ class TestCollectCheckinsDryRun:
         )
 
         assert gained == 10
-        assert not (tmp_path / "canvasser_state.json").exists()
+        assert not (tmp_path / canvasser._STATE_FILENAME).exists()
 
 
 _POST_OK: dict[str, Any] = success_response()

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 def _state_file(profile_dir: Path) -> Path:
     """profile_dir 配下の state ファイルパスを返す。"""
-    return profile_dir / "canvasser_state.json"
+    return profile_dir / canvasser._STATE_FILENAME
 
 
 def _spot(slug: str = "cg_vote2026_7") -> canvasser.Spot:
@@ -125,7 +125,7 @@ class TestSaveAccountState:
         canvasser.save_account_state(tmp_path, {})
 
         names = [p.name for p in tmp_path.iterdir()]
-        assert names == ["canvasser_state.json"]
+        assert names == [canvasser._STATE_FILENAME]
 
     def test_ディレクトリが無ければ作成する(self, tmp_path: Path) -> None:
         """profile_dir が未作成でも mkdir して保存する。"""
@@ -298,7 +298,7 @@ class TestResumeContext:
 
     def test_strictでは破損stateの例外が伝播する(self, tmp_path: Path) -> None:
         """本番経路相当の strict=True では破損を丸めず例外を上げる。"""
-        (tmp_path / "canvasser_state.json").write_text("{{{", encoding="utf-8")
+        _state_file(tmp_path).write_text("{{{", encoding="utf-8")
 
         with pytest.raises(StateFileCorruptedError, match="canvasser_state"):
             canvasser.resume_context(tmp_path, strict=True)

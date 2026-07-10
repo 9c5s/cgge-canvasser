@@ -14,7 +14,11 @@ from playwright.sync_api import Error as PlaywrightError
 
 import canvasser
 from canvasser import JST, AutoLoginOutcome, Credentials
-from tests._fakes import FakePage, as_page
+from tests._fakes import (
+    FakePage,
+    as_page,
+    noop_sleep as _noop_sleep,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -59,11 +63,6 @@ class _FakeClock:
         """呼ばれるたびに step ぶん進めて現在時刻を返す。"""
         self.now += self.step
         return self.now
-
-
-def _noop_sleep(_sec: float) -> None:
-    """time.sleep 差し替え用の noop (テストで時間を経過させないため)。"""
-    return
 
 
 def _install_fake_time(

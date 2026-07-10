@@ -431,15 +431,6 @@ class TestReceive:
         assert got == canvasser.MissionOutcome()
 
 
-def test_receive_returns_gained_on_success() -> None:
-    """`_receive` は PUT 成功時、獲得票数入りの MissionOutcome を返す。"""
-    fake = FakePage([success_response({"received_point": 5})])
-
-    result = canvasser._receive(_as_page(fake), 1, "テスト", 5, dry_run=False)
-
-    assert result == canvasser.MissionOutcome(gained=5)
-
-
 def test_receive_returns_linkage_expired_on_e1926() -> None:
     """`_receive` は受取 PUT が E1926 を返したら linkage_expired_id を伝搬する。"""
     fake = FakePage([_error_response("E1926")])
