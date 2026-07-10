@@ -668,21 +668,15 @@ def _coerce_finite_float(v: object, *, name: str) -> float:
     return f
 
 
-def _finite_float_or_none(v: object) -> float | None:
-    """有限な数値なら float に変換する。それ以外 (bool 含む) は None。"""
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, int | float) and math.isfinite(v):
-        return float(v)
-    return None
-
-
 def _finite_float_in_range_or_none(v: object, lo: float, hi: float) -> float | None:
-    """有限かつ [lo, hi] 内なら float、それ以外は None。resume 用の緩い経路。"""
-    f = _finite_float_or_none(v)
-    if f is None or not (lo <= f <= hi):
+    """有限かつ [lo, hi] 内なら float、それ以外 (bool 含む) は None を返す。
+
+    resume 用の緩い経路。手改変で入り込んだ NaN/Infinity/文字列も安全に落とす。
+    """
+    if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v):
         return None
-    return f
+    f = float(v)
+    return f if lo <= f <= hi else None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1113,15 +1107,10 @@ class _CheckinRunner:
         """このスポットの後にループを継続するかを判定する。
 
         呼び出し時点で attempted・successful は加算済み、`_remaining` からは
-        当該 spot が pop 済みという前提。dry_run の True と False で参照する
-        カウンタが違う点だけ注意する。
+        当該 spot が pop 済みという前提。budget 判定は `_budget_reached` に
+        委ねて 1 箇所で維持する。
         """
-        if not self._remaining:
-            return False
-        if self.settings.daily_budget <= 0:
-            return True
-        counter = self.attempted if not self.settings.dry_run else self.successful
-        return counter < self.settings.daily_budget
+        return bool(self._remaining) and not self._budget_reached()
 
     def _attempt(self, spot: Spot, index: int) -> None:
         """1 スポット分のチェックインを dry-run または実 POST で処理する。"""
@@ -1189,8 +1178,7 @@ class _CheckinRunner:
         # sleep 中に中断されても再開位置と時刻を失わないよう、成功直後に
         # last_checkin を保存する。既達成の重複回避はサーバ側 is_checkedin に
         # 一本化しているので、ここで local に completed 集合を持つ必要はない。
-        if self.settings.profile_dir is not None:
-            update_checkin_state(self.settings.profile_dir, spot, self.virtual_now)
+        update_checkin_state(self.settings.profile_dir, spot, self.virtual_now)
         if self._will_continue_after():
             self.settings.sleep_fn(stay_secs)
             self.virtual_now = self.virtual_now + timedelta(seconds=stay_secs)
@@ -1199,8 +1187,7 @@ class _CheckinRunner:
                 f" -> 出発 {self.virtual_now:%m/%d %H:%M %Z}"
             )
             # 滞在後の virtual_now を state に反映する (同じ spot への上書き相当)
-            if self.settings.profile_dir is not None:
-                update_checkin_state(self.settings.profile_dir, spot, self.virtual_now)
+            update_checkin_state(self.settings.profile_dir, spot, self.virtual_now)
 
     def _on_out_of_range(self, spot: Spot, ecode: str) -> None:
         """E5005 (範囲外) の後処理。累積が閾値に達したら fail closed で停止する。"""
@@ -1672,7 +1659,6 @@ def _matches_last_checkin_kind(v: object, kind: str) -> bool:
     matches_by_kind: dict[str, bool] = {
         "int": not isinstance(v, bool) and isinstance(v, int),
         "str": isinstance(v, str),
-        "finite_number": is_finite_num,
         "latitude": is_finite_num and _LAT_MIN <= cast("float", v) <= _LAT_MAX,
         "longitude": is_finite_num and _LNG_MIN <= cast("float", v) <= _LNG_MAX,
     }
@@ -1775,30 +1761,35 @@ def load_account_state(profile_dir: Path, *, strict: bool = False) -> dict[str, 
     return state
 
 
-def save_account_state(profile_dir: Path, state: dict[str, Any]) -> None:
-    """`profile_dir/canvasser_state.json` に atomic に書き出す。
+def _atomic_write_json(path: Path, data: object, *, tmp_prefix: str) -> None:
+    """`path` に JSON を atomic に書き出す。
 
     一時ファイルへ書いて fsync してから `os.replace` で置換する。書き込み中に
-    クラッシュしても既存ファイルは壊れない。
+    クラッシュしても既存ファイルは壊れない。`allow_nan=False` で NaN/Infinity
+    の書き出しを ValueError にする (JSON 標準外の拡張出力を state に載せない)。
     """
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    state_file = profile_dir / _STATE_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
-        prefix=".canvasser_state-", suffix=".tmp", dir=str(profile_dir)
+        prefix=tmp_prefix, suffix=".tmp", dir=str(path.parent)
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            # allow_nan=False で NaN/Infinity の書き出しを ValueError にする
-            # (JSON 標準外の拡張出力を state に載せない)
-            json.dump(state, f, ensure_ascii=False, indent=2, allow_nan=False)
+            json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
             f.flush()
             os.fsync(f.fileno())
-        Path(tmp_path).replace(state_file)
+        Path(tmp_path).replace(path)
     except Exception:
-        # 失敗時は一時ファイルだけ掃除して例外を伝播する (state_file はそのまま残す)
+        # 失敗時は一時ファイルだけ掃除して例外を伝播する (path はそのまま残す)
         with contextlib.suppress(OSError):
             Path(tmp_path).unlink()
         raise
+
+
+def save_account_state(profile_dir: Path, state: dict[str, Any]) -> None:
+    """`profile_dir/canvasser_state.json` に atomic に書き出す。"""
+    _atomic_write_json(
+        profile_dir / _STATE_FILENAME, state, tmp_prefix=".canvasser_state-"
+    )
 
 
 @dataclass(kw_only=True)
@@ -2014,13 +2005,9 @@ class ReloginGuard:
     disabled_until: str | None = None
 
 
-def _relogin_guard_file(profile_dir: Path) -> Path:
-    return profile_dir / _RELOGIN_GUARD_FILENAME
-
-
 def load_relogin_guard(profile_dir: Path) -> ReloginGuard:
     """profile_dir/relogin_guard.json を読み込む。欠損・破損は既定値。"""
-    path = _relogin_guard_file(profile_dir)
+    path = profile_dir / _RELOGIN_GUARD_FILENAME
     if not path.exists():
         return ReloginGuard()
     try:
@@ -2048,34 +2035,27 @@ def load_relogin_guard(profile_dir: Path) -> ReloginGuard:
 
 def save_relogin_guard(profile_dir: Path, guard: ReloginGuard) -> None:
     """profile_dir/relogin_guard.json に atomic に書き出す。"""
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    path = _relogin_guard_file(profile_dir)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=".relogin_guard-", suffix=".tmp", dir=str(profile_dir)
+    _atomic_write_json(
+        profile_dir / _RELOGIN_GUARD_FILENAME,
+        asdict(guard),
+        tmp_prefix=".relogin_guard-",
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(asdict(guard), f, ensure_ascii=False, indent=2, allow_nan=False)
-            f.flush()
-            os.fsync(f.fileno())
-        Path(tmp_path).replace(path)
-    except Exception:
-        with contextlib.suppress(OSError):
-            Path(tmp_path).unlink()
-        raise
 
 
 def update_checkin_state(
-    profile_dir: Path,
+    profile_dir: Path | None,
     spot: Spot,
     virtual_now: datetime,
 ) -> None:
     """1 件チェックイン成功時に `last_checkin` を更新する。
 
+    `profile_dir=None` (テスト用途で state を持たない runner) は no-op。
     実行中の破損 state を空 dict で上書きしてしまわないよう、読み込みは
     strict にする (本番経路からのみ呼ばれる)。legacy キーの除去は
     `load_account_state` に一本化しているため、ここでは扱わない。
     """
+    if profile_dir is None:
+        return
     state = load_account_state(profile_dir, strict=True)
     state["last_checkin"] = {
         "schema_version": LAST_CHECKIN_SCHEMA_VERSION,
@@ -2099,11 +2079,10 @@ def resume_context(
     # できないため resume には使わない。旧 dry-run の simulated route を
     # 本番 run の起点にすると、偽の位置と時刻から始まって有効スポットを
     # skip する事故になる。
-    schema_ok = last.get("schema_version") == LAST_CHECKIN_SCHEMA_VERSION
-    lat = last.get("location_latitude") if schema_ok else None
-    lng = last.get("location_longitude") if schema_ok else None
-    raw = last.get("virtual_completed_at") if schema_ok else None
+    if last.get("schema_version") != LAST_CHECKIN_SCHEMA_VERSION:
+        return None, None, None
     resume_at: datetime | None = None
+    raw = last.get("virtual_completed_at")
     if raw:
         with contextlib.suppress(ValueError):
             resume_at = _as_jst_aware(datetime.fromisoformat(raw))
@@ -2111,11 +2090,13 @@ def resume_context(
     # NaN/Infinity/範囲外の座標が入っていても ValueError にせず None
     # (resume 情報なし) に丸める。strict 経路とは違い、破損 dry-run 起動を
     # 単に「resume 位置なしの初回相当」として続行させる。
-    return (
-        _finite_float_in_range_or_none(lat, _LAT_MIN, _LAT_MAX),
-        _finite_float_in_range_or_none(lng, _LNG_MIN, _LNG_MAX),
-        resume_at,
+    lat = _finite_float_in_range_or_none(
+        last.get("location_latitude"), _LAT_MIN, _LAT_MAX
     )
+    lng = _finite_float_in_range_or_none(
+        last.get("location_longitude"), _LNG_MIN, _LNG_MAX
+    )
+    return lat, lng, resume_at
 
 
 def _install_chromium() -> None:
@@ -2434,9 +2415,18 @@ def _run_auto_login_sequence(
     return retry_outcome, submitted + retry_submitted
 
 
-def _run_guarded_auto_login(page: Page, profile_dir: Path, name: str) -> bool:
+def _run_guarded_auto_login(
+    page: Page,
+    profile_dir: Path,
+    name: str,
+    *,
+    credentials: Credentials | None = None,
+) -> bool:
     """`credentials` + `guard` を読み、ガード付きで auto_login し成功なら True を返す。
 
+    - credentials は呼び出し側で既に読み込んでいれば渡す (Chrome Login Data の
+      復号は重い処理なので、attempt_auto_relogin の事前チェックで得た値を
+      再利用する)。渡されない場合はここで `load_credentials` する。
     - credentials の復号に失敗したら False。
     - `guard.disabled_until` が未来なら False (連続失敗ガードで無言スキップ)。
     - `_run_auto_login_sequence` を呼び、SUCCESS なら guard をリセットし、失敗
@@ -2445,7 +2435,8 @@ def _run_guarded_auto_login(page: Page, profile_dir: Path, name: str) -> bool:
     - `attempt_auto_relogin` と ASOBI 連携復旧ドライバ (Task 8) の両方から呼ぶ
       共有ヘルパーである。
     """
-    credentials = load_credentials(profile_dir)
+    if credentials is None:
+        credentials = load_credentials(profile_dir)
     if credentials is None:
         return False
     guard = load_relogin_guard(profile_dir)
@@ -2508,7 +2499,7 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
         _reset_relogin_failure(profile_dir, guard)
         return True
 
-    return _run_guarded_auto_login(page, profile_dir, name)
+    return _run_guarded_auto_login(page, profile_dir, name, credentials=credentials)
 
 
 LINKAGE_ENTRY_URL = (
