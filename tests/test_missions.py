@@ -349,7 +349,7 @@ def test_collect_missions_no_auto_relogin_skips_recovery(
 
     ユーザーが明示的に自動再ログインを opt-out している場合、driver 経由で
     BNID 保存パスワードが submit される経路も遮断する必要がある。
-    E1926 だったミッションはスキップし、翌日再試行に落とす。
+    E1926 だったミッションはスキップし、翌日再試行へ回す。
     """
     call_log: list[str] = []
 

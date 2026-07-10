@@ -146,7 +146,7 @@ class TestProfilesDirIsGitignored:
     def test_gitが見つからなければFalse(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """git 不在では誤コミット経路を判定できないため拒否側に倒す。"""
+        """git 不在では誤コミット経路を判定できないため拒否側として扱う。"""
         monkeypatch.setattr(canvasser.shutil, "which", _which_none)
 
         assert canvasser._profiles_dir_is_gitignored(tmp_path / "profiles") is False
@@ -182,7 +182,7 @@ class TestProfilesDirIsGitignored:
     def test_subprocess例外はFalseに丸める(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception
     ) -> None:
-        """check-ignore の実行自体が失敗しても例外にせず拒否側に倒す。"""
+        """check-ignore の実行自体が失敗しても例外にせず拒否側として扱う。"""
         monkeypatch.setattr(canvasser.shutil, "which", _which_git)
 
         def raise_exc(_cmd: list[str], **_kwargs: object) -> object:

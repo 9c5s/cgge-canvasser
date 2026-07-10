@@ -97,7 +97,7 @@ class TestEstimateTravelSecondsHaversine:
 class TestEstimateTravelSeconds:
     """estimate_travel_seconds のフォールバック合流。"""
 
-    def test_GMAPSキー未設定ならHaversineに落ちる(self) -> None:
+    def test_GMAPSキー未設定ならHaversineへフォールバックする(self) -> None:
         """キー無しでは gmaps を使わず Haversine の結果をそのまま返す。"""
         got = canvasser.estimate_travel_seconds(35.0, 135.0, 35.0, 135.0)
         assert got == (0.0, "walk")
@@ -223,7 +223,7 @@ class TestEstimateTravelSecondsGmaps:
 
         assert got == (800.0, "gmaps-driving")
 
-    def test_driving_fallbackはduration_in_traffic欠落時はdurationに落ちる(
+    def test_driving_fallbackはduration_in_traffic欠落時にdurationへフォールバックする(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """duration_in_traffic 欠落時は既存の duration にフォールバックする。"""

@@ -246,7 +246,7 @@ class TestSpotFromApi:
         assert canvasser.Spot.from_api(raw).is_checkedin is False
 
     def test_checkin_status_is_checkedin_0は未達成扱いになる(self) -> None:
-        """将来 is_checkedin=0 の中間状態が来ても未達成側に倒す (防御)。"""
+        """将来 is_checkedin=0 の中間状態が来ても未達成側として扱う (防御)。"""
         raw = _spot(1, 35.0, 135.0)
         raw["checkin_status"] = {"is_checkedin": 0}
 
@@ -267,7 +267,7 @@ class TestSpotFromApi:
         assert canvasser.Spot.from_api(raw).is_checkedin is False
 
     def test_is_checkedinが文字列1は未達成扱いになる(self) -> None:
-        """`"1"` のような文字列値も未知値として未達成側に倒す。"""
+        """`"1"` のような文字列値も未知値として未達成側として扱う。"""
         raw = _spot(1, 35.0, 135.0)
         raw["checkin_status"] = {"is_checkedin": "1"}
 
@@ -486,7 +486,7 @@ class TestSkipDoesNotAdvanceOrigin:
     def test_パース不能スポットへtravel_estimationは呼ばれない(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """段 1 のパース不能判定で fail_closed に落ち、estimate を呼ばずに済む。"""
+        """段 1 のパース不能判定で fail_closed に至り、estimate を呼ばずに済む。"""
         calls = self._spy_travel(monkeypatch)
         spot1 = _typed(1, 35.00, 135.0)
         spot2 = _typed(2, 40.00, 135.0, deadline="invalid-date")
@@ -507,7 +507,7 @@ class TestSkipDoesNotAdvanceOrigin:
     def test_現在時点期限切れスポットへtravel_estimationは呼ばれない(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """段 1 の現在時点期限切れ判定で skip に落ち、estimate を呼ばずに済む。"""
+        """段 1 の現在時点期限切れ判定で skip 側に振り、estimate を呼ばずに済む。"""
         calls = self._spy_travel(monkeypatch)
         spot1 = _typed(1, 35.00, 135.0)  # 期限内
         spot2 = _typed(2, 40.00, 135.0, deadline="2026-01-01 00:00:00")
