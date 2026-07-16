@@ -237,6 +237,20 @@ def _redact_secrets(text: str) -> str:
     return _SECRET_QUERY_RE.sub(r"\1***", text)
 
 
+# 例外メッセージや state ファイルパスに紛れ込む Windows 絶対パスを basename に
+# 丸める。`C:\Users\<name>\projects\cgge-canvasser\profiles\shun\Default\Login Data`
+# のようなパスは Windows ユーザー名を含む PII だが、永続ログに残ると診断上の価値
+# より漏洩リスクの方が大きい。
+_ABS_WIN_PATH_RE = re.compile(
+    r"[A-Za-z]:[\\/](?:[^\\/\s\"'<>|?*:]+[\\/])+([^\\/\s\"'<>|?*:]+)"
+)
+
+
+def _sanitize_paths(text: str) -> str:
+    """メッセージ内の Windows 絶対パスを basename だけに丸めた文字列を返す。"""
+    return _ABS_WIN_PATH_RE.sub(r"<path>/\1", text)
+
+
 def _success_payload_or_raise(res: dict[str, Any], err_prefix: str) -> dict[str, Any]:
     """成功応答の payload を取り出す。失敗応答なら RuntimeError を送出する。
 
@@ -2985,8 +2999,12 @@ def process_account(
             except FailClosedError as e:
                 # fail-closed 前に成功していた POST の reward は
                 # e.partial_gained に入っているので、集計から落とさないよう合流させる。
-                # 意図的な中断のため traceback は出さない (メッセージのみ)
-                logger.error("[%s] fail closed: %s", name, e)  # noqa: TRY400
+                # 意図的な中断のため traceback は出さない (メッセージのみ)。
+                # message には state ファイルの絶対パスが載る経路があるため
+                # ここで sanitize して永続ログに Windows ユーザー名を残さない。
+                logger.error(  # noqa: TRY400
+                    "[%s] fail closed: %s", name, _sanitize_paths(str(e))
+                )
                 if not options.dry_run:
                     gained += e.partial_gained
                 exit_code = 1
@@ -3182,11 +3200,15 @@ def _ensure_profiles_dir_ignored(args: argparse.Namespace, profiles_dir: Path) -
 
 
 def _setup_logging(command: str) -> None:
-    """Logger にコンソール (stderr) と、必要に応じてファイルハンドラを装着する。
+    """Logger にコンソール (stdout/stderr) と、必要に応じてファイルハンドラを装着する。
 
     mission / checkin は日次自動実行される。永続ログを ``logs/{command}.log``
     へ追記モードで積み上げる。login は対話 1 回きりのため、ファイルログは
     付けない。ローテーションは意図的にしない (肥大化したら手動整理)。
+
+    コンソールは INFO/DEBUG を stdout、WARNING 以上を stderr に振り分ける。
+    従来 print (=stdout) だった通常進捗を `> run.log` で redirect できる
+    互換を保つため。
     """
     logger.setLevel(logging.INFO)
     # テストや再入からの多重装着を防ぐため、毎回既存ハンドラをクリアする。
@@ -3195,9 +3217,16 @@ def _setup_logging(command: str) -> None:
         logger.removeHandler(h)
         h.close()
 
-    console = logging.StreamHandler(sys.stderr)
-    console.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(console)
+    fmt = logging.Formatter("%(message)s")
+    info_console = logging.StreamHandler(sys.stdout)
+    info_console.setFormatter(fmt)
+    info_console.addFilter(lambda r: r.levelno < logging.WARNING)
+    logger.addHandler(info_console)
+
+    err_console = logging.StreamHandler(sys.stderr)
+    err_console.setFormatter(fmt)
+    err_console.setLevel(logging.WARNING)
+    logger.addHandler(err_console)
 
     if command in LOGGABLE_COMMANDS:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -3254,8 +3283,16 @@ def _main_impl() -> int:
             try:
                 gained, code = process_account(p, name, profile_dir, options)
             # 1 アカウントの失敗で全体を止めないため、意図して広く握る
-            except Exception:
-                logger.exception("[%s] 実行中に例外", name)
+            except Exception as e:  # noqa: BLE001
+                # 永続ログに traceback (=絶対パス含む) を残さないため logger.error
+                # に落とし、例外 message も sanitize してから書く。詳細な traceback
+                # が必要な場合はコンソール実行で再現する。
+                logger.error(  # noqa: TRY400
+                    "[%s] 実行中に例外: %s: %s",
+                    name,
+                    type(e).__name__,
+                    _sanitize_paths(str(e)),
+                )
                 exit_code = 1
                 results.append((name, 0))
                 continue

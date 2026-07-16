@@ -1,6 +1,7 @@
 """_setup_logging の契約検証 (handler の配置、file 出力、多重装着回避)。"""
 
 import logging
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -49,18 +50,18 @@ def _console_handlers() -> list[logging.Handler]:
 class TestSetupLogging:
     """`_setup_logging` は起動時に 1 度だけ呼ばれ、handler 構成を決定する契約。"""
 
-    def test_missionはfile_handlerとconsoleの2枚を装着する(
+    def test_missionはfile_handlerと2枚のconsoleを装着する(
         self, tmp_path: Path
     ) -> None:
-        """mission は永続ログ対象 → file handler + console の 2 枚。"""
+        """mission → file handler 1 枚 + console 2 枚 (stdout/stderr split)。"""
         canvasser._setup_logging("mission")
 
         file_handlers = _file_handlers()
         assert len(file_handlers) == 1
         assert Path(file_handlers[0].baseFilename) == tmp_path / "logs" / "mission.log"
-        assert len(_console_handlers()) == 1
+        assert len(_console_handlers()) == 2
 
-    def test_checkinはfile_handlerとconsoleの2枚を装着する(
+    def test_checkinはfile_handlerと2枚のconsoleを装着する(
         self, tmp_path: Path
     ) -> None:
         """checkin も永続ログ対象 → mission と同じ構成 (ファイル名だけ異なる)。"""
@@ -70,20 +71,20 @@ class TestSetupLogging:
         assert len(file_handlers) == 1
         assert Path(file_handlers[0].baseFilename) == tmp_path / "logs" / "checkin.log"
 
-    def test_loginはconsoleだけを装着しfile_handlerは付けない(self) -> None:
-        """login は対話 1 回きりなのでファイル永続化しない (要件)。"""
+    def test_loginは2枚のconsoleだけを装着しfile_handlerは付けない(self) -> None:
+        """login は対話 1 回きりなのでファイル永続化しない (要件)。console は 2 枚。"""
         canvasser._setup_logging("login")
 
         assert _file_handlers() == []
-        assert len(_console_handlers()) == 1
+        assert len(_console_handlers()) == 2
 
     def test_二回呼んでもhandlerは重複しない(self) -> None:
-        """テストや再入で複数回呼ばれても handler は 2 枚を超えない。"""
+        """テストや再入で複数回呼ばれても handler の枚数は増えない。"""
         canvasser._setup_logging("mission")
         canvasser._setup_logging("mission")
 
         assert len(_file_handlers()) == 1
-        assert len(_console_handlers()) == 1
+        assert len(_console_handlers()) == 2
 
     def test_サブコマンドを切り替えるとfile_handlerも切り替わる(
         self, tmp_path: Path
@@ -110,12 +111,37 @@ class TestSetupLogging:
         assert (tmp_path / "logs").is_dir()
 
     def test_console_formatterはmessageのみ(self) -> None:
-        """コンソール出力は従来 print 互換のため message だけを流す。"""
+        """コンソール 2 枚とも従来 print 互換の message だけを流す。"""
         canvasser._setup_logging("mission")
 
-        console = _console_handlers()[0]
-        assert console.formatter is not None
-        assert console.formatter._fmt == "%(message)s"
+        for console in _console_handlers():
+            assert console.formatter is not None
+            assert console.formatter._fmt == "%(message)s"
+
+    def test_console_infoはstdoutに向く(self) -> None:
+        """INFO 以下の進捗は従来の print と同じく stdout に向ける。"""
+        canvasser._setup_logging("mission")
+
+        stdout_consoles = [
+            h for h in _console_handlers() if getattr(h, "stream", None) is sys.stdout
+        ]
+        assert len(stdout_consoles) == 1
+        h = stdout_consoles[0]
+        # filter が WARNING 未満のみ通す。Handler.filter は通過時に truthy を返す。
+        info = logging.LogRecord("canvasser", logging.INFO, "", 0, "msg", None, None)
+        warn = logging.LogRecord("canvasser", logging.WARNING, "", 0, "msg", None, None)
+        assert h.filter(info)
+        assert not h.filter(warn)
+
+    def test_console_warningはstderrに向く(self) -> None:
+        """WARNING 以上のみ stderr の handler に流す。"""
+        canvasser._setup_logging("mission")
+
+        stderr_consoles = [
+            h for h in _console_handlers() if getattr(h, "stream", None) is sys.stderr
+        ]
+        assert len(stderr_consoles) == 1
+        assert stderr_consoles[0].level == logging.WARNING
 
     def test_file_formatterはtimestampとlevelnameを持つ(self) -> None:
         """永続ログは時刻とレベルを付ける (診断時の時系列追跡のため)。"""

@@ -1,8 +1,8 @@
-"""ロギング補助関数 (`_redact_secrets`, `_log_body`) の直接検証。"""
+"""ロギング補助関数 (`_redact_secrets`, `_log_body`, `_sanitize_paths`) の直接検証。"""
 
 import pytest
 
-from canvasser import _log_body, _redact_secrets
+from canvasser import _log_body, _redact_secrets, _sanitize_paths
 
 
 class TestRedactSecrets:
@@ -125,3 +125,52 @@ class TestLogBody:
         got = _log_body({"status": "SUCCESS", "payload": {"other": 1}})
 
         assert got == "{status='SUCCESS'}"
+
+
+class TestSanitizePaths:
+    """`_sanitize_paths` は例外メッセージ内の Windows 絶対パスを basename に丸める。"""
+
+    def test_絶対パスは_path_プレフィックスとbasenameに置換される(self) -> None:
+        """Windows ユーザー名を含むフルパスは basename だけ残す。"""
+        text = r"C:\Users\shun\projects\cgge-canvasser\profiles\shun\Default\Login Data"
+
+        got = _sanitize_paths(text)
+
+        assert "shun" not in got
+        assert got.endswith("Login Data")
+        assert "<path>/" in got
+
+    def test_forward_slash区切りにも対応する(self) -> None:
+        """Path.as_posix() 由来の forward slash パスも丸められる。"""
+        text = "C:/Users/shun/projects/cgge-canvasser/profiles/shun/state.json"
+
+        got = _sanitize_paths(text)
+
+        assert "shun" not in got
+        assert got.endswith("state.json")
+
+    def test_文の中に紛れた絶対パスも置換する(self) -> None:
+        """例外メッセージ内に埋め込まれたパスも対象。"""
+        text = r"OSError: cannot open C:\Users\shun\project\file.txt for reading"
+
+        got = _sanitize_paths(text)
+
+        assert "shun" not in got
+        assert "cannot open" in got
+        assert "for reading" in got
+
+    def test_絶対パスを含まないメッセージは変更しない(self) -> None:
+        """相対パスやただの文字列はそのまま返す。"""
+        text = "connection reset by peer"
+
+        assert _sanitize_paths(text) == text
+
+    def test_複数のパスをすべて置換する(self) -> None:
+        """メッセージ内に複数の Windows パスが並んでも全部丸める。"""
+        text = r"src=C:\Users\shun\a.txt dst=C:\Users\shun\b.txt"
+
+        got = _sanitize_paths(text)
+
+        assert "shun" not in got
+        assert "a.txt" in got
+        assert "b.txt" in got
