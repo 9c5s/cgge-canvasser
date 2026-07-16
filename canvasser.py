@@ -188,18 +188,48 @@ def _is_success_response(res: dict[str, Any]) -> bool:
     return res["status"] == 200 and body is not None and body.get("status") == "SUCCESS"
 
 
-# 永続ログ (logs/mission.log 等) に API 応答 body 全体をそのまま残すと、
-# 長期運用でログサイズが肥大化しやすく、また将来的に body に含まれる可能性の
-# ある値も無制限に残ってしまう。診断に必要な先頭部分だけを残す。
-_LOG_BODY_MAX = 200
+# 永続ログ (logs/mission.log 等) には API 応答 body 全体を残さず、既知の
+# 診断キー (status / ecode / message) だけを allowlist で抽出する。raw body を
+# 部分的に残す truncate 方式では、将来 body に載る値も無制限に残ってしまうため、
+# allowlist が唯一の安全な方針。
+_LOG_BODY_PAYLOAD_KEYS = ("ecode", "message")
 
 
 def _log_body(body: object) -> str:
-    """API 応答 body を永続ログ向けに truncate した表現に変換する。"""
-    text = str(body)
-    if len(text) <= _LOG_BODY_MAX:
-        return text
-    return f"{text[:_LOG_BODY_MAX]}...(len={len(text)})"
+    """API 応答 body から診断に必要な既知キーだけを抽出する。
+
+    - dict 応答: `status` と `payload.ecode` / `payload.message` があれば載せる
+    - 未知形状: 型名と文字列長だけ残す (raw は残さない)
+    """
+    body_dict = _as_str_dict(body)
+    if body_dict is None:
+        return f"<{type(body).__name__}, len={len(str(body))}>"
+    parts: list[str] = []
+    if "status" in body_dict:
+        parts.append(f"status={body_dict.get('status')!r}")
+    payload = _as_str_dict(body_dict.get("payload"))
+    if payload is not None:
+        parts.extend(
+            f"payload.{key}={payload.get(key)!r}"
+            for key in _LOG_BODY_PAYLOAD_KEYS
+            if key in payload
+        )
+    if not parts:
+        return f"<dict, len={len(str(body))}>"
+    return "{" + ", ".join(parts) + "}"
+
+
+# URL クエリに載る API key / signature を伏せる。Google Maps 例外の str() は
+# 失敗した URL 全体 (`https://maps.googleapis.com/...?key=GMAPS_KEY&...`) を
+# そのまま含み得るため、永続ログには redact してから残す。
+_SECRET_QUERY_RE = re.compile(
+    r"([?&](?:key|signature|api[_-]?key)=)[^&\s#]+", re.IGNORECASE
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """URL 内の機密クエリ値 (key / signature 系) を伏せた文字列を返す。"""
+    return _SECRET_QUERY_RE.sub(r"\1***", text)
 
 
 def _success_payload_or_raise(res: dict[str, Any], err_prefix: str) -> dict[str, Any]:
@@ -1420,9 +1450,13 @@ def _get_gmaps_client() -> googlemaps.Client | None:
     # ライブラリが送出しうる例外を列挙できないため、初期化失敗は広く握って
     # Haversine フォールバックへ丸める
     except Exception as e:  # noqa: BLE001
+        # 例外の str() には URL 経由で GMAPS_KEY が載る可能性がある。type と
+        # redact 済み message だけ残す。
         logger.warning(
-            "Google Maps クライアント初期化失敗: %s。Haversine にフォールバックする。",
-            e,
+            "Google Maps クライアント初期化失敗: %s (%s)。"
+            "Haversine にフォールバックする。",
+            type(e).__name__,
+            _redact_secrets(str(e)),
         )
         return None
 
@@ -1444,7 +1478,12 @@ def _directions_driving_fallback(
         )
     # API 失敗は呼び出し側の Haversine フォールバックへ丸めるため広く握る
     except Exception as e:  # noqa: BLE001
-        logger.warning("  gmaps driving 再試行失敗: %s", e)
+        # GMAPS_KEY 漏洩防止のため type と redact 済み message に絞る。
+        logger.warning(
+            "  gmaps driving 再試行失敗: %s (%s)",
+            type(e).__name__,
+            _redact_secrets(str(e)),
+        )
         return None
     if not result:
         return None
@@ -1503,7 +1542,12 @@ def _estimate_travel_seconds_gmaps(
         )
     # API 失敗は呼び出し側の Haversine フォールバックへ丸めるため広く握る
     except Exception as e:  # noqa: BLE001
-        logger.warning("  gmaps directions 失敗: %s", e)
+        # GMAPS_KEY 漏洩防止のため type と redact 済み message に絞る。
+        logger.warning(
+            "  gmaps directions 失敗: %s (%s)",
+            type(e).__name__,
+            _redact_secrets(str(e)),
+        )
         return None
 
     if result:
@@ -1946,9 +1990,11 @@ def _decode_dpapi_blob(local_state: Path, encrypted_b64: str) -> bytes | None:
         logger.warning("encrypted_key の base64 デコード失敗: %s", e)
         return None
     if not encrypted.startswith(b"DPAPI"):
-        # 絶対パス全体は永続ログに残さず basename だけ出す (PII 対策)
+        # 呼び出し側で local_state = profile_dir / "Local State" として構築されて
+        # おり、parent.name = profile_dir.name (= account 相当) を取り出せる。
+        # 他の warning と揃えて account prefix にする。
         logger.warning(
-            "Local State (%s) の DPAPI プレフィックスが無い", local_state.name
+            "[%s] Local State の DPAPI プレフィックスが無い", local_state.parent.name
         )
         return None
     return encrypted[5:]

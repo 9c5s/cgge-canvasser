@@ -103,3 +103,27 @@ class TestSetupLogging:
         canvasser._setup_logging("mission")
 
         assert (tmp_path / "logs").is_dir()
+
+    def test_console_formatterはmessageのみ(self) -> None:
+        """コンソール出力は従来 print 互換のため message だけを流す。"""
+        canvasser._setup_logging("mission")
+
+        console = _console_handlers()[0]
+        assert console.formatter is not None
+        assert console.formatter._fmt == "%(message)s"
+
+    def test_file_formatterはtimestampとlevelnameを持つ(self) -> None:
+        """永続ログは時刻とレベルを付ける (診断時の時系列追跡のため)。"""
+        canvasser._setup_logging("mission")
+
+        fh = _file_handlers()[0]
+        assert fh.formatter is not None
+        assert fh.formatter._fmt == "%(asctime)s %(levelname)s: %(message)s"
+
+    def test_file_handlerはutf8で開く(self) -> None:
+        """日本語メッセージが Windows 既定 cp932 で mojibake しないよう utf-8 固定。"""
+        canvasser._setup_logging("mission")
+
+        fh = _file_handlers()[0]
+        assert fh.encoding is not None
+        assert fh.encoding.lower().replace("-", "") == "utf8"
