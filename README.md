@@ -104,6 +104,19 @@ Register-ScheduledTask -TaskName "cgge-canvasser" -Action $action -Trigger $trig
 
 登録済みのタスクを更新する手順、および rollback 時の手順は `docs/superpowers/specs/2026-07-08-chrome-login-data-auto-relogin-design.md` の Rollout 節を参照。
 
+### 実行ログ (`logs/`)
+
+`mission` と `checkin` は実行の全出力を永続ログにも書き出す (`login` は対話 1 回きりのため対象外)。
+
+- 出力先: `logs/mission.log`、`logs/checkin.log` (canvasser.py と同じディレクトリの `logs/` を自動作成)
+- モード: 追記 (append)。日付ローテーションなし
+- フォーマット: `2026-07-16 12:28:42,123 INFO: <メッセージ>`
+- コンソール出力 (stderr) は従来どおり残る
+
+ローテーションは意図的に付けていない (「1 ファイルに積み上げる」運用方針)。長期運用でファイルサイズが問題になったら、実行が動いていないタイミングで `logs/mission.log` / `logs/checkin.log` を rename して手動でアーカイブする。
+
+`logs/` は `.gitignore` に入っている (Cookie 誤コミット防止と同じ扱い)。
+
 ## 挙動の要点
 
 ### ASOBI STORE 連携の自動復旧

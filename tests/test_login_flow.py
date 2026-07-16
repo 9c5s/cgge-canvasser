@@ -213,7 +213,7 @@ class TestAutoLogin:
         assert "タイムアウト" in caplog.text
 
     def test_click時のPlaywrightErrorはpollingに進みsubmitted1(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """click() が PlaywrightError を raise した場合の扱い。
 
