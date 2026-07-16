@@ -16,6 +16,11 @@ def isolate_logger(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[
     saved_handlers = list(canvasser.logger.handlers)
     saved_level = canvasser.logger.level
     saved_propagate = canvasser.logger.propagate
+    # テスト中に _setup_logging が logger.handlers を iterate して close() するため、
+    # 事前に外しておかないと saved_handlers 内の handler まで close されてしまう。
+    # teardown で restore する契約を守るため、close はテストで装着したもの限定。
+    for h in saved_handlers:
+        canvasser.logger.removeHandler(h)
     yield
     # 装着した FileHandler を close してファイルロックを外す
     for h in list(canvasser.logger.handlers):
