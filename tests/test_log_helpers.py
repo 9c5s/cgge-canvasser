@@ -135,15 +135,19 @@ class TestLogBody:
 class TestSanitizePaths:
     """`_sanitize_paths` は例外メッセージ内の Windows 絶対パスを basename に丸める。"""
 
-    def test_絶対パスは_path_プレフィックスとbasenameに置換される(self) -> None:
-        """Windows ユーザー名を含むフルパスは basename だけ残す。"""
-        text = r"C:\Users\shun\projects\cgge-canvasser\profiles\shun\Default\Login Data"
+    def test_拡張子なしパスはUsers下のユーザー名だけ丸まる(self) -> None:
+        """拡張子なしファイル (Chrome の `Login Data` など) は step2 の対象外。
+
+        Users home の Windows ユーザー名は step1 で消えるが、それ以下の
+        account 名などは canvasser の意図的な表示として残る。
+        """
+        text = r"C:\Users\shun\projects\cgge-canvasser\profiles\main\Default\Login Data"
 
         got = _sanitize_paths(text)
 
-        assert "shun" not in got
-        assert got.endswith("Login Data")
-        assert "<path>/" in got
+        # Users 直下の Windows ユーザー名は消える
+        assert r"\Users\shun\\" not in got.replace("\\\\", "\\")
+        assert "<user>" in got
 
     def test_forward_slash区切りにも対応する(self) -> None:
         """Path.as_posix() 由来の forward slash パスも丸められる。"""
@@ -201,6 +205,29 @@ class TestSanitizePaths:
         assert "<user>" not in got
         assert got.endswith("file.txt")
         assert "<path>/" in got
+
+    def test_スペース入り中間ディレクトリも巻き込んで丸める(self) -> None:
+        r"""OneDrive - Corp などスペース入り中間ディレクトリも 1 度で redact される。"""
+        text = (
+            r"C:\Users\Jane Doe\OneDrive - Corp"
+            r"\cgge-canvasser\profiles\main\canvasser_state.json"
+        )
+
+        got = _sanitize_paths(text)
+
+        for leak in ("Jane", "Doe", "OneDrive", "Corp", "profiles", "main"):
+            assert leak not in got, got
+        assert got.endswith("canvasser_state.json")
+
+    def test_文の後続テキストを貪欲に巻き込まない(self) -> None:
+        r"""`cannot open C:\path\file.txt for reading` は basename で切れる。"""
+        text = r"cannot open C:\path\file.txt for reading"
+
+        got = _sanitize_paths(text)
+
+        assert got.startswith("cannot open ")
+        assert got.endswith(" for reading")
+        assert "<path>/file.txt" in got
 
 
 class TestSanitizeException:

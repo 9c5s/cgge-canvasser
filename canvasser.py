@@ -247,11 +247,16 @@ _WIN_USER_HOME_RE = re.compile(
     r"([A-Za-z]:[\\/]Users[\\/])[^\\/\r\n\"'<>|?*]+",
     re.IGNORECASE,
 )
-_ABS_WIN_PATH_RE = re.compile(
-    # `<` `>` は step1 が挿入する `<user>` プレースホルダを step2 が跨いで match
-    # できるよう、除外リストから外す (Windows パスとしても実在しない文字なので
-    # 副作用はない)。
-    r"[A-Za-z]:[\\/](?:[^\\/\s\"'|?*:]+[\\/])+([^\\/\s\"'|?*:]+)"
+_ABS_WIN_PATH_WITH_EXT_RE = re.compile(
+    # 拡張子で終わる絶対パスに絞る。lazy `+?` + `.<ext>` を anchor にすることで
+    # `cannot open C:\path\file.txt for reading` の `for reading` まで巻き込む
+    # 貪欲マッチを避けつつ、`C:\Users\Jane Doe\OneDrive - Corp\...\file.json` の
+    # ようなスペース入り中間ディレクトリも 1 度にマッチできる。拡張子を持たない
+    # パス (ディレクトリのみ) は対象外。
+    # 除外リストから `<` `>` は外す (step1 が挿入する `<user>` プレースホルダを
+    # step2 の match が跨げるように)。実 Windows パスに `<>` は使えないので
+    # 誤マッチのリスクはない。
+    r"[A-Za-z]:[\\/][^\r\n\"'|?*]+?\.[A-Za-z0-9]+"
 )
 
 
@@ -259,13 +264,17 @@ def _sanitize_paths(text: str) -> str:
     r"""メッセージ内の Windows 絶対パスを redact する。
 
     step1 で `C:\Users\<user>` を潰し (スペース入りユーザー名も対応)、step2 で
-    残る絶対パスを basename だけに丸める。中間ディレクトリにスペースが入る
-    非 Users 経路 (例: `C:\Program Files\...`) は step2 で完全には丸まらない
-    ことがあるが、Windows ユーザー名を含む典型的な PII 経路は step1 で処理
-    される。
+    拡張子付きの絶対パスを basename だけに丸める。拡張子を持たないパス
+    (ディレクトリのみ) は step2 が touch しないが、実務上 exception message に
+    出るのはファイル操作由来がほとんどなので許容する。
     """
     text = _WIN_USER_HOME_RE.sub(r"\1<user>", text)
-    return _ABS_WIN_PATH_RE.sub(r"<path>/\1", text)
+
+    def _to_basename(match: re.Match[str]) -> str:
+        segments = re.split(r"[\\/]", match.group(0))
+        return f"<path>/{segments[-1]}"
+
+    return _ABS_WIN_PATH_WITH_EXT_RE.sub(_to_basename, text)
 
 
 def _sanitize_exception(e: BaseException) -> str:
