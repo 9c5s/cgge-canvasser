@@ -240,7 +240,8 @@ def _success_payload_or_raise(res: dict[str, Any], err_prefix: str) -> dict[str,
     """
     if not _is_success_response(res):
         # body 全体を message に埋めると raise 経由でログ (traceback) に
-        # 大きな応答がそのまま残るため truncate する。
+        # 応答内容がそのまま残るため、_log_body で allowlist 抽出した
+        # 診断キーだけに絞る (status / payload.ecode / payload.message)。
         msg = (
             f"{err_prefix}: HTTP {res.get('status')}"
             f" err={res.get('error')} body={_log_body(res.get('body'))}"
