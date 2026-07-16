@@ -188,6 +188,20 @@ def _is_success_response(res: dict[str, Any]) -> bool:
     return res["status"] == 200 and body is not None and body.get("status") == "SUCCESS"
 
 
+# 永続ログ (logs/mission.log 等) に API 応答 body 全体をそのまま残すと、
+# 長期運用でログサイズが肥大化しやすく、また将来的に body に含まれる可能性の
+# ある値も無制限に残ってしまう。診断に必要な先頭部分だけを残す。
+_LOG_BODY_MAX = 200
+
+
+def _log_body(body: object) -> str:
+    """API 応答 body を永続ログ向けに truncate した表現に変換する。"""
+    text = str(body)
+    if len(text) <= _LOG_BODY_MAX:
+        return text
+    return f"{text[:_LOG_BODY_MAX]}...(len={len(text)})"
+
+
 def _success_payload_or_raise(res: dict[str, Any], err_prefix: str) -> dict[str, Any]:
     """成功応答の payload を取り出す。失敗応答なら RuntimeError を送出する。
 
@@ -195,7 +209,12 @@ def _success_payload_or_raise(res: dict[str, Any], err_prefix: str) -> dict[str,
     応答全体入りのメッセージで raise → payload を cast」の定型を束ねる。
     """
     if not _is_success_response(res):
-        msg = f"{err_prefix}: {res}"
+        # body 全体を message に埋めると raise 経由でログ (traceback) に
+        # 大きな応答がそのまま残るため truncate する。
+        msg = (
+            f"{err_prefix}: HTTP {res.get('status')}"
+            f" err={res.get('error')} body={_log_body(res.get('body'))}"
+        )
         raise RuntimeError(msg)
     body = cast("dict[str, Any]", res["body"])
     return cast("dict[str, Any]", body.get("payload") or {})
@@ -468,7 +487,10 @@ def _complete_error_result(res: dict[str, Any]) -> str:
 
     err_note = f" err={res.get('error')}" if res.get("error") else ""
     logger.error(
-        "  -> 失敗: HTTP %s%s body=%s", res["status"], err_note, res.get("body")
+        "  -> 失敗: HTTP %s%s body=%s",
+        res["status"],
+        err_note,
+        _log_body(res.get("body")),
     )
     return "error"
 
@@ -523,7 +545,10 @@ def _receive(
         return MissionOutcome(linkage_expired_id=mid)
     err_note = f" err={res.get('error')}" if res.get("error") else ""
     logger.error(
-        "  -> 失敗: HTTP %s%s body=%s", res["status"], err_note, res.get("body")
+        "  -> 失敗: HTTP %s%s body=%s",
+        res["status"],
+        err_note,
+        _log_body(res.get("body")),
     )
     return MissionOutcome()
 
@@ -1188,7 +1213,9 @@ class _CheckinRunner:
 
         実 POST 実行時の resume 起点をドライラン由来の値で汚染しないため。
         """
-        logger.info("       body=%s...(len=%d)  [DRY-RUN]", body[:60], len(body))
+        # dry-run の暗号化ペイロードは診断上ほぼ無意味 (座標は spot が既知)。
+        # 永続ログには長さだけ残す。
+        logger.info("       [DRY-RUN] body_len=%d", len(body))
         self.gained += 10
         self.successful += 1
         self._move_origin_to(spot)
@@ -1269,7 +1296,7 @@ class _CheckinRunner:
             self.consecutive_failures,
             res["status"],
             err_note,
-            res.get("body"),
+            _log_body(res.get("body")),
         )
         if self.consecutive_failures >= self.settings.consecutive_failure_limit:
             msg = (
@@ -1919,7 +1946,10 @@ def _decode_dpapi_blob(local_state: Path, encrypted_b64: str) -> bytes | None:
         logger.warning("encrypted_key の base64 デコード失敗: %s", e)
         return None
     if not encrypted.startswith(b"DPAPI"):
-        logger.warning("%s の DPAPI プレフィックスが無い", local_state)
+        # 絶対パス全体は永続ログに残さず basename だけ出す (PII 対策)
+        logger.warning(
+            "Local State (%s) の DPAPI プレフィックスが無い", local_state.name
+        )
         return None
     return encrypted[5:]
 
@@ -1938,7 +1968,7 @@ def _load_chrome_master_key(
     try:
         raw = json.loads(local_state.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning("%s を読めません: %s", local_state, e)
+        logger.warning("[%s] Local State を読めません: %s", profile_dir.name, e)
         return None
     # dict の isinstance 絞り込みだけだと型引数が Unknown に推論されるため、
     # 既存の _as_str_dict (dict[str, Any] への絞り込み + cast の共通化) に乗せる。
@@ -1946,7 +1976,9 @@ def _load_chrome_master_key(
     os_crypt = _as_str_dict(raw_dict.get("os_crypt")) or {}
     encrypted_b64 = os_crypt.get("encrypted_key")
     if not isinstance(encrypted_b64, str):
-        logger.warning("%s に os_crypt.encrypted_key が無い", local_state)
+        logger.warning(
+            "[%s] Local State に os_crypt.encrypted_key が無い", profile_dir.name
+        )
         return None
     dpapi_payload = _decode_dpapi_blob(local_state, encrypted_b64)
     if dpapi_payload is None:
@@ -1999,7 +2031,7 @@ def _read_bnid_login_row(
             timeout=5.0,
         )
     except sqlite3.OperationalError as e:
-        logger.warning("%s を開けません: %s", login_data, e)
+        logger.warning("[%s] Login Data を開けません: %s", profile_dir.name, e)
         return None
     try:
         row = con.execute(
@@ -2008,7 +2040,7 @@ def _read_bnid_login_row(
             " ORDER BY date_last_used DESC LIMIT 1"
         ).fetchone()
     except sqlite3.Error as e:
-        logger.warning("%s の SELECT で失敗: %s", login_data, e)
+        logger.warning("[%s] Login Data の SELECT で失敗: %s", profile_dir.name, e)
         return None
     finally:
         con.close()
@@ -2047,11 +2079,18 @@ def load_relogin_guard(profile_dir: Path) -> ReloginGuard:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning("%s を読めません: %s。ガードを既定値にリセットします。", path, e)
+        logger.warning(
+            "[%s] relogin_guard.json を読めません: %s。"
+            "ガードを既定値にリセットします。",
+            profile_dir.name,
+            e,
+        )
         return ReloginGuard()
     if not isinstance(raw, dict):
         logger.warning(
-            "%s のトップレベルが dict でありません。既定値を使います。", path
+            "[%s] relogin_guard.json のトップレベルが dict でありません。"
+            "既定値を使います。",
+            profile_dir.name,
         )
         return ReloginGuard()
     data = cast("dict[str, Any]", raw)
@@ -3099,8 +3138,10 @@ def _setup_logging(command: str) -> None:
     """
     logger.setLevel(logging.INFO)
     # テストや再入からの多重装着を防ぐため、毎回既存ハンドラをクリアする。
+    # FileHandler は close しないとファイルロックが残るため必ず close する。
     for h in list(logger.handlers):
         logger.removeHandler(h)
+        h.close()
 
     console = logging.StreamHandler(sys.stderr)
     console.setFormatter(logging.Formatter("%(message)s"))
@@ -3156,7 +3197,8 @@ def _main_impl() -> int:
     with sync_playwright() as p:
         for name, profile_dir in profiles:
             logger.info("")
-            logger.info("=== アカウント: %s (%s) ===", name, profile_dir)
+            # 絶対パスは永続ログに残さない (Windows ユーザー名等の PII 対策)
+            logger.info("=== アカウント: %s ===", name)
             try:
                 gained, code = process_account(p, name, profile_dir, options)
             # 1 アカウントの失敗で全体を止めないため、意図して広く握る
