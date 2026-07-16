@@ -163,18 +163,14 @@ class TestUpdateCheckinState:
         state = canvasser.load_account_state(tmp_path)
         assert "completed_spots" not in state
 
-    def test_既存のcompleted_spotsキーは成功保存で消える(
-        self, tmp_path: Path
-    ) -> None:
+    def test_既存のcompleted_spotsキーは成功保存で消える(self, tmp_path: Path) -> None:
         """legacy キー付きの state から成功 POST しても、保存結果から消える。
 
         save 側で pop していないと、load → 変更なし → save で残り続けてしまう。
         silent 無視の契約 (load 側では素通し、save 側で除外する) を保存経路でも
         担保する。
         """
-        canvasser.save_account_state(
-            tmp_path, {"completed_spots": ["cg_vote2026_1"]}
-        )
+        canvasser.save_account_state(tmp_path, {"completed_spots": ["cg_vote2026_1"]})
         vnow = datetime(2026, 7, 3, 12, 30, tzinfo=JST)
 
         canvasser.update_checkin_state(tmp_path, _spot(), vnow)
@@ -387,5 +383,3 @@ class TestResumeContext:
 
         assert (lat, lng) == (35.0, 135.0)
         assert resume_at == datetime(2026, 7, 3, 12, 30, tzinfo=JST)
-
-

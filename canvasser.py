@@ -24,10 +24,6 @@ mission と checkin は独立したサブコマンドで、同時実行はしな
 `--dry-run` を付けた場合のみ GET のみのドライランとなり、POST/PUT は一切送らない。
 """
 
-# print はこの CLI の仕様そのもの (標準出力が UI) のため、T201 はファイル全体で
-# 抑制する。
-# ruff: noqa: T201
-
 import argparse
 import base64
 import contextlib
@@ -35,6 +31,7 @@ import ctypes
 import functools
 import hashlib
 import json
+import logging
 import math
 import os
 import random
@@ -94,6 +91,13 @@ LOGIN_ENTRY_URL = (
 METERS_PER_DEG_LAT = 111_320.0
 # 許容半径ぎりぎりの座標を避けて境界事故を防ぐ内寄せ係数。
 CHECKIN_RADIUS_MARGIN = 0.85
+
+# 日次自動実行される mission / checkin の永続ログ出力先。login は対話 1 回きりの
+# ため対象外とする。ローテーションは意図的にしない (肥大化したら手動整理)。
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOGGABLE_COMMANDS = frozenset({"mission", "checkin"})
+
+logger = logging.getLogger("canvasser")
 
 
 def _default_now() -> datetime:
@@ -309,9 +313,9 @@ def _process_all_missions(
     result = MissionRunResult()
     for mt, label, payload in listings:
         if mt == 0:
-            print(f"現在の保有投票券: {payload.get('current_point', 0)}枚")
+            logger.info("現在の保有投票券: %s枚", payload.get("current_point", 0))
         mode_label = "本番" if not dry_run else "DRY-RUN (POST/PUT送信なし)"
-        print(f"ミッションモード ({label}): {mode_label}")
+        logger.info("ミッションモード (%s): %s", label, mode_label)
         for m in cast("list[dict[str, Any]]", payload["missions"]):
             outcome = _process_one_mission(page, m, dry_run=dry_run)
             result.gained += outcome.gained
@@ -379,10 +383,10 @@ def collect_missions(
             # --no-auto-relogin のユーザー opt-out を尊重する。driver は
             # 中間 BNID フォームに到達したとき保存された password を submit
             # する経路を含むため、opt-out 時は driver 全体を起動しない
-            print(
-                f"[{name}] E1926 検知だが --no-auto-relogin 指定のため復旧を"
+            logger.warning(
+                "[%s] E1926 検知だが --no-auto-relogin 指定のため復旧を"
                 "スキップする (該当ミッションは翌日再試行)",
-                file=sys.stderr,
+                name,
             )
             break
         if attempt == 2:
@@ -393,7 +397,7 @@ def collect_missions(
         listings = _filter_listings(listings, keep_ids=result.linkage_expired_ids)
 
     result_label = "獲得見込み" if dry_run else "獲得"
-    print(f"ミッション {result_label}: {total_gained}枚")
+    logger.info("ミッション %s: %s枚", result_label, total_gained)
     return total_gained
 
 
@@ -453,17 +457,19 @@ def _complete_error_result(res: dict[str, Any]) -> str:
     """
     ecode = _extract_ecode(res.get("body"))
     if ecode == "E1906":
-        print("  -> 既に達成済み (受取を試す)")
+        logger.info("  -> 既に達成済み (受取を試す)")
         return "already_done"
     if ecode == "E1926":
-        print("  -> ASOBI 連携トークン切れ (完了 POST)", file=sys.stderr)
+        logger.warning("  -> ASOBI 連携トークン切れ (完了 POST)")
         return "linkage_expired"
     if ecode == "E1924":
-        print("  -> 条件未達、スキップ")
+        logger.info("  -> 条件未達、スキップ")
         return "condition_unmet"
 
     err_note = f" err={res.get('error')}" if res.get("error") else ""
-    print(f"  -> 失敗: HTTP {res['status']}{err_note} body={res.get('body')}")
+    logger.error(
+        "  -> 失敗: HTTP %s%s body=%s", res["status"], err_note, res.get("body")
+    )
     return "error"
 
 
@@ -480,13 +486,13 @@ def _complete(page: Page, mid: int, name: str, *, dry_run: bool) -> str:
       - "linkage_expired": E1926 ASOBI 連携トークン切れ
       - "error"          : その他失敗
     """
-    print(f"[達成] #{mid} {name}")
+    logger.info("[達成] #%s %s", mid, name)
     if dry_run:
-        print("  -> DRY-RUN (POST送信なし)")
+        logger.info("  -> DRY-RUN (POST送信なし)")
         return "ok"
     res = call_api(page, "POST", f"/mission/{mid}")
     if _is_success_response(res):
-        print("  -> 成功")
+        logger.info("  -> 成功")
         return "ok"
     return _complete_error_result(res)
 
@@ -500,23 +506,25 @@ def _receive(
     連携トークン切れ) を検知した場合は linkage_expired_id=mid を返し、それ
     以外の失敗は空の MissionOutcome (gained=0) を返す。
     """
-    print(f"[受取] #{mid} {name} (+{pts})")
+    logger.info("[受取] #%s %s (+%s)", mid, name, pts)
     if dry_run:
-        print("  -> DRY-RUN (PUT送信なし)")
+        logger.info("  -> DRY-RUN (PUT送信なし)")
         return MissionOutcome(gained=pts)
     res = call_api(page, "PUT", f"/mission/{mid}/receive")
     if _is_success_response(res):
         body = cast("dict[str, Any]", res["body"])
         payload = cast("dict[str, Any]", body.get("payload") or {})
         received = payload.get("received_point")
-        print(f"  -> 成功 (received_point={received})")
+        logger.info("  -> 成功 (received_point=%s)", received)
         return MissionOutcome(gained=pts)
     ecode = _extract_ecode(res.get("body"))
     if ecode == "E1926":
-        print("  -> ASOBI 連携トークン切れ (受取 PUT)", file=sys.stderr)
+        logger.warning("  -> ASOBI 連携トークン切れ (受取 PUT)")
         return MissionOutcome(linkage_expired_id=mid)
     err_note = f" err={res.get('error')}" if res.get("error") else ""
-    print(f"  -> 失敗: HTTP {res['status']}{err_note} body={res.get('body')}")
+    logger.error(
+        "  -> 失敗: HTTP %s%s body=%s", res["status"], err_note, res.get("body")
+    )
     return MissionOutcome()
 
 
@@ -847,7 +855,7 @@ def _load_resume_context(
         if not settings.dry_run:
             raise FailClosedError(msg) from e
         # dry-run は空 state のまま継続してスポット取得後の検証を回す
-        print(msg, file=sys.stderr)
+        logger.warning(msg)
         return None, None, None
 
 
@@ -859,7 +867,7 @@ def _partition_spots(all_spots: list[Spot]) -> tuple[list[Spot], int]:
     """
     skipped = [s for s in all_spots if s.is_checkedin]
     if skipped:
-        print(f"事前 skip (完了済み): {len(skipped)}件")
+        logger.info("事前 skip (完了済み): %s件", len(skipped))
     return [s for s in all_spots if not s.is_checkedin], len(skipped)
 
 
@@ -879,17 +887,20 @@ def _announce_checkin_plan(
         else "haversine (自前計算)"
     )
     mode_label = "本番" if not settings.dry_run else "DRY-RUN (POST送信なし)"
-    print(
-        f"チェックイン対象スポット: {len(spots)}件"
-        f" (全 {total_spots}, 完了済み {skipped})"
+    logger.info(
+        "チェックイン対象スポット: %s件 (全 %s, 完了済み %s)",
+        len(spots),
+        total_spots,
+        skipped,
     )
-    print(f"モード: {mode_label}")
-    print(f"移動時間バックエンド: {travel_backend}")
-    print(
-        f"実POST試行 上限: {budget_label} / 連続失敗中断: "
-        f"{settings.consecutive_failure_limit}件"
+    logger.info("モード: %s", mode_label)
+    logger.info("移動時間バックエンド: %s", travel_backend)
+    logger.info(
+        "実POST試行 上限: %s / 連続失敗中断: %s件",
+        budget_label,
+        settings.consecutive_failure_limit,
     )
-    print(f"開始スポット: {spots[0].slug} {spots[0].name}")
+    logger.info("開始スポット: %s %s", spots[0].slug, spots[0].name)
 
 
 def _initial_virtual_now(
@@ -958,9 +969,10 @@ class _CheckinRunner:
         while self._remaining:
             index += 1
             if self._budget_reached():
-                print(
-                    f"  日次上限 {self.settings.daily_budget}件に到達。"
-                    f"残り {len(self._remaining)}件は次回以降。"
+                logger.info(
+                    "  日次上限 %s件に到達。残り %s件は次回以降。",
+                    self.settings.daily_budget,
+                    len(self._remaining),
                 )
                 break
             # first spot (prev 未確定) は事前計算の順序 (`order_spots_by_proximity`
@@ -1052,10 +1064,13 @@ class _CheckinRunner:
             if plan.deferred_seconds > 60
             else ""
         )
-        print(
-            f"  移動待機: {humanize_duration(plan.wait_seconds)} ({plan.mode},"
-            f" 直線 {plan.straight_km:.1f}km{deferred_note})"
-            f" -> 到着 {plan.arrival:%m/%d %H:%M}"
+        logger.info(
+            "  移動待機: %s (%s, 直線 %.1fkm%s) -> 到着 %s",
+            humanize_duration(plan.wait_seconds),
+            plan.mode,
+            plan.straight_km,
+            deferred_note,
+            f"{plan.arrival:%m/%d %H:%M}",
         )
         if not self.settings.dry_run:
             self.settings.sleep_fn(plan.wait_seconds)
@@ -1079,10 +1094,14 @@ class _CheckinRunner:
             )
             if not self.settings.dry_run:
                 raise FailClosedError(msg, partial_gained=self.gained)
-            print(f"  {msg} (dry-run: skip)", file=sys.stderr)
+            logger.warning("  %s (dry-run: skip)", msg)
             return False
         if self.virtual_now > deadline:
-            print(f"  [{slug}] スポット期限 ({deadline:%m/%d %H:%M %Z}) 経過、skip。")
+            logger.info(
+                "  [%s] スポット期限 (%s) 経過、skip。",
+                slug,
+                f"{deadline:%m/%d %H:%M %Z}",
+            )
             return False
         return True
 
@@ -1102,9 +1121,11 @@ class _CheckinRunner:
         # deadline は None ではない。narrowing は cast で明示する。
         deadline = cast("datetime", spot.deadline)
         if planned_arrival > deadline:
-            print(
-                f"  [{slug}] 到着予定 {planned_arrival:%m/%d %H:%M}"
-                f" が期限 ({deadline:%m/%d %H:%M %Z}) 超過、skip。"
+            logger.info(
+                "  [%s] 到着予定 %s が期限 (%s) 超過、skip。",
+                slug,
+                f"{planned_arrival:%m/%d %H:%M}",
+                f"{deadline:%m/%d %H:%M %Z}",
             )
             return False
         return True
@@ -1127,10 +1148,15 @@ class _CheckinRunner:
         )
         body = encrypt_coords(coords)
 
-        print(
-            f"[{index:3}/{len(self.spots)}] {slug} {spot.name}"
-            f" (offset {distance_m:.1f}m, acc={coords['accuracy']}m,"
-            f" alt={coords['altitude']})"
+        logger.info(
+            "[%3d/%d] %s %s (offset %.1fm, acc=%sm, alt=%s)",
+            index,
+            len(self.spots),
+            slug,
+            spot.name,
+            distance_m,
+            coords["accuracy"],
+            coords["altitude"],
         )
 
         stay_secs = natural_stay_seconds()
@@ -1162,20 +1188,21 @@ class _CheckinRunner:
 
         実 POST 実行時の resume 起点をドライラン由来の値で汚染しないため。
         """
-        print(f"       body={body[:60]}...(len={len(body)})  [DRY-RUN]")
+        logger.info("       body=%s...(len=%d)  [DRY-RUN]", body[:60], len(body))
         self.gained += 10
         self.successful += 1
         self._move_origin_to(spot)
         if self._will_continue_after():
             self.virtual_now = self.virtual_now + timedelta(seconds=stay_secs)
-            print(
-                f"       滞在 {humanize_duration(stay_secs)}"
-                f" -> 出発 {self.virtual_now:%m/%d %H:%M}"
+            logger.info(
+                "       滞在 %s -> 出発 %s",
+                humanize_duration(stay_secs),
+                f"{self.virtual_now:%m/%d %H:%M}",
             )
 
     def _on_success(self, spot: Spot, stay_secs: float) -> None:
         """実 POST 成功の後処理。state 保存と滞在 sleep を行う。"""
-        print("       -> 成功")
+        logger.info("       -> 成功")
         self.gained += 10
         self.successful += 1
         self.consecutive_failures = 0
@@ -1188,9 +1215,10 @@ class _CheckinRunner:
         if self._will_continue_after():
             self.settings.sleep_fn(stay_secs)
             self.virtual_now = self.virtual_now + timedelta(seconds=stay_secs)
-            print(
-                f"       滞在 {humanize_duration(stay_secs)}"
-                f" -> 出発 {self.virtual_now:%m/%d %H:%M %Z}"
+            logger.info(
+                "       滞在 %s -> 出発 %s",
+                humanize_duration(stay_secs),
+                f"{self.virtual_now:%m/%d %H:%M %Z}",
             )
             # 滞在後の virtual_now を state に反映する (同じ spot への上書き相当)
             update_checkin_state(self.settings.profile_dir, spot, self.virtual_now)
@@ -1199,9 +1227,11 @@ class _CheckinRunner:
         """E5005 (範囲外) の後処理。累積が閾値に達したら fail closed で停止する。"""
         self.out_of_range_count += 1
         limit = self.settings.out_of_range_limit
-        print(
-            f"       -> 範囲外 ({ecode})、スキップ "
-            f"(累積 {self.out_of_range_count}/{limit})"
+        logger.warning(
+            "       -> 範囲外 (%s)、スキップ (累積 %s/%s)",
+            ecode,
+            self.out_of_range_count,
+            limit,
         )
         self.consecutive_failures = 0
         if self.out_of_range_count >= limit:
@@ -1222,7 +1252,7 @@ class _CheckinRunner:
         ECODES_ALREADY_DONE が空 tuple の間は到達しない。実観測で意味が
         確定した ecode を追加した時点から有効になる。
         """
-        print(f"       -> 既達成 ({ecode})、スキップ")
+        logger.info("       -> 既達成 (%s)、スキップ", ecode)
         self.consecutive_failures = 0
         self._move_origin_to(spot)
 
@@ -1234,10 +1264,12 @@ class _CheckinRunner:
         """
         self.consecutive_failures += 1
         err_note = f" err={res.get('error')}" if res.get("error") else ""
-        print(
-            f"       -> 未観測ecode (連続{self.consecutive_failures}件目): "
-            f"HTTP {res['status']}{err_note} body={res.get('body')}",
-            file=sys.stderr,
+        logger.error(
+            "       -> 未観測ecode (連続%s件目): HTTP %s%s body=%s",
+            self.consecutive_failures,
+            res["status"],
+            err_note,
+            res.get("body"),
         )
         if self.consecutive_failures >= self.settings.consecutive_failure_limit:
             msg = (
@@ -1257,7 +1289,7 @@ class _CheckinRunner:
         if not self.settings.dry_run:
             footer += f", 実POST試行 {self.attempted}件"
         footer += f", 仮想終了時刻 {self.virtual_now:%m/%d %H:%M}"
-        print(f"{label}: 約{self.gained}票 ({footer})")
+        logger.info("%s: 約%s票 (%s)", label, self.gained, footer)
 
 
 def collect_checkins(page: Page, settings: CheckinSettings) -> int:
@@ -1285,14 +1317,14 @@ def collect_checkins(page: Page, settings: CheckinSettings) -> int:
     """
     all_spots = _fetch_checkin_spots(page)
     if not all_spots:
-        print("チェックイン対象スポットが空でした。")
+        logger.info("チェックイン対象スポットが空でした。")
         return 0
 
     resume_lat, resume_lng, resume_at = _load_resume_context(settings)
 
     spots, skipped = _partition_spots(all_spots)
     if not spots:
-        print("全スポット完了済みです。")
+        logger.info("全スポット完了済みです。")
         return 0
 
     start_loc = (
@@ -1305,10 +1337,10 @@ def collect_checkins(page: Page, settings: CheckinSettings) -> int:
 
     virtual_now = _initial_virtual_now(settings, resume_at)
     resumed = start_loc is not None
-    print(
-        f"開始時刻(仮想): {virtual_now:%Y-%m-%d %H:%M %Z}"
-        + (f" (前回位置から再開: {resume_lat:.4f},{resume_lng:.4f})" if resumed else "")
+    resume_note = (
+        f" (前回位置から再開: {resume_lat:.4f},{resume_lng:.4f})" if resumed else ""
     )
+    logger.info("開始時刻(仮想): %s%s", f"{virtual_now:%Y-%m-%d %H:%M %Z}", resume_note)
 
     runner = _CheckinRunner(
         page=page,
@@ -1361,10 +1393,9 @@ def _get_gmaps_client() -> googlemaps.Client | None:
     # ライブラリが送出しうる例外を列挙できないため、初期化失敗は広く握って
     # Haversine フォールバックへ丸める
     except Exception as e:  # noqa: BLE001
-        print(
-            f"Google Maps クライアント初期化失敗: {e}。"
-            "Haversine にフォールバックする。",
-            file=sys.stderr,
+        logger.warning(
+            "Google Maps クライアント初期化失敗: %s。Haversine にフォールバックする。",
+            e,
         )
         return None
 
@@ -1386,7 +1417,7 @@ def _directions_driving_fallback(
         )
     # API 失敗は呼び出し側の Haversine フォールバックへ丸めるため広く握る
     except Exception as e:  # noqa: BLE001
-        print(f"  gmaps driving 再試行失敗: {e}", file=sys.stderr)
+        logger.warning("  gmaps driving 再試行失敗: %s", e)
         return None
     if not result:
         return None
@@ -1445,7 +1476,7 @@ def _estimate_travel_seconds_gmaps(
         )
     # API 失敗は呼び出し側の Haversine フォールバックへ丸めるため広く握る
     except Exception as e:  # noqa: BLE001
-        print(f"  gmaps directions 失敗: {e}", file=sys.stderr)
+        logger.warning("  gmaps directions 失敗: %s", e)
         return None
 
     if result:
@@ -1818,10 +1849,7 @@ def load_credentials(profile_dir: Path) -> Credentials | None:
     - 認証情報値 (email/password) はログに出さない
     """
     if os.name != "nt":
-        print(
-            "[warn] load_credentials は Windows でのみ動作します。",
-            file=sys.stderr,
-        )
+        logger.warning("load_credentials は Windows でのみ動作します。")
         return None
     master_key = _load_chrome_master_key(profile_dir)
     if master_key is None:
@@ -1868,10 +1896,10 @@ def _dpapi_unprotect(blob: bytes) -> bytes | None:
             ctypes.byref(out_blob),
         )
     except OSError as e:
-        print(f"[warn] DPAPI 呼び出し失敗: {e}", file=sys.stderr)
+        logger.warning("DPAPI 呼び出し失敗: %s", e)
         return None
     if not ok:
-        print("[warn] DPAPI 復号失敗", file=sys.stderr)
+        logger.warning("DPAPI 復号失敗")
         return None
     try:
         buf = ctypes.string_at(out_blob.pbData, out_blob.cbData)
@@ -1888,10 +1916,10 @@ def _decode_dpapi_blob(local_state: Path, encrypted_b64: str) -> bytes | None:
     try:
         encrypted = base64.b64decode(encrypted_b64)
     except (ValueError, TypeError) as e:
-        print(f"[warn] encrypted_key の base64 デコード失敗: {e}", file=sys.stderr)
+        logger.warning("encrypted_key の base64 デコード失敗: %s", e)
         return None
     if not encrypted.startswith(b"DPAPI"):
-        print(f"[warn] {local_state} の DPAPI プレフィックスが無い", file=sys.stderr)
+        logger.warning("%s の DPAPI プレフィックスが無い", local_state)
         return None
     return encrypted[5:]
 
@@ -1910,7 +1938,7 @@ def _load_chrome_master_key(
     try:
         raw = json.loads(local_state.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
-        print(f"[warn] {local_state} を読めません: {e}", file=sys.stderr)
+        logger.warning("%s を読めません: %s", local_state, e)
         return None
     # dict の isinstance 絞り込みだけだと型引数が Unknown に推論されるため、
     # 既存の _as_str_dict (dict[str, Any] への絞り込み + cast の共通化) に乗せる。
@@ -1918,7 +1946,7 @@ def _load_chrome_master_key(
     os_crypt = _as_str_dict(raw_dict.get("os_crypt")) or {}
     encrypted_b64 = os_crypt.get("encrypted_key")
     if not isinstance(encrypted_b64, str):
-        print(f"[warn] {local_state} に os_crypt.encrypted_key が無い", file=sys.stderr)
+        logger.warning("%s に os_crypt.encrypted_key が無い", local_state)
         return None
     dpapi_payload = _decode_dpapi_blob(local_state, encrypted_b64)
     if dpapi_payload is None:
@@ -1971,7 +1999,7 @@ def _read_bnid_login_row(
             timeout=5.0,
         )
     except sqlite3.OperationalError as e:
-        print(f"[warn] {login_data} を開けません: {e}", file=sys.stderr)
+        logger.warning("%s を開けません: %s", login_data, e)
         return None
     try:
         row = con.execute(
@@ -1980,7 +2008,7 @@ def _read_bnid_login_row(
             " ORDER BY date_last_used DESC LIMIT 1"
         ).fetchone()
     except sqlite3.Error as e:
-        print(f"[warn] {login_data} の SELECT で失敗: {e}", file=sys.stderr)
+        logger.warning("%s の SELECT で失敗: %s", login_data, e)
         return None
     finally:
         con.close()
@@ -2019,15 +2047,11 @@ def load_relogin_guard(profile_dir: Path) -> ReloginGuard:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
-        print(
-            f"[warn] {path} を読めません: {e}。ガードを既定値にリセットします。",
-            file=sys.stderr,
-        )
+        logger.warning("%s を読めません: %s。ガードを既定値にリセットします。", path, e)
         return ReloginGuard()
     if not isinstance(raw, dict):
-        print(
-            f"[warn] {path} のトップレベルが dict でありません。既定値を使います。",
-            file=sys.stderr,
+        logger.warning(
+            "%s のトップレベルが dict でありません。既定値を使います。", path
         )
         return ReloginGuard()
     data = cast("dict[str, Any]", raw)
@@ -2123,7 +2147,7 @@ def ensure_chromium_installed() -> None:
         if exe and Path(exe).exists():
             return
 
-    print("Chromium バイナリを取得します (初回のみ)...", file=sys.stderr)
+    logger.info("Chromium バイナリを取得します (初回のみ)...")
     _install_chromium()
 
 
@@ -2202,10 +2226,9 @@ def auto_login(
     # ケース (連続失敗による動的挿入等) では、フォームに入力してから submit しても
     # 認証エラーで失敗するだけなので、パスワードを送信しないうちに abort する。
     if _detect_login_captcha(page):
-        print(
+        logger.warning(
             "[auto_login] submit 前に CAPTCHA/2FA を検知しました。"
-            "`uv run canvasser.py login --account NAME` で手動ログインしてください。",
-            file=sys.stderr,
+            "`uv run canvasser.py login --account NAME` で手動ログインしてください。"
         )
         return AutoLoginOutcome.CAPTCHA_DETECTED, 0
 
@@ -2223,7 +2246,7 @@ def auto_login(
         # disabled が外れるまで待ってからクリックする (Phase 1 の必須手順)
         page.locator(_LOGIN_BTN_ENABLED_SEL).wait_for(timeout=5000)
     except PlaywrightError as e:
-        print(f"[auto_login] フォーム操作でエラー: {e}", file=sys.stderr)
+        logger.warning("[auto_login] フォーム操作でエラー: %s", e)
         return AutoLoginOutcome.FORM_ERROR, 0
 
     # click は別 try に分離する。click が起こす navigation を Playwright が待って
@@ -2254,29 +2277,24 @@ def _poll_login_outcome(
     while time.monotonic() < deadline:
         with contextlib.suppress(PlaywrightError):
             if check_login(page):
-                print("[auto_login] ログイン成功を検知しました。", file=sys.stderr)
+                logger.info("[auto_login] ログイン成功を検知しました。")
                 return AutoLoginOutcome.SUCCESS
             if _login_error_visible(page):
-                print(
+                logger.warning(
                     "[auto_login] BNID から認証エラーが返されました。"
-                    "メールアドレスかパスワードが誤っている可能性があります。",
-                    file=sys.stderr,
+                    "メールアドレスかパスワードが誤っている可能性があります。"
                 )
                 return AutoLoginOutcome.PASSWORD_ERROR
             if _detect_login_captcha(page):
-                print(
+                logger.warning(
                     "[auto_login] CAPTCHA/2FA を検知しました。"
                     "`uv run canvasser.py login --account NAME` で"
-                    "手動ログインしてください。",
-                    file=sys.stderr,
+                    "手動ログインしてください。"
                 )
                 return AutoLoginOutcome.CAPTCHA_DETECTED
         time.sleep(interval_sec)
 
-    print(
-        "[auto_login] タイムアウト。ログイン結果を検知できませんでした。",
-        file=sys.stderr,
-    )
+    logger.warning("[auto_login] タイムアウト。ログイン結果を検知できませんでした。")
     return AutoLoginOutcome.TIMEOUT
 
 
@@ -2295,10 +2313,10 @@ def _relogin_disabled(guard: ReloginGuard, name: str) -> bool:
     deadline = _as_jst_aware(deadline)
     if datetime.now(JST) >= deadline:
         return False
-    print(
-        f"[{name}] 自動再ログインは {guard.disabled_until} まで"
-        "一時停止中です (連続失敗ガード)。",
-        file=sys.stderr,
+    logger.warning(
+        "[%s] 自動再ログインは %s まで一時停止中です (連続失敗ガード)。",
+        name,
+        guard.disabled_until,
     )
     return True
 
@@ -2345,31 +2363,25 @@ def _retry_after_timeout(
     # 1 回目 submit 直後の見込み failure_count は guard.failure_count + 1。
     # リトライで更に +1 されると MAX を超える場合は、リトライを控える。
     if guard.failure_count + 1 >= CREDENTIALS_MAX_FAILURES:
-        print(
-            f"[{name}] failure_count が上限のため、タイムアウト後のリトライは"
+        logger.warning(
+            "[%s] failure_count が上限のため、タイムアウト後のリトライは"
             "控えます (BNID アカウントロック防止)。",
-            file=sys.stderr,
+            name,
         )
         return AutoLoginOutcome.TIMEOUT, 0
 
-    print(f"[{name}] タイムアウトのため 1 回リトライします。", file=sys.stderr)
+    logger.info("[%s] タイムアウトのため 1 回リトライします。", name)
     try:
         page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
     except PlaywrightError as e:
-        print(
-            f"[{name}] リトライ時の BNID ログイン画面への遷移で失敗: {e}",
-            file=sys.stderr,
-        )
+        logger.warning("[%s] リトライ時の BNID ログイン画面への遷移で失敗: %s", name, e)
         return AutoLoginOutcome.TIMEOUT, 0
     # check_login は redirect 進行中に PlaywrightError を投げうる。ここで例外が
     # 上流に escape すると、1 回目 submit の failure_count 加算が飛んで無限ループ
     # 気味に BNID にパスワードを投げ続ける事故になる。polling と同じく suppress する。
     with contextlib.suppress(PlaywrightError):
         if check_login(page):
-            print(
-                f"[{name}] タイムアウト後に遅延成功を検知しました。",
-                file=sys.stderr,
-            )
+            logger.info("[%s] タイムアウト後に遅延成功を検知しました。", name)
             return AutoLoginOutcome.SUCCESS, 0
 
     return _resolve_retry_outcome(page, name, credentials)
@@ -2388,10 +2400,7 @@ def _resolve_retry_outcome(
         # 失敗時は outcome=TIMEOUT のまま抜ける (失敗ガードは caller が計上する)。
         with contextlib.suppress(PlaywrightError):
             if check_login(page):
-                print(
-                    f"[{name}] リトライ後にも遅延成功を検知しました。",
-                    file=sys.stderr,
-                )
+                logger.info("[%s] リトライ後にも遅延成功を検知しました。", name)
                 return AutoLoginOutcome.SUCCESS, submitted
     return outcome, submitted
 
@@ -2486,10 +2495,7 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
     try:
         page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
     except PlaywrightError as e:
-        print(
-            f"[{name}] BNID ログイン画面への遷移で失敗: {e}",
-            file=sys.stderr,
-        )
+        logger.warning("[%s] BNID ログイン画面への遷移で失敗: %s", name, e)
         return False
 
     # 初回 check_login が false negative だった場合の救済。cookie が実は有効なら
@@ -2502,9 +2508,8 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
     with contextlib.suppress(PlaywrightError):
         session_valid = check_login(page)
     if session_valid:
-        print(
-            f"[{name}] BNID ログイン画面遷移後にセッション有効を確認しました。",
-            file=sys.stderr,
+        logger.info(
+            "[%s] BNID ログイン画面遷移後にセッション有効を確認しました。", name
         )
         _reset_relogin_failure(profile_dir, guard)
         return True
@@ -2540,9 +2545,8 @@ def _click_asobi_bridge_button(page: Page, name: str) -> None:
         with contextlib.suppress(PlaywrightError):
             locator = page.locator(sel).filter(visible=True).first
             if locator.is_visible():
-                print(
-                    f"[{name}] 中間ページのブリッジボタン ({sel}) をクリック",
-                    file=sys.stderr,
+                logger.info(
+                    "[%s] 中間ページのブリッジボタン (%s) をクリック", name, sel
                 )
                 locator.click()
                 clicked = True
@@ -2563,10 +2567,7 @@ def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> boo
     try:
         page.goto(LINKAGE_ENTRY_URL, wait_until="domcontentloaded")
     except PlaywrightError as e:
-        print(
-            f"[{name}] ASOBI 連携 URL への遷移で失敗: {e}",
-            file=sys.stderr,
-        )
+        logger.warning("[%s] ASOBI 連携 URL への遷移で失敗: %s", name, e)
         return False
 
     timeout_sec = 60
@@ -2577,10 +2578,7 @@ def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> boo
             current_url = page.url
             # (a) backto (mission page) 到達
             if current_url.startswith(MISSION_PAGE_URL):
-                print(
-                    f"[{name}] ASOBI 連携復旧: backto 到達を確認しました。",
-                    file=sys.stderr,
-                )
+                logger.info("[%s] ASOBI 連携復旧: backto 到達を確認しました。", name)
                 # cookie 保存事故対策の wait (project-asobi-linkage メモリ参照)
                 time.sleep(10)
                 # SSO 途中 URL で観測された場合でも確実に mission page に
@@ -2599,23 +2597,18 @@ def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> boo
                     continue
             # (d) CAPTCHA/2FA 検知 → 復旧失敗
             if _detect_login_captcha(page):
-                print(
-                    f"[{name}] ASOBI 連携復旧中に CAPTCHA/2FA を検知、abort",
-                    file=sys.stderr,
+                logger.warning(
+                    "[%s] ASOBI 連携復旧中に CAPTCHA/2FA を検知、abort", name
                 )
                 return False
         except PlaywrightError as e:
-            print(
-                f"[{name}] ASOBI 連携復旧ポーリング中に PlaywrightError: {e}",
-                file=sys.stderr,
+            logger.warning(
+                "[%s] ASOBI 連携復旧ポーリング中に PlaywrightError: %s", name, e
             )
             # 次ポーリングに委ねる
         time.sleep(interval_sec)
 
-    print(
-        f"[{name}] ASOBI 連携復旧タイムアウト",
-        file=sys.stderr,
-    )
+    logger.warning("[%s] ASOBI 連携復旧タイムアウト", name)
     return False
 
 
@@ -2640,10 +2633,11 @@ def _ensure_authenticated(
         and attempt_auto_relogin(page, profile_dir, name)
     ):
         return True
-    print(
-        f"[{name}] 未ログイン。"
-        f"`uv run canvasser.py login --account {name}` を実行してください。",
-        file=sys.stderr,
+    logger.warning(
+        "[%s] 未ログイン。"
+        "`uv run canvasser.py login --account %s` を実行してください。",
+        name,
+        name,
     )
     return False
 
@@ -2664,40 +2658,30 @@ def run_login_flow(
     応答する前に context を閉じると Login Data に書き込まれず、後の自動再ログインが
     silent に無資格情報で失敗するのを防ぐ。
     """
-    print("ブラウザが立ち上がりました。", file=sys.stderr)
-    print(
-        "BNID でログインしてください。ログイン成功を検知したら自動で終了します。",
-        file=sys.stderr,
+    logger.info("ブラウザが立ち上がりました。")
+    logger.info(
+        "BNID でログインしてください。ログイン成功を検知したら自動で終了します。"
     )
-    print(
-        f"(最大 {timeout_sec // 60} 分待機、Ctrl+C で中断可能)",
-        file=sys.stderr,
-    )
+    logger.info("(最大 %s 分待機、Ctrl+C で中断可能)", timeout_sec // 60)
 
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
         # ログイン画面へのリダイレクト中などに fetch は失敗する。次のポーリングを待つ。
         with contextlib.suppress(PlaywrightError):
             if check_login(page):
-                print("ログイン状態を確認しました。", file=sys.stderr)
-                print(
+                logger.info("ログイン状態を確認しました。")
+                logger.info(
                     "Chrome の「パスワードを保存しますか?」プロンプトが出たら"
-                    f"「保存」をクリックしてください ({save_password_grace_sec} 秒後に"
-                    "ブラウザを閉じます)。保存すると次回以降の自動再ログインで参照される。",
-                    file=sys.stderr,
+                    "「保存」をクリックしてください (%s 秒後にブラウザを閉じます)。"
+                    "保存すると次回以降の自動再ログインで参照される。",
+                    save_password_grace_sec,
                 )
                 time.sleep(save_password_grace_sec)
-                print(
-                    "次回から mission / checkin を実行できます。",
-                    file=sys.stderr,
-                )
+                logger.info("次回から mission / checkin を実行できます。")
                 return 0
         time.sleep(interval_sec)
 
-    print(
-        "タイムアウト。ログインを検出できませんでした。再度お試しください。",
-        file=sys.stderr,
-    )
+    logger.warning("タイムアウト。ログインを検出できませんでした。再度お試しください。")
     return 1
 
 
@@ -2803,10 +2787,9 @@ def resolve_profiles(
             continue
         # 手動作成された悪性ディレクトリを排除するため、既存名も同じ規則で検証する
         if not _ACCOUNT_NAME_RE.fullmatch(entry.name):
-            print(
-                f"[warn] プロファイル名 {entry.name!r} が命名規則に合致しないため"
-                " skip します。",
-                file=sys.stderr,
+            logger.warning(
+                "プロファイル名 %r が命名規則に合致しないため skip します。",
+                entry.name,
             )
             continue
         target = entry.resolve()
@@ -2911,7 +2894,8 @@ def process_account(
             except FailClosedError as e:
                 # fail-closed 前に成功していた POST の reward は
                 # e.partial_gained に入っているので、集計から落とさないよう合流させる。
-                print(f"[{name}] fail closed: {e}", file=sys.stderr)
+                # 意図的な中断のため traceback は出さない (メッセージのみ)
+                logger.error("[%s] fail closed: %s", name, e)  # noqa: TRY400
                 if not options.dry_run:
                     gained += e.partial_gained
                 exit_code = 1
@@ -2930,7 +2914,8 @@ def main() -> int:
     try:
         return _main_impl()
     except UserInputError as e:
-        print(f"エラー: {e}", file=sys.stderr)
+        # ユーザー入力エラーは短いメッセージだけを出す (traceback は不要)
+        logger.error("エラー: %s", e)  # noqa: TRY400
         return 1
 
 
@@ -3105,18 +3090,45 @@ def _ensure_profiles_dir_ignored(args: argparse.Namespace, profiles_dir: Path) -
     raise UserInputError(msg)
 
 
+def _setup_logging(command: str) -> None:
+    """Logger にコンソール (stderr) と、必要に応じてファイルハンドラを装着する。
+
+    mission / checkin は日次自動実行される。永続ログを ``logs/{command}.log``
+    へ追記モードで積み上げる。login は対話 1 回きりのため、ファイルログは
+    付けない。ローテーションは意図的にしない (肥大化したら手動整理)。
+    """
+    logger.setLevel(logging.INFO)
+    # テストや再入からの多重装着を防ぐため、毎回既存ハンドラをクリアする。
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(console)
+
+    if command in LOGGABLE_COMMANDS:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(LOG_DIR / f"{command}.log", encoding="utf-8")
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+        )
+        logger.addHandler(file_handler)
+
+
 def _print_summary(results: list[tuple[str, int]]) -> None:
     """複数アカウント実行時の獲得サマリを出力する。"""
-    print("\n=== サマリ ===")
+    logger.info("")
+    logger.info("=== サマリ ===")
     total = 0
     for name, gained in results:
-        print(f"  {name}: +{gained}枚")
+        logger.info("  %s: +%s枚", name, gained)
         total += gained
-    print(f"  合計: +{total}枚")
+    logger.info("  合計: +%s枚", total)
 
 
 def _main_impl() -> int:
     args = _build_parser().parse_args()
+    _setup_logging(args.command)
 
     profiles_dir = Path(args.profiles_dir).resolve()
 
@@ -3143,12 +3155,13 @@ def _main_impl() -> int:
     results: list[tuple[str, int]] = []
     with sync_playwright() as p:
         for name, profile_dir in profiles:
-            print(f"\n=== アカウント: {name} ({profile_dir}) ===")
+            logger.info("")
+            logger.info("=== アカウント: %s (%s) ===", name, profile_dir)
             try:
                 gained, code = process_account(p, name, profile_dir, options)
             # 1 アカウントの失敗で全体を止めないため、意図して広く握る
-            except Exception as e:  # noqa: BLE001
-                print(f"[{name}] 実行中に例外: {e}", file=sys.stderr)
+            except Exception:
+                logger.exception("[%s] 実行中に例外", name)
                 exit_code = 1
                 results.append((name, 0))
                 continue

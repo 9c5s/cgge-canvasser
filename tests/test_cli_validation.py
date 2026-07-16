@@ -87,7 +87,7 @@ class TestResolveProfiles:
         assert [name for name, _ in got] == ["alice", "bob"]
 
     def test_命名規則違反のディレクトリはskipする(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """空白入りなど規則外の名前は警告してリストから除外する。"""
         (tmp_path / "good").mkdir()
@@ -96,7 +96,7 @@ class TestResolveProfiles:
         got = canvasser.resolve_profiles(tmp_path, None)
 
         assert [name for name, _ in got] == ["good"]
-        assert "命名規則に合致しない" in capsys.readouterr().err
+        assert "命名規則に合致しない" in caplog.text
 
     def test_profiles_dirが無ければ空リスト(self, tmp_path: Path) -> None:
         """未作成の profiles_dir では空リストを返す。"""
@@ -425,5 +425,3 @@ class TestBuildRunOptions:
         assert options.daily_budget == 3
         assert options.consecutive_failure_limit == 2
         assert options.out_of_range_limit == 5
-
-

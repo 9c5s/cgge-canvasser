@@ -40,6 +40,9 @@ reportPrivateUsage = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# caplog / caplog.text で INFO 以上を捕捉できるようにする
+# (canvasser の logger は INFO 中心なので既定の WARNING では不足)
+log_level = "INFO"
 
 [tool.ruff]
 target-version = "py314"

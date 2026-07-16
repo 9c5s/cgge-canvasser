@@ -248,9 +248,9 @@ class TestEstimateTravelSecondsGmaps:
         assert got is None
 
     def test_transitの例外はNoneに丸めて警告する(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """API 例外は伝播させず None を返し、stderr に失敗を出力する。"""
+        """API 例外は伝播させず None を返し、警告ログを残す。"""
         client = FakeGmapsClient([RuntimeError("api down")])
         self._install(monkeypatch, client)
 
@@ -259,12 +259,12 @@ class TestEstimateTravelSecondsGmaps:
         )
 
         assert got is None
-        assert "gmaps directions 失敗" in capsys.readouterr().err
+        assert "gmaps directions 失敗" in caplog.text
 
     def test_driving再試行の例外もNoneに丸めて警告する(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """driving 側の例外も伝播させず None を返し、stderr に失敗を出力する。"""
+        """driving 側の例外も伝播させず None を返し、警告ログを残す。"""
         client = FakeGmapsClient([[], RuntimeError("api down")])
         self._install(monkeypatch, client)
 
@@ -273,7 +273,7 @@ class TestEstimateTravelSecondsGmaps:
         )
 
         assert got is None
-        assert "driving 再試行失敗" in capsys.readouterr().err
+        assert "driving 再試行失敗" in caplog.text
 
     def test_過去のdeparture_timeはnowに丸めて渡す(
         self, monkeypatch: pytest.MonkeyPatch
