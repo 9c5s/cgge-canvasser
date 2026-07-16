@@ -31,23 +31,23 @@ def test_load_missing_returns_default(tmp_path: Path) -> None:
 
 
 def test_load_broken_json_returns_default(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """壊れた JSON なら既定値 + stderr 警告。"""
+    """壊れた JSON なら既定値 + 警告ログ。"""
     (tmp_path / "relogin_guard.json").write_text("{not json", encoding="utf-8")
     guard = load_relogin_guard(tmp_path)
     assert guard == ReloginGuard()
-    assert "relogin_guard.json" in capsys.readouterr().err
+    assert "relogin_guard.json" in caplog.text
 
 
 def test_load_wrong_shape_returns_default(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """トップレベルが dict でない場合、既定値 + stderr 警告。"""
+    """トップレベルが dict でない場合、既定値 + 警告ログ。"""
     (tmp_path / "relogin_guard.json").write_text("[]", encoding="utf-8")
     guard = load_relogin_guard(tmp_path)
     assert guard == ReloginGuard()
-    assert "relogin_guard.json" in capsys.readouterr().err
+    assert "relogin_guard.json" in caplog.text
 
 
 def test_save_load_roundtrip(tmp_path: Path) -> None:
@@ -65,7 +65,7 @@ def test_save_atomic_writes_json(tmp_path: Path) -> None:
     assert data == {"failure_count": 1, "disabled_until": None}
 
 
-def test_relogin_disabled_none(capsys: pytest.CaptureFixture[str]) -> None:
+def test_relogin_disabled_none() -> None:
     """`disabled_until` が None ならガード無効 (False) を返す。"""
     guard = ReloginGuard(disabled_until=None)
     assert _relogin_disabled(guard, "test") is False
@@ -78,12 +78,12 @@ def test_relogin_disabled_past() -> None:
     assert _relogin_disabled(guard, "test") is False
 
 
-def test_relogin_disabled_future(capsys: pytest.CaptureFixture[str]) -> None:
-    """未来時刻の `disabled_until` はガード有効 (True) にし stderr へ案内する。"""
+def test_relogin_disabled_future(caplog: pytest.LogCaptureFixture) -> None:
+    """未来時刻の `disabled_until` はガード有効 (True) にし警告ログを残す。"""
     future = (datetime.now(JST) + timedelta(hours=1)).isoformat()
     guard = ReloginGuard(disabled_until=future)
     assert _relogin_disabled(guard, "test") is True
-    assert "test" in capsys.readouterr().err
+    assert "test" in caplog.text
 
 
 def test_relogin_disabled_invalid_string() -> None:

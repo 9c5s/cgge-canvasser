@@ -83,7 +83,7 @@ class TestAutoLogin:
     """auto_login の成功・失敗・タイムアウト・CAPTCHA 各分岐。"""
 
     def test_成功パスでSUCCESSを返す(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """フォーム操作後の 1 回目の check_login が is_login=True なら SUCCESS。
 
@@ -117,10 +117,10 @@ class TestAutoLogin:
             "press_sequentially",
             ("#mail", "user@example.com"),
         ))
-        assert "ログイン成功を検知" in capsys.readouterr().err
+        assert "ログイン成功を検知" in caplog.text
 
     def test_エラーDOM可視化でPASSWORD_ERROR(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """パスワード誤り相当のエラーメッセージが表示されたら PASSWORD_ERROR。"""
         _install_fake_time(monkeypatch)
@@ -136,10 +136,10 @@ class TestAutoLogin:
         assert result is AutoLoginOutcome.PASSWORD_ERROR
         # click 済みなので submit=1
         assert submitted == 1
-        assert "認証エラー" in capsys.readouterr().err
+        assert "認証エラー" in caplog.text
 
     def test_submit前のCAPTCHAで即CAPTCHA_DETECTED(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """フォーム入力前に CAPTCHA を検知したら submit せずに CAPTCHA_DETECTED。
 
@@ -163,11 +163,11 @@ class TestAutoLogin:
         assert not any(c[0] == "fill" for c in fake.calls)
         assert not any(c[0] == "press_sequentially" for c in fake.calls)
         assert not any(c[0] == "click" for c in fake.calls)
-        err = capsys.readouterr().err
+        err = caplog.text
         assert "submit 前に CAPTCHA/2FA" in err
 
     def test_submit後のCAPTCHA動的挿入でCAPTCHA_DETECTED(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """submit 後 (ポーリング中) に CAPTCHA が動的挿入されたら CAPTCHA_DETECTED。
 
@@ -192,11 +192,11 @@ class TestAutoLogin:
         assert submitted == 1
         # フォーム入力・click が実行されている (pre-submit 分岐と区別)
         assert any(c[0] == "press_sequentially" for c in fake.calls)
-        err = capsys.readouterr().err
+        err = caplog.text
         assert "CAPTCHA/2FA" in err
 
     def test_タイムアウトでTIMEOUT(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """成功も失敗も検知できなければ deadline 経過で TIMEOUT + submit=1。"""
         _install_fake_time(monkeypatch)
@@ -210,10 +210,10 @@ class TestAutoLogin:
         assert result is AutoLoginOutcome.TIMEOUT
         # click 済みなので submit=1
         assert submitted == 1
-        assert "タイムアウト" in capsys.readouterr().err
+        assert "タイムアウト" in caplog.text
 
     def test_click時のPlaywrightErrorはpollingに進みsubmitted1(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """click() が PlaywrightError を raise した場合の扱い。
 
@@ -238,7 +238,7 @@ class TestAutoLogin:
         assert submitted == 1
 
     def test_フォーム操作エラーで即FORM_ERROR(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """メール入力で PlaywrightError なら poll に入らず FORM_ERROR + submit=0。"""
         _install_fake_time(monkeypatch)
@@ -258,7 +258,7 @@ class TestAutoLogin:
         assert result is AutoLoginOutcome.FORM_ERROR
         # click に到達していないので BNID に届いていない
         assert submitted == 0
-        assert "フォーム操作でエラー" in capsys.readouterr().err
+        assert "フォーム操作でエラー" in caplog.text
 
 
 def _install_creds(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> Credentials:
@@ -450,7 +450,7 @@ class TestAttemptAutoRelogin:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """初回 check_login が false negative だった場合の救済。
 
@@ -471,7 +471,7 @@ class TestAttemptAutoRelogin:
         # failure_count は 0 にリセット
         got = canvasser.load_relogin_guard(tmp_path)
         assert got.failure_count == 0
-        assert "セッション有効を確認" in capsys.readouterr().err
+        assert "セッション有効を確認" in caplog.text
 
     def test_タイムアウトはリトライして最終的にTrueで成功(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -501,7 +501,7 @@ class TestAttemptAutoRelogin:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """1 回目 TIMEOUT 後にリトライ用 goto で check_login=True (遅延成功) の場合。
 
@@ -529,13 +529,13 @@ class TestAttemptAutoRelogin:
         assert len(press_calls) == 2
         got = canvasser.load_relogin_guard(tmp_path)
         assert got.failure_count == 0
-        assert "遅延成功を検知" in capsys.readouterr().err
+        assert "遅延成功を検知" in caplog.text
 
     def test_リトライしても失敗すればFalseとfailure_count2回分加算(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """TIMEOUT → TIMEOUT で False、failure_count は 2 回分加算、goto 2 回。
 
@@ -552,7 +552,7 @@ class TestAttemptAutoRelogin:
         got = canvasser.load_relogin_guard(tmp_path)
         # BNID に 2 回 submit されているので 2 回分計上する
         assert got.failure_count == 2
-        assert "リトライします" in capsys.readouterr().err
+        assert "リトライします" in caplog.text
         assert len([c for c in fake.calls if c[0] == "goto"]) == 2
 
     def test_パスワード誤りは即Falseでリトライしない(
@@ -585,7 +585,7 @@ class TestAttemptAutoRelogin:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """認証情報を BNID に送る前の一時的なネットワーク不調は据え置く。
 
@@ -599,7 +599,7 @@ class TestAttemptAutoRelogin:
         result = canvasser.attempt_auto_relogin(as_page(fake), tmp_path, "haruo")
 
         assert result is False
-        assert "BNID ログイン画面への遷移で失敗" in capsys.readouterr().err
+        assert "BNID ログイン画面への遷移で失敗" in caplog.text
         got = canvasser.load_relogin_guard(tmp_path)
         # 初期値 2 のまま + disabled_until も未設定 (自動再ログインは次回も試せる)
         assert got.failure_count == 2
@@ -773,7 +773,7 @@ class TestAttemptAutoRelogin:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """2 回目 auto_login TIMEOUT 直後の check_login=True で SUCCESS 拾い。
 
@@ -798,7 +798,7 @@ class TestAttemptAutoRelogin:
         got = canvasser.load_relogin_guard(tmp_path)
         # 遅延成功で failure_count はリセット
         assert got.failure_count == 0
-        assert "リトライ後にも遅延成功" in capsys.readouterr().err
+        assert "リトライ後にも遅延成功" in caplog.text
 
 
 def _run_options(*, dry_run: bool, auto_relogin: bool = True) -> canvasser.RunOptions:
@@ -827,7 +827,7 @@ class TestEnsureAuthenticated:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """dry_run=True では credentials が保存されていても auto_login を送らない。"""
         _install_creds(monkeypatch)
@@ -843,7 +843,7 @@ class TestEnsureAuthenticated:
         assert not any(c[0] == "fill" for c in fake.calls)
         assert not any(c[0] == "press_sequentially" for c in fake.calls)
         # 未ログインメッセージだけ出る
-        assert "未ログイン" in capsys.readouterr().err
+        assert "未ログイン" in caplog.text
 
     def test_本番かつauto_relogin無効なら自動再ログインを走らせない(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

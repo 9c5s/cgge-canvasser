@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 *_profile/
 profiles/
+logs/
 .coverage
 htmlcov/
 

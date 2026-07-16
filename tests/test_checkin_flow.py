@@ -393,7 +393,7 @@ class TestDeadlineOkBeforeTravel:
         assert (runner.prev_lat, runner.prev_lng) == (34.99, 135.0)
 
     def test_パース不能はdryrunで警告付きskip_originを維持(
-        self, capsys: pytest.CaptureFixture[str]
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """dry-run では期限パース失敗を警告付き skip に丸め、origin も維持する。"""
         runner = _runner()
@@ -401,7 +401,7 @@ class TestDeadlineOkBeforeTravel:
         spot = _typed(1, 35.0, 135.0, deadline="31/07/2026")
 
         assert runner._deadline_ok_before_travel(spot) is False
-        assert "パースできません" in capsys.readouterr().err
+        assert "パースできません" in caplog.text
         assert (runner.prev_lat, runner.prev_lng) == (34.99, 135.0)
 
     def test_パース不能は本番でfail_closed(self) -> None:
@@ -420,7 +420,7 @@ class TestDeadlineOkAfterTravel:
     """travel plan 後の deadline 判定: 到着予定超過をここで捌く。"""
 
     def test_到着予定が期限超過ならskipしoriginを更新しない(
-        self, capsys: pytest.CaptureFixture[str]
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """planned_arrival が deadline より先なら skip、origin は維持する。"""
         runner = _runner()
@@ -431,7 +431,7 @@ class TestDeadlineOkAfterTravel:
 
         assert runner._deadline_ok_after_travel(spot, planned) is False
         assert (runner.prev_lat, runner.prev_lng) == (34.99, 135.0)
-        assert "到着予定" in capsys.readouterr().out
+        assert "到着予定" in caplog.text
 
     def test_到着予定が期限内なら継続(self) -> None:
         """planned_arrival が期限内なら継続 (skip しない)。"""
@@ -630,7 +630,7 @@ class TestCollectCheckinsDryRun:
     """collect_checkins の dry-run 経路。"""
 
     def test_全スポットの見込み票数を返す(
-        self, capsys: pytest.CaptureFixture[str]
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """2 スポット dry-run は 1 件 10 票の 2 件分 = 20 票の見込みを返す。"""
         random.seed(0)
@@ -641,7 +641,7 @@ class TestCollectCheckinsDryRun:
 
         assert gained == 20
         assert len(fake.calls) == 1
-        assert "DRY-RUN" in capsys.readouterr().out
+        assert "DRY-RUN" in caplog.text
 
     def test_daily_budgetで見込み件数を打ち切る(self) -> None:
         """daily_budget=1 の dry-run は 1 件分の見込みで停止する。"""
@@ -653,17 +653,17 @@ class TestCollectCheckinsDryRun:
 
         assert gained == 10
 
-    def test_スポットが空なら0(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_スポットが空なら0(self, caplog: pytest.LogCaptureFixture) -> None:
         """イベントにスポットが無ければ何もせず 0 を返す。"""
         fake = FakePage([_listing([])])
 
         gained = canvasser.collect_checkins(_as_page(fake), _settings())
 
         assert gained == 0
-        assert "空でした" in capsys.readouterr().out
+        assert "空でした" in caplog.text
 
     def test_全件is_checkedinなら0(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """listing 上で全 spot が is_checkedin=1 なら走行せず 0 を返す。"""
         spots = [_spot_done(1, 35.00, 135.0), _spot_done(2, 35.01, 135.0)]
@@ -674,7 +674,7 @@ class TestCollectCheckinsDryRun:
         )
 
         assert gained == 0
-        assert "全スポット完了済み" in capsys.readouterr().out
+        assert "全スポット完了済み" in caplog.text
 
     def test_期限切れスポットはskipされ票に計上しない(self) -> None:
         """全スポット期限切れなら見込み 0 票で走行を終える。"""
