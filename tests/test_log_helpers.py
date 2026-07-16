@@ -49,6 +49,31 @@ class TestRedactSecrets:
 
         assert _redact_secrets(text) == text
 
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            (
+                "{'url': 'https://x/?key=SECRET'}",
+                "{'url': 'https://x/?key=***'}",
+            ),
+            (
+                '"https://x/?key=SECRET"',
+                '"https://x/?key=***"',
+            ),
+            (
+                "(https://x/?key=SECRET)",
+                "(https://x/?key=***)",
+            ),
+            (
+                "url=https://x/?key=SECRET, next",
+                "url=https://x/?key=***, next",
+            ),
+        ],
+    )
+    def test_デリミタは巻き込んで伏せない(self, text: str, expected: str) -> None:
+        """引用符 / 括弧 / カンマなどのデリミタは redact に巻き込まれず保持される。"""
+        assert _redact_secrets(text) == expected
+
 
 class TestLogBody:
     """`_log_body` は API 応答 body から診断に必要な既知キーだけ抽出する。"""
