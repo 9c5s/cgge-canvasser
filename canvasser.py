@@ -223,7 +223,12 @@ def _log_body(body: object) -> str:
 # 失敗した URL 全体 (`https://maps.googleapis.com/...?key=GMAPS_KEY&...`) を
 # そのまま含み得るため、永続ログには redact してから残す。
 _SECRET_QUERY_RE = re.compile(
-    r"([?&](?:key|signature|api[_-]?key)=)[^&\s#]+", re.IGNORECASE
+    # value の終端はクエリ区切り (`&`) / fragment (`#`) / 空白に加え、周辺の
+    # 引用符 / 括弧 / カンマなどのデリミタも除外する。これらを含めてしまうと
+    # `"...?key=SECRET"` の閉じ引用符まで redact され、ログの JSON / 引用構造が
+    # 壊れる。
+    r"([?&](?:key|signature|api[_-]?key)=)[^&\s#\"'(){}\[\],<>]+",
+    re.IGNORECASE,
 )
 
 
