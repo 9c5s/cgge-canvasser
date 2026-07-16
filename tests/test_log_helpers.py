@@ -1,8 +1,13 @@
-"""ロギング補助関数 (`_redact_secrets`, `_log_body`, `_sanitize_paths`) の直接検証。"""
+"""ロギング補助関数 (redact / body allowlist / path sanitize) の直接検証。"""
 
 import pytest
 
-from canvasser import _log_body, _redact_secrets, _sanitize_paths
+from canvasser import (
+    _log_body,
+    _redact_secrets,
+    _sanitize_exception,
+    _sanitize_paths,
+)
 
 
 class TestRedactSecrets:
@@ -174,3 +179,46 @@ class TestSanitizePaths:
         assert "shun" not in got
         assert "a.txt" in got
         assert "b.txt" in got
+
+    def test_スペース入りユーザー名も丸める(self) -> None:
+        r"""`C:\Users\Jane Doe\...` のようなスペース入りユーザー名も漏れない。"""
+        text = r"C:\Users\Jane Doe\projects\main\canvasser_state.json"
+
+        got = _sanitize_paths(text)
+
+        assert "Jane" not in got
+        assert "Doe" not in got
+        assert got.endswith("canvasser_state.json")
+        assert "<path>/" in got
+
+    def test_Users以外のドライブも_path_に丸まる(self) -> None:
+        r"""`D:\projects\...` も step2 で basename に丸められる。"""
+        text = r"D:\projects\cgge-canvasser\profiles\shun\file.txt"
+
+        got = _sanitize_paths(text)
+
+        # `<user>` は入らない (Users パターンではないため step1 は動かない)
+        assert "<user>" not in got
+        assert got.endswith("file.txt")
+        assert "<path>/" in got
+
+
+class TestSanitizeException:
+    """`_sanitize_exception` は URL secret redact と絶対パス redact を両方適用する。"""
+
+    def test_urlのkeyとパスの両方が処理される(self) -> None:
+        """GMAPS_KEY を含む URL とローカル絶対パスを同時に redact する。"""
+        e = RuntimeError(
+            r"failed to fetch https://x/?key=SECRET (opened C:\Users\shun\a.txt)"
+        )
+
+        got = _sanitize_exception(e)
+
+        assert "SECRET" not in got
+        assert "shun" not in got
+
+    def test_通常メッセージはそのまま返す(self) -> None:
+        """redact 対象を含まない例外 message はそのまま返す。"""
+        e = RuntimeError("connection reset by peer")
+
+        assert _sanitize_exception(e) == "connection reset by peer"

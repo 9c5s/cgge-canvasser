@@ -237,18 +237,45 @@ def _redact_secrets(text: str) -> str:
     return _SECRET_QUERY_RE.sub(r"\1***", text)
 
 
-# 例外メッセージや state ファイルパスに紛れ込む Windows 絶対パスを basename に
-# 丸める。`C:\Users\<name>\projects\cgge-canvasser\profiles\shun\Default\Login Data`
-# のようなパスは Windows ユーザー名を含む PII だが、永続ログに残ると診断上の価値
-# より漏洩リスクの方が大きい。
+# 例外メッセージや state ファイルパスに紛れ込む Windows 絶対パスを redact する。
+# `C:\Users\<name>\projects\cgge-canvasser\profiles\shun\Default\Login Data` のような
+# パスは Windows ユーザー名を含む PII だが、永続ログに残ると診断上の価値より漏洩
+# リスクの方が大きい。二段構成で対応する:
+#   1. `C:\Users\<name>` を `C:\Users\<user>` に丸める (スペース入りユーザー名対応)
+#   2. 残る絶対パスを `<path>/<basename>` に丸める (スペースを含まない典型パス)
+_WIN_USER_HOME_RE = re.compile(
+    r"([A-Za-z]:[\\/]Users[\\/])[^\\/\r\n\"'<>|?*]+",
+    re.IGNORECASE,
+)
 _ABS_WIN_PATH_RE = re.compile(
-    r"[A-Za-z]:[\\/](?:[^\\/\s\"'<>|?*:]+[\\/])+([^\\/\s\"'<>|?*:]+)"
+    # `<` `>` は step1 が挿入する `<user>` プレースホルダを step2 が跨いで match
+    # できるよう、除外リストから外す (Windows パスとしても実在しない文字なので
+    # 副作用はない)。
+    r"[A-Za-z]:[\\/](?:[^\\/\s\"'|?*:]+[\\/])+([^\\/\s\"'|?*:]+)"
 )
 
 
 def _sanitize_paths(text: str) -> str:
-    """メッセージ内の Windows 絶対パスを basename だけに丸めた文字列を返す。"""
+    r"""メッセージ内の Windows 絶対パスを redact する。
+
+    step1 で `C:\Users\<user>` を潰し (スペース入りユーザー名も対応)、step2 で
+    残る絶対パスを basename だけに丸める。中間ディレクトリにスペースが入る
+    非 Users 経路 (例: `C:\Program Files\...`) は step2 で完全には丸まらない
+    ことがあるが、Windows ユーザー名を含む典型的な PII 経路は step1 で処理
+    される。
+    """
+    text = _WIN_USER_HOME_RE.sub(r"\1<user>", text)
     return _ABS_WIN_PATH_RE.sub(r"<path>/\1", text)
+
+
+def _sanitize_exception(e: BaseException) -> str:
+    """例外テキストを永続ログ向けに URL secret redact + パス丸めしたものに変換する。
+
+    exception message には Windows 絶対パスや Google Maps 例外の GMAPS_KEY が
+    含まれ得る。全ての except 経路の logger 呼び出しでこの helper を経由させ、
+    永続ログ (logs/*.log) に生の PII が残らないようにする。
+    """
+    return _sanitize_paths(_redact_secrets(str(e)))
 
 
 def _success_payload_or_raise(res: dict[str, Any], err_prefix: str) -> dict[str, Any]:
@@ -929,8 +956,9 @@ def _load_resume_context(
         )
         if not settings.dry_run:
             raise FailClosedError(msg) from e
-        # dry-run は空 state のまま継続してスポット取得後の検証を回す
-        logger.warning(msg)
+        # dry-run は空 state のまま継続してスポット取得後の検証を回す。
+        # msg 内には state.json の絶対パスが含まれるため sanitize してから出す。
+        logger.warning(_sanitize_paths(msg))
         return None, None, None
 
 
@@ -1476,7 +1504,7 @@ def _get_gmaps_client() -> googlemaps.Client | None:
             "Google Maps クライアント初期化失敗: %s (%s)。"
             "Haversine にフォールバックする。",
             type(e).__name__,
-            _redact_secrets(str(e)),
+            _sanitize_exception(e),
         )
         return None
 
@@ -1502,7 +1530,7 @@ def _directions_driving_fallback(
         logger.warning(
             "  gmaps driving 再試行失敗: %s (%s)",
             type(e).__name__,
-            _redact_secrets(str(e)),
+            _sanitize_exception(e),
         )
         return None
     if not result:
@@ -1566,7 +1594,7 @@ def _estimate_travel_seconds_gmaps(
         logger.warning(
             "  gmaps directions 失敗: %s (%s)",
             type(e).__name__,
-            _redact_secrets(str(e)),
+            _sanitize_exception(e),
         )
         return None
 
@@ -1987,7 +2015,7 @@ def _dpapi_unprotect(blob: bytes) -> bytes | None:
             ctypes.byref(out_blob),
         )
     except OSError as e:
-        logger.warning("DPAPI 呼び出し失敗: %s", e)
+        logger.warning("DPAPI 呼び出し失敗: %s", _sanitize_exception(e))
         return None
     if not ok:
         logger.warning("DPAPI 復号失敗")
@@ -2007,7 +2035,9 @@ def _decode_dpapi_blob(local_state: Path, encrypted_b64: str) -> bytes | None:
     try:
         encrypted = base64.b64decode(encrypted_b64)
     except (ValueError, TypeError) as e:
-        logger.warning("encrypted_key の base64 デコード失敗: %s", e)
+        logger.warning(
+            "encrypted_key の base64 デコード失敗: %s", _sanitize_exception(e)
+        )
         return None
     if not encrypted.startswith(b"DPAPI"):
         # 呼び出し側で local_state = profile_dir / "Local State" として構築されて
@@ -2034,7 +2064,11 @@ def _load_chrome_master_key(
     try:
         raw = json.loads(local_state.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning("[%s] Local State を読めません: %s", profile_dir.name, e)
+        logger.warning(
+            "[%s] Local State を読めません: %s",
+            profile_dir.name,
+            _sanitize_exception(e),
+        )
         return None
     # dict の isinstance 絞り込みだけだと型引数が Unknown に推論されるため、
     # 既存の _as_str_dict (dict[str, Any] への絞り込み + cast の共通化) に乗せる。
@@ -2097,7 +2131,11 @@ def _read_bnid_login_row(
             timeout=5.0,
         )
     except sqlite3.OperationalError as e:
-        logger.warning("[%s] Login Data を開けません: %s", profile_dir.name, e)
+        logger.warning(
+            "[%s] Login Data を開けません: %s",
+            profile_dir.name,
+            _sanitize_exception(e),
+        )
         return None
     try:
         row = con.execute(
@@ -2106,7 +2144,11 @@ def _read_bnid_login_row(
             " ORDER BY date_last_used DESC LIMIT 1"
         ).fetchone()
     except sqlite3.Error as e:
-        logger.warning("[%s] Login Data の SELECT で失敗: %s", profile_dir.name, e)
+        logger.warning(
+            "[%s] Login Data の SELECT で失敗: %s",
+            profile_dir.name,
+            _sanitize_exception(e),
+        )
         return None
     finally:
         con.close()
@@ -2149,7 +2191,7 @@ def load_relogin_guard(profile_dir: Path) -> ReloginGuard:
             "[%s] relogin_guard.json を読めません: %s。"
             "ガードを既定値にリセットします。",
             profile_dir.name,
-            e,
+            _sanitize_exception(e),
         )
         return ReloginGuard()
     if not isinstance(raw, dict):
@@ -2351,7 +2393,7 @@ def auto_login(
         # disabled が外れるまで待ってからクリックする (Phase 1 の必須手順)
         page.locator(_LOGIN_BTN_ENABLED_SEL).wait_for(timeout=5000)
     except PlaywrightError as e:
-        logger.warning("[auto_login] フォーム操作でエラー: %s", e)
+        logger.warning("[auto_login] フォーム操作でエラー: %s", _sanitize_exception(e))
         return AutoLoginOutcome.FORM_ERROR, 0
 
     # click は別 try に分離する。click が起こす navigation を Playwright が待って
@@ -2479,7 +2521,11 @@ def _retry_after_timeout(
     try:
         page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
     except PlaywrightError as e:
-        logger.warning("[%s] リトライ時の BNID ログイン画面への遷移で失敗: %s", name, e)
+        logger.warning(
+            "[%s] リトライ時の BNID ログイン画面への遷移で失敗: %s",
+            name,
+            _sanitize_exception(e),
+        )
         return AutoLoginOutcome.TIMEOUT, 0
     # check_login は redirect 進行中に PlaywrightError を投げうる。ここで例外が
     # 上流に escape すると、1 回目 submit の failure_count 加算が飛んで無限ループ
@@ -2600,7 +2646,11 @@ def attempt_auto_relogin(page: Page, profile_dir: Path, name: str) -> bool:
     try:
         page.goto(LOGIN_ENTRY_URL, wait_until="domcontentloaded")
     except PlaywrightError as e:
-        logger.warning("[%s] BNID ログイン画面への遷移で失敗: %s", name, e)
+        logger.warning(
+            "[%s] BNID ログイン画面への遷移で失敗: %s",
+            name,
+            _sanitize_exception(e),
+        )
         return False
 
     # 初回 check_login が false negative だった場合の救済。cookie が実は有効なら
@@ -2672,7 +2722,11 @@ def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> boo
     try:
         page.goto(LINKAGE_ENTRY_URL, wait_until="domcontentloaded")
     except PlaywrightError as e:
-        logger.warning("[%s] ASOBI 連携 URL への遷移で失敗: %s", name, e)
+        logger.warning(
+            "[%s] ASOBI 連携 URL への遷移で失敗: %s",
+            name,
+            _sanitize_exception(e),
+        )
         return False
 
     timeout_sec = 60
@@ -2708,7 +2762,9 @@ def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> boo
                 return False
         except PlaywrightError as e:
             logger.warning(
-                "[%s] ASOBI 連携復旧ポーリング中に PlaywrightError: %s", name, e
+                "[%s] ASOBI 連携復旧ポーリング中に PlaywrightError: %s",
+                name,
+                _sanitize_exception(e),
             )
             # 次ポーリングに委ねる
         time.sleep(interval_sec)
@@ -3003,7 +3059,7 @@ def process_account(
                 # message には state ファイルの絶対パスが載る経路があるため
                 # ここで sanitize して永続ログに Windows ユーザー名を残さない。
                 logger.error(  # noqa: TRY400
-                    "[%s] fail closed: %s", name, _sanitize_paths(str(e))
+                    "[%s] fail closed: %s", name, _sanitize_exception(e)
                 )
                 if not options.dry_run:
                     gained += e.partial_gained
@@ -3023,8 +3079,9 @@ def main() -> int:
     try:
         return _main_impl()
     except UserInputError as e:
-        # ユーザー入力エラーは短いメッセージだけを出す (traceback は不要)
-        logger.error("エラー: %s", e)  # noqa: TRY400
+        # ユーザー入力エラーは短いメッセージだけを出す (traceback は不要)。
+        # message には profile_dir などの絶対パスが載る経路があるため sanitize する。
+        logger.error("エラー: %s", _sanitize_exception(e))  # noqa: TRY400
         return 1
 
 
@@ -3291,7 +3348,7 @@ def _main_impl() -> int:
                     "[%s] 実行中に例外: %s: %s",
                     name,
                     type(e).__name__,
-                    _sanitize_paths(str(e)),
+                    _sanitize_exception(e),
                 )
                 exit_code = 1
                 results.append((name, 0))
