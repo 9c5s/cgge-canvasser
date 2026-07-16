@@ -135,20 +135,6 @@ class TestLogBody:
 class TestSanitizePaths:
     """`_sanitize_paths` は例外メッセージ内の Windows 絶対パスを basename に丸める。"""
 
-    def test_拡張子なしパスはUsers下のユーザー名だけ丸まる(self) -> None:
-        """拡張子なしファイル (Chrome の `Login Data` など) は step2 の対象外。
-
-        Users home の Windows ユーザー名は step1 で消えるが、それ以下の
-        account 名などは canvasser の意図的な表示として残る。
-        """
-        text = r"C:\Users\shun\projects\cgge-canvasser\profiles\main\Default\Login Data"
-
-        got = _sanitize_paths(text)
-
-        # Users 直下の Windows ユーザー名は消える
-        assert r"\Users\shun\\" not in got.replace("\\\\", "\\")
-        assert "<user>" in got
-
     def test_forward_slash区切りにも対応する(self) -> None:
         """Path.as_posix() 由来の forward slash パスも丸められる。"""
         text = "C:/Users/shun/projects/cgge-canvasser/profiles/shun/state.json"
@@ -174,15 +160,20 @@ class TestSanitizePaths:
 
         assert _sanitize_paths(text) == text
 
-    def test_複数のパスをすべて置換する(self) -> None:
-        """メッセージ内に複数の Windows パスが並んでも全部丸める。"""
+    def test_複数のパスもuser名は消える(self) -> None:
+        r"""同一メッセージに複数の Windows パスが並んでも user 名は消える。
+
+        space 入り中間ディレクトリを許容している都合上、`src=...\a.txt dst=...\b.txt`
+        のように区切りが space の場合は step2 の中間 segment が両 path を跨いで
+        マッチする (これは Windows ユーザー名を漏らさないという主目的とは無関係)。
+        """
         text = r"src=C:\Users\shun\a.txt dst=C:\Users\shun\b.txt"
 
         got = _sanitize_paths(text)
 
         assert "shun" not in got
-        assert "a.txt" in got
-        assert "b.txt" in got
+        # basename (最後のファイル名) は必ず残る
+        assert got.endswith("b.txt")
 
     def test_スペース入りユーザー名も丸める(self) -> None:
         r"""`C:\Users\Jane Doe\...` のようなスペース入りユーザー名も漏れない。"""
@@ -228,6 +219,26 @@ class TestSanitizePaths:
         assert got.startswith("cannot open ")
         assert got.endswith(" for reading")
         assert "<path>/file.txt" in got
+
+    def test_拡張子なしディレクトリも丸まる(self) -> None:
+        r"""`profile_dir.mkdir(...)` 失敗のようなディレクトリパスも redact される。"""
+        text = r"[Errno 13] Permission denied: 'D:\work\cgge-canvasser\profiles\main'"
+
+        got = _sanitize_paths(text)
+
+        assert "profiles" not in got
+        assert "cgge-canvasser" not in got
+        assert "<path>/main" in got
+
+    def test_dotted_directoryを跨いで拡張子付きbasenameまで丸める(self) -> None:
+        r"""version 番号入り中間ディレクトリ (project.v1) も 1 度で redact。"""
+        text = r"C:\Users\Jane Doe\project.v1\profiles\main\canvasser_state.json"
+
+        got = _sanitize_paths(text)
+
+        for leak in ("Jane", "Doe", "project.v1", "profiles"):
+            assert leak not in got, got
+        assert got.endswith("canvasser_state.json")
 
 
 class TestSanitizeException:

@@ -248,25 +248,38 @@ _WIN_USER_HOME_RE = re.compile(
     re.IGNORECASE,
 )
 _ABS_WIN_PATH_WITH_EXT_RE = re.compile(
-    # 拡張子で終わる絶対パスに絞る。lazy `+?` + `.<ext>` を anchor にすることで
-    # `cannot open C:\path\file.txt for reading` の `for reading` まで巻き込む
-    # 貪欲マッチを避けつつ、`C:\Users\Jane Doe\OneDrive - Corp\...\file.json` の
-    # ようなスペース入り中間ディレクトリも 1 度にマッチできる。拡張子を持たない
-    # パス (ディレクトリのみ) は対象外。
+    # 拡張子で終わる絶対パスに絞る。各中間 segment は space を許容し
+    # (`OneDrive - Corp` 等)、basename は lazy `+?` で最短マッチ、末尾の
+    # `.<ext>` を anchor にする。この配置で:
+    #   - 中間 segment が dotted (`project.v1` 等) でも overall match は最後の
+    #     拡張子まで届く (中間 segment は貪欲、basename だけ lazy)
+    #   - `cannot open C:\path\file.txt for reading` の `for reading` は
+    #     basename の lazy 停止で巻き込まれない
     # 除外リストから `<` `>` は外す (step1 が挿入する `<user>` プレースホルダを
-    # step2 の match が跨げるように)。実 Windows パスに `<>` は使えないので
-    # 誤マッチのリスクはない。
-    r"[A-Za-z]:[\\/][^\r\n\"'|?*]+?\.[A-Za-z0-9]+"
+    # step2 が跨げるように)。実 Windows パスに `<>` は使えないので副作用なし。
+    r"[A-Za-z]:[\\/](?:[^\\/\r\n\"'|?*]+[\\/])+[^\\/\r\n\"'|?*]+?\.[A-Za-z0-9]+"
+)
+_ABS_WIN_PATH_DIR_RE = re.compile(
+    # 拡張子なしディレクトリパスも redact 対象にする。上記と違い basename が
+    # 拡張子で anchor されないため、space stop で貪欲を抑える (space 入りの
+    # 中間ディレクトリは step2a か step1 でカバーする想定)。`profile_dir.mkdir`
+    # 失敗などディレクトリを message に載せる例外にも対応する。
+    r"[A-Za-z]:[\\/](?:[^\s\\/\r\n\"'|?*]+[\\/])*[^\s\\/\r\n\"'|?*]+"
 )
 
 
 def _sanitize_paths(text: str) -> str:
     r"""メッセージ内の Windows 絶対パスを redact する。
 
-    step1 で `C:\Users\<user>` を潰し (スペース入りユーザー名も対応)、step2 で
-    拡張子付きの絶対パスを basename だけに丸める。拡張子を持たないパス
-    (ディレクトリのみ) は step2 が touch しないが、実務上 exception message に
-    出るのはファイル操作由来がほとんどなので許容する。
+    3 段構成:
+      1. `C:\Users\<user>` の user 名を潰す (スペース入りユーザー名も対応)
+      2. 拡張子付き絶対パスを `<path>/<basename>` に丸める (中間 segment に
+         space・dot が含まれてもよい)
+      3. 拡張子なしディレクトリパスを `<path>/<basename>` に丸める (space stop)
+
+    step2 と step3 の差分は「space 入り中間ディレクトリを許すか」の 1 点。
+    拡張子付きは末尾 anchor で貪欲を抑えられるので space 許容、ディレクトリ
+    パスは末尾 anchor が無いので space stop で誤マッチを防ぐ。
     """
     text = _WIN_USER_HOME_RE.sub(r"\1<user>", text)
 
@@ -274,7 +287,8 @@ def _sanitize_paths(text: str) -> str:
         segments = re.split(r"[\\/]", match.group(0))
         return f"<path>/{segments[-1]}"
 
-    return _ABS_WIN_PATH_WITH_EXT_RE.sub(_to_basename, text)
+    text = _ABS_WIN_PATH_WITH_EXT_RE.sub(_to_basename, text)
+    return _ABS_WIN_PATH_DIR_RE.sub(_to_basename, text)
 
 
 def _sanitize_exception(e: BaseException) -> str:
