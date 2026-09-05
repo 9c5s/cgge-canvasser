@@ -549,7 +549,7 @@ def _process_one_mission(
     remaining = m.get("remaining_completable_count") or 0
 
     if completed and not received:
-        return _receive(page, mid, name, pts, dry_run=dry_run)
+        return _receive(page, mid, name, pts=pts, dry_run=dry_run)
 
     if not api_completable:
         return MissionOutcome()
@@ -562,7 +562,7 @@ def _process_one_mission(
         # 一覧の completed フラグ更新が遅延する。達成 POST が「既に達成済み」を
         # 返した場合も受取 PUT は通る。
         if complete_result in ("ok", "already_done"):
-            return _receive(page, mid, name, pts, dry_run=dry_run)
+            return _receive(page, mid, name, pts=pts, dry_run=dry_run)
 
     return MissionOutcome()
 
@@ -625,7 +625,7 @@ def _complete(page: Page, mid: int, name: str, *, dry_run: bool) -> str:
 
 
 def _receive(
-    page: Page, mid: int, name: str, pts: int, *, dry_run: bool
+    page: Page, mid: int, name: str, *, pts: int, dry_run: bool
 ) -> MissionOutcome:
     """投票券受取の PUT を送る。
 
@@ -759,6 +759,7 @@ def call_checkin_api(
     page: Page,
     method: str,
     path: str,
+    *,
     body: str | None = None,
 ) -> dict[str, Any]:
     """API の checkins 系エンドポイントを叩く。
@@ -935,7 +936,7 @@ def _pop_nearest(unvisited: list[Spot], lat: float, lng: float) -> Spot:
     """
     nearest_idx = min(
         range(len(unvisited)),
-        key=lambda i: _distance_m(lat, lng, unvisited[i].lat, unvisited[i].lng),
+        key=lambda i: _distance_m((lat, lng), (unvisited[i].lat, unvisited[i].lng)),
     )
     return unvisited.pop(nearest_idx)
 
@@ -1005,6 +1006,7 @@ def _partition_spots(all_spots: list[Spot]) -> tuple[list[Spot], int]:
 def _announce_checkin_plan(
     settings: CheckinSettings,
     spots: list[Spot],
+    *,
     total_spots: int,
     skipped: int,
 ) -> None:
@@ -1157,10 +1159,8 @@ class _CheckinRunner:
         if self.prev_lat is None or self.prev_lng is None:
             return None
         secs, mode = estimate_travel_seconds(
-            self.prev_lat,
-            self.prev_lng,
-            spot.lat,
-            spot.lng,
+            (self.prev_lat, self.prev_lng),
+            (spot.lat, spot.lng),
             departure_time=self.virtual_now,
         )
         if mode == "gmaps-transit":
@@ -1174,7 +1174,7 @@ class _CheckinRunner:
             arrival = next_arrival_time(self.virtual_now, secs)
         wait_seconds = (arrival - self.virtual_now).total_seconds()
         straight_km = (
-            _distance_m(self.prev_lat, self.prev_lng, spot.lat, spot.lng) / 1000
+            _distance_m((self.prev_lat, self.prev_lng), (spot.lat, spot.lng)) / 1000
         )
         return _TravelPlan(
             wait_seconds=wait_seconds,
@@ -1275,7 +1275,7 @@ class _CheckinRunner:
         slug = spot.slug
         coords = make_checkin_coords(spot)
         distance_m = _distance_m(
-            spot.lat, spot.lng, coords["latitude"], coords["longitude"]
+            (spot.lat, spot.lng), (coords["latitude"], coords["longitude"])
         )
         body = encrypt_coords(coords)
 
@@ -1466,7 +1466,7 @@ def collect_checkins(page: Page, settings: CheckinSettings) -> int:
         else None
     )
     spots = order_spots_by_proximity(spots, start_location=start_loc)
-    _announce_checkin_plan(settings, spots, len(all_spots), skipped)
+    _announce_checkin_plan(settings, spots, total_spots=len(all_spots), skipped=skipped)
 
     virtual_now = _initial_virtual_now(settings, resume_at)
     resumed = start_loc is not None
@@ -1486,8 +1486,14 @@ def collect_checkins(page: Page, settings: CheckinSettings) -> int:
     return runner.run()
 
 
-def _distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+# (緯度, 経度) の組。
+type LatLng = tuple[float, float]
+
+
+def _distance_m(origin: LatLng, dest: LatLng) -> float:
     """2 点間の距離 [m] を Haversine 近似で計算する。"""
+    lat1, lng1 = origin
+    lat2, lng2 = dest
     earth_radius_m = 6371000.0
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
@@ -1539,8 +1545,9 @@ def _get_gmaps_client() -> googlemaps.Client | None:
 
 def _directions_driving_fallback(
     client: googlemaps.Client,
-    origin: tuple[float, float],
-    dest: tuple[float, float],
+    origin: LatLng,
+    dest: LatLng,
+    *,
     depart_arg: datetime | str,
 ) -> tuple[float, str] | None:
     """経路が transit で見つからない場合の driving 再試行。失敗時は None を返す。"""
@@ -1572,11 +1579,7 @@ def _directions_driving_fallback(
 
 
 def _estimate_travel_seconds_gmaps(
-    lat1: float,
-    lng1: float,
-    lat2: float,
-    lng2: float,
-    departure_time: datetime,
+    origin: LatLng, dest: LatLng, departure_time: datetime
 ) -> tuple[float, str] | None:
     """Google Maps Directions API で公共交通機関の実移動時間を取得する。
 
@@ -1592,6 +1595,8 @@ def _estimate_travel_seconds_gmaps(
         departure_time.minute // _GMAPS_TIME_BUCKET_MINUTES
     ) * _GMAPS_TIME_BUCKET_MINUTES
     bucketed = departure_time.replace(minute=bucket_minute, second=0, microsecond=0)
+    lat1, lng1 = origin
+    lat2, lng2 = dest
     cache_key = (
         round(lat1, 4),
         round(lng1, 4),
@@ -1609,8 +1614,8 @@ def _estimate_travel_seconds_gmaps(
             departure_time if departure_time > real_now else "now"
         )
         result = client.directions(
-            (lat1, lng1),
-            (lat2, lng2),
+            origin,
+            dest,
             mode="transit",
             departure_time=depart_arg,
             language="ja",
@@ -1634,23 +1639,21 @@ def _estimate_travel_seconds_gmaps(
         )
     else:
         # transit で経路がない (深夜帯や公共交通が届かない場所) 場合は driving で再試行
-        pair = _directions_driving_fallback(
-            client, (lat1, lng1), (lat2, lng2), depart_arg
-        )
+        pair = _directions_driving_fallback(client, origin, dest, depart_arg=depart_arg)
     if pair is not None:
         _GMAPS_CACHE[cache_key] = pair
     return pair
 
 
 def _estimate_travel_seconds_haversine(
-    lat1: float, lng1: float, lat2: float, lng2: float
+    origin: LatLng, dest: LatLng
 ) -> tuple[float, str]:
     """フォールバックの実装。Haversine と距離レンジ別平均速度で下限を推定する。
 
     Haversine 直線距離に `ROAD_DISTANCE_FACTOR` を掛けた値を実道路距離とみなし、
     `_TRAVEL_SPEED_BANDS` で手段を自動選択して、手段固有のオーバーヘッドを加える。
     """
-    straight_m = _distance_m(lat1, lng1, lat2, lng2)
+    straight_m = _distance_m(origin, dest)
     road_m = straight_m * ROAD_DISTANCE_FACTOR
     for max_road_m, speed_m_per_h, overhead_sec, mode in _TRAVEL_SPEED_BANDS:
         if road_m < max_road_m:
@@ -1660,11 +1663,7 @@ def _estimate_travel_seconds_haversine(
 
 
 def estimate_travel_seconds(
-    lat1: float,
-    lng1: float,
-    lat2: float,
-    lng2: float,
-    departure_time: datetime | None = None,
+    origin: LatLng, dest: LatLng, departure_time: datetime | None = None
 ) -> tuple[float, str]:
     """2 点間の常識的な最短移動時間 [秒] と使用手段名を返す。
 
@@ -1676,11 +1675,11 @@ def estimate_travel_seconds(
     if departure_time is None:
         departure_time = datetime.now(JST)
     gmaps_result = _estimate_travel_seconds_gmaps(
-        lat1, lng1, lat2, lng2, departure_time=departure_time
+        origin, dest, departure_time=departure_time
     )
     if gmaps_result is not None:
         return gmaps_result
-    return _estimate_travel_seconds_haversine(lat1, lng1, lat2, lng2)
+    return _estimate_travel_seconds_haversine(origin, dest)
 
 
 def humanize_duration(seconds: float) -> str:
@@ -2558,7 +2557,7 @@ def _record_relogin_failure(
 
 
 def _retry_after_timeout(
-    page: Page, name: str, credentials: Credentials, guard: ReloginGuard
+    page: Page, name: str, *, credentials: Credentials, guard: ReloginGuard
 ) -> tuple[AutoLoginOutcome, int]:
     """1 回目 TIMEOUT を受けてリトライを実行し、(outcome, 追加 submit 回数) を返す。
 
@@ -2620,7 +2619,7 @@ def _resolve_retry_outcome(
 
 
 def _run_auto_login_sequence(
-    page: Page, name: str, credentials: Credentials, guard: ReloginGuard
+    page: Page, name: str, *, credentials: Credentials, guard: ReloginGuard
 ) -> tuple[AutoLoginOutcome, int]:
     """auto_login を最大 2 回試して (最終 outcome, 実 submit 回数) を返す。
 
@@ -2642,7 +2641,7 @@ def _run_auto_login_sequence(
     if outcome is not AutoLoginOutcome.TIMEOUT:
         return outcome, submitted
     retry_outcome, retry_submitted = _retry_after_timeout(
-        page, name, credentials, guard
+        page, name, credentials=credentials, guard=guard
     )
     return retry_outcome, submitted + retry_submitted
 
@@ -2674,7 +2673,9 @@ def _run_guarded_auto_login(
     guard = load_relogin_guard(profile_dir)
     if _relogin_disabled(guard, name):
         return False
-    outcome, submissions = _run_auto_login_sequence(page, name, credentials, guard)
+    outcome, submissions = _run_auto_login_sequence(
+        page, name, credentials=credentials, guard=guard
+    )
     if outcome is AutoLoginOutcome.SUCCESS:
         _reset_relogin_failure(profile_dir, guard)
         return True
@@ -2840,7 +2841,7 @@ def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> boo
 
 
 def _ensure_authenticated(
-    page: Page, name: str, profile_dir: Path, options: RunOptions
+    page: Page, name: str, profile_dir: Path, *, options: RunOptions
 ) -> bool:
     """check_login → auto-relogin ゲートで最終的にログイン済みかを返す。
 
@@ -2871,6 +2872,7 @@ def _ensure_authenticated(
 
 def run_login_flow(
     page: Page,
+    *,
     timeout_sec: int = 600,
     interval_sec: float = 3.0,
     save_password_grace_sec: int = 30,
@@ -3070,6 +3072,7 @@ def process_account(
     p: Playwright,
     name: str,
     profile_dir: Path,
+    *,
     options: RunOptions,
 ) -> tuple[int, int]:
     """1 アカウント分の処理を行う。戻り値は `(獲得票数, exit_code)`。
@@ -3088,7 +3091,7 @@ def process_account(
         if options.login_mode:
             return 0, run_login_flow(page)
 
-        if not _ensure_authenticated(page, name, profile_dir, options):
+        if not _ensure_authenticated(page, name, profile_dir, options=options):
             return 0, 1
 
         gained = 0
@@ -3404,7 +3407,7 @@ def _main_impl() -> int:
             # 絶対パスは永続ログに残さない (Windows ユーザー名等の PII 対策)
             logger.info("=== アカウント: %s ===", name)
             try:
-                gained, code = process_account(p, name, profile_dir, options)
+                gained, code = process_account(p, name, profile_dir, options=options)
             # 1 アカウントの失敗で全体を止めないため、意図して広く握る
             except Exception as e:  # noqa: BLE001
                 # 永続ログに traceback (=絶対パス含む) を残さないため logger.error

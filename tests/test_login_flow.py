@@ -336,6 +336,7 @@ class TestRunGuardedAutoLogin:
         def _sequence_success(
             page: Page,
             name: str,
+            *,
             credentials: Credentials,
             guard: canvasser.ReloginGuard,
         ) -> tuple[AutoLoginOutcome, int]:
@@ -357,6 +358,7 @@ class TestRunGuardedAutoLogin:
         def _sequence_password_error(
             page: Page,
             name: str,
+            *,
             credentials: Credentials,
             guard: canvasser.ReloginGuard,
         ) -> tuple[AutoLoginOutcome, int]:
@@ -382,6 +384,7 @@ class TestRunGuardedAutoLogin:
         def _sequence_form_error(
             page: Page,
             name: str,
+            *,
             credentials: Credentials,
             guard: canvasser.ReloginGuard,
         ) -> tuple[AutoLoginOutcome, int]:
@@ -818,7 +821,7 @@ class TestEnsureAuthenticated:
 
         assert (
             canvasser._ensure_authenticated(
-                as_page(fake), "haruo", canvasser.Path("."), opts
+                as_page(fake), "haruo", canvasser.Path("."), options=opts
             )
             is True
         )
@@ -836,7 +839,9 @@ class TestEnsureAuthenticated:
         fake = FakePage(responses=[_is_login_response(is_login=False)])
         opts = _run_options(dry_run=True)
 
-        result = canvasser._ensure_authenticated(as_page(fake), "haruo", tmp_path, opts)
+        result = canvasser._ensure_authenticated(
+            as_page(fake), "haruo", tmp_path, options=opts
+        )
 
         assert result is False
         # dry-run では auto_login のフォーム操作 (fill/press_sequentially) が起きない
@@ -854,7 +859,9 @@ class TestEnsureAuthenticated:
         fake = FakePage(responses=[_is_login_response(is_login=False)])
         opts = _run_options(dry_run=False, auto_relogin=False)
 
-        result = canvasser._ensure_authenticated(as_page(fake), "haruo", tmp_path, opts)
+        result = canvasser._ensure_authenticated(
+            as_page(fake), "haruo", tmp_path, options=opts
+        )
 
         assert result is False
         assert not any(c[0] == "press_sequentially" for c in fake.calls)
@@ -879,7 +886,9 @@ class TestEnsureAuthenticated:
         opts = _run_options(dry_run=False)
 
         assert (
-            canvasser._ensure_authenticated(as_page(fake), "haruo", tmp_path, opts)
+            canvasser._ensure_authenticated(
+                as_page(fake), "haruo", tmp_path, options=opts
+            )
             is True
         )
         # auto_login のフォーム操作が実際に呼ばれた

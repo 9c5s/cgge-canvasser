@@ -408,7 +408,7 @@ class TestReceive:
         """dry_run=True では evaluate を呼ばず pts をそのまま返す。"""
         fake = FakePage([])
 
-        got = canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=True)
+        got = canvasser._receive(_as_page(fake), 1, "m", pts=30, dry_run=True)
 
         assert got == canvasser.MissionOutcome(gained=30)
         assert fake.calls == []
@@ -418,7 +418,7 @@ class TestReceive:
         response = success_response({"received_point": 30})
         fake = FakePage([response])
 
-        got = canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=False)
+        got = canvasser._receive(_as_page(fake), 1, "m", pts=30, dry_run=False)
 
         assert got == canvasser.MissionOutcome(gained=30)
 
@@ -426,7 +426,7 @@ class TestReceive:
         """PUT 失敗では票数に計上しない。"""
         fake = FakePage([_error_response("E9999")])
 
-        got = canvasser._receive(_as_page(fake), 1, "m", 30, dry_run=False)
+        got = canvasser._receive(_as_page(fake), 1, "m", pts=30, dry_run=False)
 
         assert got == canvasser.MissionOutcome()
 
@@ -435,7 +435,7 @@ def test_receive_returns_linkage_expired_on_e1926() -> None:
     """`_receive` は受取 PUT が E1926 を返したら linkage_expired_id を伝搬する。"""
     fake = FakePage([_error_response("E1926")])
 
-    result = canvasser._receive(_as_page(fake), 21, "ASOBI", 2, dry_run=False)
+    result = canvasser._receive(_as_page(fake), 21, "ASOBI", pts=2, dry_run=False)
 
     assert result == canvasser.MissionOutcome(linkage_expired_id=21)
 

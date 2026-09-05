@@ -40,22 +40,22 @@ class TestDistanceM:
 
     def test_同一点は距離0(self) -> None:
         """同一座標の距離は 0m である。"""
-        assert canvasser._distance_m(35.0, 135.0, 35.0, 135.0) == 0.0
+        assert canvasser._distance_m((35.0, 135.0), (35.0, 135.0)) == 0.0
 
     def test_緯度1度は約111195m(self) -> None:
         """緯度 1 度 = 2πR/360 ≒ 111194.93m (R=6371km) に一致する。"""
-        got = canvasser._distance_m(0.0, 0.0, 1.0, 0.0)
+        got = canvasser._distance_m((0.0, 0.0), (1.0, 0.0))
         assert got == pytest.approx(111194.93, abs=0.5)
 
     def test_赤道上の経度1度は緯度1度と等距離(self) -> None:
         """赤道上では経度 1 度も約 111194.93m になる。"""
-        got = canvasser._distance_m(0.0, 0.0, 0.0, 1.0)
+        got = canvasser._distance_m((0.0, 0.0), (0.0, 1.0))
         assert got == pytest.approx(111194.93, abs=0.5)
 
     def test_引数の順序を入れ替えても対称(self) -> None:
         """距離は始点終点を入れ替えても同じ値になる。"""
-        d1 = canvasser._distance_m(35.68, 139.77, 34.70, 135.50)
-        d2 = canvasser._distance_m(34.70, 135.50, 35.68, 139.77)
+        d1 = canvasser._distance_m((35.68, 139.77), (34.70, 135.50))
+        d2 = canvasser._distance_m((34.70, 135.50), (35.68, 139.77))
         assert d1 == pytest.approx(d2)
 
 
@@ -68,7 +68,7 @@ class TestRandomPointInCircle:
         random.seed(seed)
         for _ in range(100):
             lat, lng = canvasser.random_point_in_circle(35.0, 135.0, 500.0)
-            d = canvasser._distance_m(35.0, 135.0, lat, lng)
+            d = canvasser._distance_m((35.0, 135.0), (lat, lng))
             assert d <= 500.0 * 1.01
 
     def test_高緯度でも半径内に収まる(self) -> None:
@@ -76,7 +76,7 @@ class TestRandomPointInCircle:
         random.seed(7)
         for _ in range(100):
             lat, lng = canvasser.random_point_in_circle(60.0, 25.0, 300.0)
-            d = canvasser._distance_m(60.0, 25.0, lat, lng)
+            d = canvasser._distance_m((60.0, 25.0), (lat, lng))
             assert d <= 300.0 * 1.01
 
     def test_半径0は中心そのもの(self) -> None:
@@ -178,7 +178,7 @@ class TestMakeCheckinCoords:
         for _ in range(50):
             coords = canvasser.make_checkin_coords(self._spot(500.0))
             d = canvasser._distance_m(
-                35.0, 135.0, coords["latitude"], coords["longitude"]
+                (35.0, 135.0), (coords["latitude"], coords["longitude"])
             )
             assert d <= 500 * canvasser.CHECKIN_RADIUS_MARGIN * 1.01
 

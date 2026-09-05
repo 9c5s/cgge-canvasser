@@ -33,6 +33,7 @@ def _spot(
     num: int,
     lat: float,
     lng: float,
+    *,
     deadline: str = "2026-12-31 23:59:59",
 ) -> dict[str, Any]:
     """チェックインスポット 1 件分の dict を組み立てる。"""
@@ -50,20 +51,22 @@ def _typed(
     num: int,
     lat: float,
     lng: float,
+    *,
     deadline: str = "2026-12-31 23:59:59",
 ) -> canvasser.Spot:
     """正規化済み Spot を組み立てる (runner 単体メソッドのテスト用)。"""
-    return canvasser.Spot.from_api(_spot(num, lat, lng, deadline))
+    return canvasser.Spot.from_api(_spot(num, lat, lng, deadline=deadline))
 
 
 def _spot_done(
     num: int,
     lat: float,
     lng: float,
+    *,
     deadline: str = "2026-12-31 23:59:59",
 ) -> dict[str, Any]:
     """サーバ側で checkin_status.is_checkedin==1 の spot dict を組み立てる。"""
-    raw = _spot(num, lat, lng, deadline)
+    raw = _spot(num, lat, lng, deadline=deadline)
     raw["checkin_status"] = {
         "is_checkedin": 1,
         "checkedin_count": 1,

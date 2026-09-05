@@ -163,6 +163,7 @@ class TestProfilesDirIsGitignored:
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        *,
         returncode: int,
         expected: bool,
     ) -> None:

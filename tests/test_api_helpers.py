@@ -126,7 +126,7 @@ class TestCallCheckinApi:
         fake = FakePage([{"status": 200, "body": {"status": "SUCCESS"}}])
         body = "aa,bb,cc=="
 
-        canvasser.call_checkin_api(_as_page(fake), "POST", "/spot/x/checkin", body)
+        canvasser.call_checkin_api(_as_page(fake), "POST", "/spot/x/checkin", body=body)
 
         expected_url = f"{canvasser.API_V1}/checkins/spot/x/checkin"
         assert fake.calls[0][1] == [expected_url, "POST", canvasser.API_KEY, body]

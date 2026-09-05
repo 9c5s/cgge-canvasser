@@ -58,13 +58,13 @@ class TestEstimateTravelSecondsHaversine:
 
     def test_同一点は徒歩0秒(self) -> None:
         """距離 0 は walk で 0 秒になる。"""
-        got = canvasser._estimate_travel_seconds_haversine(35.0, 135.0, 35.0, 135.0)
+        got = canvasser._estimate_travel_seconds_haversine((35.0, 135.0), (35.0, 135.0))
         assert got == (0.0, "walk")
 
     def test_近距離は徒歩(self) -> None:
         """直線 334m (道路換算 450m) は徒歩 5km/h で約 324 秒。"""
         secs, mode = canvasser._estimate_travel_seconds_haversine(
-            35.0, 135.0, 35.003, 135.0
+            (35.0, 135.0), (35.003, 135.0)
         )
         assert mode == "walk"
         assert secs == pytest.approx(324.2, rel=1e-3)
@@ -72,7 +72,7 @@ class TestEstimateTravelSecondsHaversine:
     def test_中距離は車または在来線(self) -> None:
         """直線 1112m (道路換算 1501m) は 40km/h + 5 分で約 435 秒。"""
         secs, mode = canvasser._estimate_travel_seconds_haversine(
-            35.0, 135.0, 35.01, 135.0
+            (35.0, 135.0), (35.01, 135.0)
         )
         assert mode == "car/local"
         assert secs == pytest.approx(435.1, rel=1e-3)
@@ -80,7 +80,7 @@ class TestEstimateTravelSecondsHaversine:
     def test_遠距離は新幹線(self) -> None:
         """直線 55.6km (道路換算 75.1km) は 200km/h + 30 分で約 3151 秒。"""
         secs, mode = canvasser._estimate_travel_seconds_haversine(
-            35.0, 135.0, 35.5, 135.0
+            (35.0, 135.0), (35.5, 135.0)
         )
         assert mode == "shinkansen"
         assert secs == pytest.approx(3151.0, rel=1e-3)
@@ -88,7 +88,7 @@ class TestEstimateTravelSecondsHaversine:
     def test_超遠距離は飛行機(self) -> None:
         """直線 556km (道路換算 751km) は 500km/h + 90 分で約 10804 秒。"""
         secs, mode = canvasser._estimate_travel_seconds_haversine(
-            35.0, 135.0, 40.0, 135.0
+            (35.0, 135.0), (40.0, 135.0)
         )
         assert mode == "flight"
         assert secs == pytest.approx(10804.1, rel=1e-3)
@@ -99,7 +99,7 @@ class TestEstimateTravelSeconds:
 
     def test_GMAPSキー未設定ならHaversineへフォールバックする(self) -> None:
         """キー無しでは gmaps を使わず Haversine の結果をそのまま返す。"""
-        got = canvasser.estimate_travel_seconds(35.0, 135.0, 35.0, 135.0)
+        got = canvasser.estimate_travel_seconds((35.0, 135.0), (35.0, 135.0))
         assert got == (0.0, "walk")
 
     def test_キー未設定ではクライアントはNone(self) -> None:
@@ -148,7 +148,7 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         got = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 0)
         )
 
         assert got == (1234.0, "gmaps-transit")
@@ -162,10 +162,10 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         got1 = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 31)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 31)
         )
         got2 = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 47)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 47)
         )
 
         assert got1 == got2 == (1000.0, "gmaps-transit")
@@ -179,10 +179,10 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         got1 = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 29)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 29)
         )
         got2 = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 31)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 31)
         )
 
         assert got1 == (1000.0, "gmaps-transit")
@@ -197,7 +197,7 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         got = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 0)
         )
 
         assert got == (500.0, "gmaps-driving")
@@ -218,7 +218,7 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         got = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 0)
         )
 
         assert got == (800.0, "gmaps-driving")
@@ -231,7 +231,7 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         got = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 0)
         )
 
         assert got == (500.0, "gmaps-driving")
@@ -242,7 +242,7 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         got = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 0)
         )
 
         assert got is None
@@ -255,7 +255,7 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         got = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 0)
         )
 
         assert got is None
@@ -269,7 +269,7 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         got = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 0)
         )
 
         assert got is None
@@ -283,10 +283,8 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         canvasser._estimate_travel_seconds_gmaps(
-            35.0,
-            135.0,
-            36.0,
-            136.0,
+            (35.0, 135.0),
+            (36.0, 136.0),
             departure_time=datetime(2020, 1, 1, 12, 0, tzinfo=JST),
         )
 
@@ -301,7 +299,7 @@ class TestEstimateTravelSecondsGmaps:
         dep = self._future_at(12, 0)
 
         canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=dep
+            (35.0, 135.0), (36.0, 136.0), departure_time=dep
         )
 
         assert client.calls[0]["departure_time"] == dep
@@ -317,7 +315,7 @@ class TestEstimateTravelSecondsGmaps:
         )
 
         got = canvasser._estimate_travel_seconds_gmaps(
-            35.0, 135.0, 36.0, 136.0, departure_time=naive_dep
+            (35.0, 135.0), (36.0, 136.0), departure_time=naive_dep
         )
 
         assert got == (100.0, "gmaps-transit")
@@ -333,7 +331,7 @@ class TestEstimateTravelSecondsGmaps:
         self._install(monkeypatch, client)
 
         got = canvasser.estimate_travel_seconds(
-            35.0, 135.0, 36.0, 136.0, departure_time=self._future_at(12, 0)
+            (35.0, 135.0), (36.0, 136.0), departure_time=self._future_at(12, 0)
         )
 
         assert got == (1234.0, "gmaps-transit")
