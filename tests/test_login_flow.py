@@ -884,3 +884,93 @@ class TestEnsureAuthenticated:
         )
         # auto_login のフォーム操作が実際に呼ばれた
         assert any(c[0] == "press_sequentially" for c in fake.calls)
+
+
+_PASSKEY_INFO_URL = (
+    "https://account.bandainamcoid.com/passkeyInfo.html"
+    "?client_id=imasofficial&type=vterm&code=dummy"
+)
+
+
+class TestAutoLoginPasskeyPrompt:
+    """BNID がログイン後に挟むパスキー作成の案内画面 (passkeyInfo.html) の通過。"""
+
+    def test_submit後の案内画面でスキップボタンを押して続行しSUCCESS(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """送信後に案内画面へ遷移したら「あとで」を click して redirect を待つ。
+
+        submit は 1 回 (パスワードは送っている)。
+        """
+        _install_fake_time(monkeypatch)
+        fake = FakePage(
+            responses=[
+                _is_login_response(is_login=False),  # 案内画面で停止中
+                _is_login_response(is_login=True),  # 「あとで」後の redirect 完了
+            ],
+            visibility={canvasser._PASSKEY_SKIP_BTN_SEL: True},
+            click_navigations={
+                canvasser._LOGIN_BTN_SEL: _PASSKEY_INFO_URL,
+                canvasser._PASSKEY_SKIP_BTN_SEL: canvasser.MISSION_PAGE_URL,
+            },
+        )
+
+        result, submitted = canvasser.auto_login(
+            as_page(fake), _sample_creds(), timeout_sec=2
+        )
+
+        assert result is AutoLoginOutcome.SUCCESS
+        assert submitted == 1
+        assert (
+            "click",
+            (canvasser._PASSKEY_SKIP_BTN_SEL, {"no_wait_after": True}),
+        ) in fake.calls
+        assert "パスキー" in caplog.text
+
+    def test_案内画面から開始した場合はフォーム操作なしで通過しsubmit0(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BNID セッション有効時はフォームを経ずに案内画面へ直行する。
+
+        パスワードは送らないので submit=0 (failure_count に計上させない)。
+        """
+        _install_fake_time(monkeypatch)
+        fake = FakePage(
+            responses=[
+                _is_login_response(is_login=False),
+                _is_login_response(is_login=True),
+            ],
+            visibility={canvasser._PASSKEY_SKIP_BTN_SEL: True},
+            click_navigations={
+                canvasser._PASSKEY_SKIP_BTN_SEL: canvasser.MISSION_PAGE_URL
+            },
+        )
+        fake.url = _PASSKEY_INFO_URL
+
+        result, submitted = canvasser.auto_login(
+            as_page(fake), _sample_creds(), timeout_sec=2
+        )
+
+        assert result is AutoLoginOutcome.SUCCESS
+        assert submitted == 0
+        assert not any(c[0] == "press_sequentially" for c in fake.calls)
+        assert (
+            "click",
+            (canvasser._PASSKEY_SKIP_BTN_SEL, {"no_wait_after": True}),
+        ) in fake.calls
+
+    def test_案内画面でもスキップボタンが不可視なら押さずにTIMEOUT(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """URL が passkeyInfo.html でもボタンが可視になるまでは click しない。"""
+        _install_fake_time(monkeypatch)
+        fake = FakePage(responses=[_is_login_response(is_login=False)] * 20)
+        fake.url = _PASSKEY_INFO_URL
+
+        result, submitted = canvasser.auto_login(
+            as_page(fake), _sample_creds(), timeout_sec=2
+        )
+
+        assert result is AutoLoginOutcome.TIMEOUT
+        assert submitted == 0
+        assert not any(c[0] == "click" for c in fake.calls)

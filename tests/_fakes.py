@@ -46,7 +46,8 @@ class FakeLocator:
         """クリック。selector と kwargs (no_wait_after 等) を記録する。
 
         click_errors[selector] に非 None が入っていればそれを raise (submit 中の
-        PlaywrightError を再現する用途)。
+        PlaywrightError を再現する用途)。click_navigations[selector] があれば
+        click 後に page.url をその URL へ進める (click 起因の遷移を再現する用途)。
         """
         self._page.calls.append(("click", (self._selector, kwargs)))
         errors = self._page.click_errors.get(self._selector)
@@ -54,6 +55,9 @@ class FakeLocator:
             err = errors.pop(0)
             if err is not None:
                 raise err
+        target = self._page.click_navigations.get(self._selector)
+        if target is not None:
+            self._page.url = target
 
     def wait_for(self, **kwargs: object) -> None:
         """要素の状態変化を待機する。
@@ -140,6 +144,7 @@ class FakePage:
         counts_sequence: dict[str, list[int]] | None = None,
         wait_for_errors: dict[str, list[Exception | None]] | None = None,
         click_errors: dict[str, list[Exception | None]] | None = None,
+        click_navigations: dict[str, str] | None = None,
         goto_errors: Sequence[Exception | None] | None = None,
     ) -> None:
         """応答キュー・selector マップ・goto/click エラーキューを受け取る。"""
@@ -157,6 +162,8 @@ class FakePage:
         self.click_errors: dict[str, list[Exception | None]] = {
             k: list(v) for k, v in (click_errors or {}).items()
         }
+        # click 後に page.url を進める先 (selector をキー、URL を値とする)。
+        self.click_navigations: dict[str, str] = dict(click_navigations or {})
         self.goto_errors: list[Exception | None] = list(goto_errors or [])
         # ASOBI 連携復旧ドライバ (linkages/as/login) のポーリングが参照する現在 URL。
         # 通常のテストではアクセスされないため空文字のままでよい。

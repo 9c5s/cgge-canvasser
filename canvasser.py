@@ -332,6 +332,11 @@ _LOGIN_BTN_SEL = "#btn-idpw-login"
 _LOGIN_BTN_ENABLED_SEL = "#btn-idpw-login:not([disabled])"
 _LOGIN_ERROR_SEL = "#error-input-area .c-message--warning"
 
+# 認証成功後、redirect_uri へ戻る前に BNID が挟むパスキー作成の案内画面と、
+# その「あとで」ボタン。click しない限り redirect が進まない。
+_PASSKEY_INFO_URL_PREFIX = "https://account.bandainamcoid.com/passkeyInfo.html"
+_PASSKEY_SKIP_BTN_SEL = "#btn-next"
+
 # CAPTCHA / 2FA が (将来的に) 混入した時に検知するための selector。
 # Phase 1 時点では BNID は初期表示・1回失敗のいずれでも痕跡なしだが、動的挿入に
 # 備えて防御的に見張る。
@@ -2345,6 +2350,28 @@ def _detect_login_captcha(page: Page) -> bool:
     return False
 
 
+def _passkey_prompt_shown(page: Page) -> bool:
+    """パスキー作成の案内画面 (passkeyInfo.html) に居るか。"""
+    return page.url.startswith(_PASSKEY_INFO_URL_PREFIX)
+
+
+def _dismiss_passkey_prompt(page: Page) -> bool:
+    """パスキー案内画面で「あとで」が可視なら click して True を返す。
+
+    ボタンが未描画のうちは click せず False を返し、次のポーリングに委ねる。
+    """
+    if not _passkey_prompt_shown(page):
+        return False
+    button = page.locator(_PASSKEY_SKIP_BTN_SEL)
+    if not button.is_visible():
+        return False
+    logger.info(
+        "[auto_login] パスキー作成の案内画面を検知したため「あとで」で通過します。"
+    )
+    button.click(no_wait_after=True)
+    return True
+
+
 class AutoLoginOutcome(Enum):
     """auto_login の結果種別。
 
@@ -2375,11 +2402,15 @@ def auto_login(
       (SPA 独自スクリプト側で送信するため Enter 送信は動作保証なし)。
     - HTTP ステータスは常に 200 なので、成功/失敗は「is_login フラグ vs エラー DOM」の
       race で判定する。
+    - 認証成功後に BNID がパスキー作成の案内画面 (passkeyInfo.html) を挟むことが
+      ある。ポーリング中に検知したら「あとで」を click して redirect を再開させる。
+      BNID セッションが有効なまま案内画面へ直行した場合はフォームが無いので、
+      入力を省いて案内画面の通過だけを待つ (パスワードは送らないので submit=0)。
 
     submit 回数は failure_count の会計に使う。pre-submit で abort したケース
-    (CAPTCHA 事前検知 / フォーム操作エラー) は BNID に届いていないので 0、
-    click が成功して以降の結果 (SUCCESS / PASSWORD_ERROR / CAPTCHA_DETECTED /
-    TIMEOUT) は 1 を返す。
+    (CAPTCHA 事前検知 / フォーム操作エラー) と案内画面から開始したケースは BNID に
+    パスワードが届いていないので 0、click が成功して以降の結果 (SUCCESS /
+    PASSWORD_ERROR / CAPTCHA_DETECTED / TIMEOUT) は 1 を返す。
 
     失敗パス:
     - PASSWORD_ERROR: `#error-input-area .c-message--warning` の可視化を検知。
@@ -2392,6 +2423,13 @@ def auto_login(
     - FORM_ERROR: フォーム操作中の PlaywrightError。DOM 変更やページ未ロードの可能性が
       あるためリトライしない。submit=0。
     """
+    # 案内画面から開始したケースはフォームが無いので、ポーリングだけで通過を待つ。
+    if _passkey_prompt_shown(page):
+        outcome = _poll_login_outcome(
+            page, timeout_sec=timeout_sec, interval_sec=interval_sec
+        )
+        return outcome, 0
+
     # submit 前に CAPTCHA / 2FA を検知する。BNID が最初から CAPTCHA を出している
     # ケース (連続失敗による動的挿入等) では、フォームに入力してから submit しても
     # 認証エラーで失敗するだけなので、パスワードを送信しないうちに abort する。
@@ -2439,9 +2477,10 @@ def _poll_login_outcome(
 ) -> AutoLoginOutcome:
     """Submit 済みログイン画面をポーリングし、SUCCESS / エラー / TIMEOUT を判定する。
 
-    ページ内の状態変化 (is_login / エラー DOM / CAPTCHA) を interval_sec ごとに
-    確認する。ログイン画面リダイレクト中の fetch は一時的に失敗するため
-    PlaywrightError は握って次のポーリングに委ねる。
+    ページ内の状態変化 (is_login / パスキー案内画面 / エラー DOM / CAPTCHA) を
+    interval_sec ごとに確認する。パスキー案内画面は「あとで」を click して redirect を
+    再開させ、次のポーリングで is_login を待つ。ログイン画面リダイレクト中の
+    fetch は一時的に失敗するため PlaywrightError は握って次のポーリングに委ねる。
     """
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
@@ -2449,6 +2488,7 @@ def _poll_login_outcome(
             if check_login(page):
                 logger.info("[auto_login] ログイン成功を検知しました。")
                 return AutoLoginOutcome.SUCCESS
+            _dismiss_passkey_prompt(page)
             if _login_error_visible(page):
                 logger.warning(
                     "[auto_login] BNID から認証エラーが返されました。"
@@ -2737,6 +2777,7 @@ def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> boo
 
     - BNID セッション生存: 自動通過して backto (mission page) に着地 → True
     - 中間ページの「バンダイナムコIDでログイン」が可視 → click して継続
+    - BNID のパスキー作成の案内画面 → 「あとで」を click して継続
     - BNID フォームが可視 → `_run_guarded_auto_login` で突破
     - CAPTCHA / タイムアウト → False (呼び出し側は現状同様スキップに退行)
 
@@ -2770,6 +2811,8 @@ def _run_asobi_linkage_recovery(page: Page, profile_dir: Path, name: str) -> boo
                 return True
             # (b) 中間ページの「バンダイナムコIDでログイン」ボタン
             _click_asobi_bridge_button(page, name)
+            # (b') BNID のパスキー作成の案内画面は「あとで」で通過
+            _dismiss_passkey_prompt(page)
             # (c) BNID フォームが可視 → guarded auto_login
             with contextlib.suppress(PlaywrightError):
                 if page.locator(_LOGIN_MAIL_SEL).is_visible():

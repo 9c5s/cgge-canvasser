@@ -234,3 +234,4 @@ Next.js チャンク解析で判明した仕様。
 - 未観測 ecode が 1 件出たら fail closed で即停止する (デフォルト)。BAN シグナル・認証切れ・予期せぬ状態のいずれかとして扱う。
 - BNID の資格情報は Chrome の Login Data (`profiles/{account}/Default/Login Data`) に Windows DPAPI + AES-256-GCM で暗号化されて保存される。復号には同一 Windows ユーザーアカウントでのログインが必要なため、Chrome 本体のパスワード保護と同水準のリスクに留まる。パスワードを変更した場合は、次回 `login` 実行時に Chrome の「パスワードを更新しますか?」プロンプトで更新を選択する。
 - BNID 側が CAPTCHA / 2FA / パスキー強制を導入すると、自動再ログインは失敗するようになり手動 `login` に退化する。`auto_login` は CAPTCHA / 2FA を検知すると即 abort する (詳細は `canvasser.py` の `_LOGIN_CAPTCHA_SELECTORS` を参照)。
+- BNID はパスワード認証の直後にパスキー作成の案内画面 (`passkeyInfo.html`) を挟むことがある。案内のみで強制ではないため、`auto_login` は「あとで」を自動で押して通過する。案内画面の URL やボタンが変わった場合は `_PASSKEY_INFO_URL_PREFIX` と `_PASSKEY_SKIP_BTN_SEL` を追従させる。

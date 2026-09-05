@@ -154,3 +154,23 @@ def test_recovery_timeout_returns_false(
     page = MutablePage(url_sequence=["https://unrelated.example.com/"])
     result = canvasser._run_asobi_linkage_recovery(as_page(page), tmp_path, "test")
     assert result is False
+
+
+def test_recovery_passkey_prompt_dismissed_then_backto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BNID のパスキー案内画面が出たら「あとで」を押し、backto 到達で True を返す。"""
+    _install_fake_time(monkeypatch)
+    page = MutablePage(
+        url_sequence=[
+            "https://account.bandainamcoid.com/passkeyInfo.html?client_id=imasofficial"
+        ],
+        visibility={canvasser._PASSKEY_SKIP_BTN_SEL: True},
+    )
+    page.click_navigations[canvasser._PASSKEY_SKIP_BTN_SEL] = canvasser.MISSION_PAGE_URL
+    result = canvasser._run_asobi_linkage_recovery(as_page(page), tmp_path, "test")
+    assert result is True
+    assert (
+        "click",
+        (canvasser._PASSKEY_SKIP_BTN_SEL, {"no_wait_after": True}),
+    ) in page.calls
